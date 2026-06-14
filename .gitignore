@@ -1,0 +1,50 @@
+# ── Secrets & environment ─────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Local dev compose override (keeps prod frontend as the repo default) ──
+docker-compose.override.yml
+
+# ── Database ──────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+data/db/
+
+# ── Project scan data (user-generated, never commit) ──────────
+data/projects/
+
+# ── DNS wordlists & resolvers ─────────────────────────────────
+# Ship the default seed files; ignore any other user-supplied lists.
+data/wordlists/*
+!data/wordlists/dns_wordlist.txt
+data/resolvers/*
+!data/resolvers/resolvers.txt
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── Node ──────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── macOS ─────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── IDE ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+

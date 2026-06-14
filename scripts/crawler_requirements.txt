@@ -1,0 +1,15 @@
+# 1. Create a fresh virtual environment named 'crawler_env'
+python3 -m venv crawler_env
+
+# 2. Activate the virtual environment
+source crawler_env/bin/activate
+
+# 3. Install the required Python packages
+pip install crawlee camoufox typing_extensions
+
+# 4. Install Playwright's core headless browsers
+playwright install
+
+# 5. Pre-fetch the Camoufox browser binary
+# (This prevents the concurrent download timeouts you saw earlier)
+python3 -m camoufox fetch

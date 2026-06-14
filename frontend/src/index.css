@@ -1,0 +1,257 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+/* frontend/src/index.css — Dark Monochromatic Design System (Black / White / Greys) */
+
+:root {
+  /* ── Surfaces ─────────────────────────────────────────── */
+  --bg-void:     #050505;
+  --bg-base:     #0a0a0a;
+  --bg-surface:  #121212;
+  --bg-elevated: #1e1e1e;
+  --bg-overlay:  #262626;
+  --bg-hover:    #2d2d2d;
+  --bg-selected: #333333;
+
+  /* ── Borders ──────────────────────────────────────────── */
+  --border-subtle:   rgba(255, 255, 255, 0.08);
+  --border-default:  rgba(255, 255, 255, 0.12);
+  --border-emphasis: rgba(255, 255, 255, 0.22);
+  --border-focus:    rgba(255, 255, 255, 0.50);
+  --border-strong:   rgba(255, 255, 255, 0.20);
+
+  /* ── Text ─────────────────────────────────────────────── */
+  --text-primary:   #f5f5f5;
+  --text-secondary: #a3a3a3;
+  --text-muted:     #666666;
+  --text-inverted:  #000000;
+  --text-code:      #d4d4d4;
+
+  /* ── Accent ───────────────────────────────────────────── */
+  --accent-primary: #ffffff;
+  --accent-dim:     #737373;
+  --accent-subtle:  rgba(255, 255, 255, 0.08);
+  --accent-border:  rgba(255, 255, 255, 0.15);
+  --accent-glow:    0 0 20px rgba(255, 255, 255, 0.08);
+
+  /* ── Status ───────────────────────────────────────────── */
+  --success: #d4d4d4;
+  --error:   #ffffff;
+  --warning: #a3a3a3;
+  --info:    #737373;
+  --running: #e5e5e5;
+  --muted:   #404040;
+
+  /* ── Status aliases (used by components) ─────────────── */
+  --status-success:        #d4d4d4;
+  --status-success-bg:     rgba(212, 212, 212, 0.08);
+  --status-success-border: rgba(212, 212, 212, 0.18);
+
+  --status-error:        #ffffff;
+  --status-error-bg:     rgba(255, 255, 255, 0.07);
+  --status-error-border: rgba(255, 255, 255, 0.15);
+
+  --status-warning:        #a3a3a3;
+  --status-warning-bg:     rgba(163, 163, 163, 0.08);
+  --status-warning-border: rgba(163, 163, 163, 0.18);
+
+  --status-info:        #737373;
+  --status-info-bg:     rgba(115, 115, 115, 0.10);
+  --status-info-border: rgba(115, 115, 115, 0.20);
+
+  --status-running:        #e5e5e5;
+  --status-running-bg:     rgba(229, 229, 229, 0.08);
+  --status-running-border: rgba(229, 229, 229, 0.18);
+
+  --status-muted:        #404040;
+  --status-muted-bg:     rgba(64, 64, 64, 0.20);
+  --status-muted-border: rgba(64, 64, 64, 0.35);
+
+  /* ── Typography ───────────────────────────────────────── */
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
+
+  /* ── Radii ────────────────────────────────────────────── */
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+  --radius-2xl: 16px;
+
+  /* ── Transitions ──────────────────────────────────────── */
+  --transition-fast: 120ms ease;
+  --transition-base: 200ms ease;
+  --transition-slow: 320ms ease;
+
+  /* ── Shadows ──────────────────────────────────────────── */
+  --shadow-card:     0 1px 3px rgba(0,0,0,0.5), 0 4px 16px rgba(0,0,0,0.4);
+  --shadow-elevated: 0 4px 24px rgba(0,0,0,0.7), 0 1px 3px rgba(0,0,0,0.5);
+  --shadow-dropdown: 0 8px 32px rgba(0,0,0,0.80), 0 2px 8px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.06);
+
+  /* ── Glass ────────────────────────────────────────────── */
+  --glass-bg:     rgba(10, 10, 10, 0.88);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-blur:   blur(20px);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  background: var(--bg-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: var(--accent-primary);
+  text-decoration: none;
+}
+
+input, textarea, select, button {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+/* ── Scrollbar ──────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-emphasis);
+}
+
+/* ── Utility Keyframes ──────────────────────────────────── */
+@keyframes pulse-glow {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* ── Number Bloom ────────────────────────────────────────── */
+.stat-value {
+  text-shadow: 0 0 40px rgba(255, 255, 255, 0.08), 0 0 80px rgba(255, 255, 255, 0.03);
+}
+
+/* ── Live Indicator ──────────────────────────────────────── */
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--status-running);
+  animation: pulse-glow 1.5s ease-in-out infinite;
+  box-shadow: 0 0 8px rgba(229, 229, 229, 0.4);
+}
+
+/* ── Focus Ring ──────────────────────────────────────────── */
+input:focus, textarea:focus, select:focus {
+  border-color: var(--border-focus) !important;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.10) !important;
+}
+
+/* ── Utility Button Classes ──────────────────────────────── */
+.btn-primary {
+  background: var(--accent-primary);
+  color: #000;
+  border: none;
+  border-radius: var(--radius-md);
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: filter var(--transition-fast);
+  font-family: var(--font-sans);
+}
+.btn-primary:hover { filter: brightness(1.1); }
+.btn-primary:disabled { opacity: 0.45; cursor: not-allowed; filter: none; }
+
+.btn-secondary {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color var(--transition-fast), color var(--transition-fast), background var(--transition-fast);
+  font-family: var(--font-sans);
+}
+.btn-secondary:hover {
+  border-color: var(--border-emphasis);
+  color: var(--text-primary);
+  background: var(--accent-subtle);
+}
+.btn-secondary:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.btn-danger {
+  background: var(--status-error-bg);
+  color: var(--status-error);
+  border: 1px solid var(--status-error-border);
+  border-radius: var(--radius-md);
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: filter var(--transition-fast);
+  font-family: var(--font-sans);
+}
+.btn-danger:hover { filter: brightness(1.1); }
+
+/* ── Card Utility Class ───────────────────────────────────── */
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+}
+
+/* ── Section Title ────────────────────────────────────────── */
+.section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+}
+
+/* ── Select styling ─────────────────────────────────────── */
+select option {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
