@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useLayoutEffect, useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import { clearScanOutput } from '../../api/scans';
 
@@ -9,6 +9,11 @@ interface Props {
   activeJob?: { scan_type: string; id: string } | null;
 }
 
+// How long after the page opens we keep the view pinned to the newest line
+// while the WebSocket replays the backlog. After this, the monitor freezes so
+// live output lands below the fold and the view stays where the user left it.
+const OPEN_FOLLOW_MS = 1000;
+
 // Semantic colours for scan output
 function lineColor(line: string): string {
   if (line.includes('[!]') || line.toLowerCase().includes('error')) return 'var(--status-error)';
@@ -18,8 +23,21 @@ function lineColor(line: string): string {
 }
 
 export default function ScanMonitor({ lines, lineOffset = 0, activeJob }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mountedAt = useRef(Date.now());
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
+
+  // Jump to the newest line only during the brief window after the page opens
+  // (covers the WebSocket backlog replay). Once that window passes we never
+  // auto-scroll again, so the view stays exactly where the user leaves it.
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    if (Date.now() - mountedAt.current < OPEN_FOLLOW_MS) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [lines]);
 
   const handleClear = async () => {
     setClearing(true);
@@ -96,15 +114,13 @@ export default function ScanMonitor({ lines, lineOffset = 0, activeJob }: Props)
         </div>
       </div>
       <div
+        ref={containerRef}
         style={{
           backgroundColor: 'var(--bg-void)',
           backgroundImage: 'repeating-linear-gradient(0deg, transparent, transparent 28px, rgba(124,107,255,0.015) 28px, rgba(124,107,255,0.015) 29px)',
           padding: 0,
           minHeight: 220, maxHeight: 400,
           overflow: 'auto', fontFamily: 'var(--font-mono)', fontSize: 13, lineHeight: 1.7,
-          // column-reverse renders pinned to the newest line with no JS scroll;
-          // the user can scroll up to older lines and stays put as new ones arrive.
-          display: 'flex', flexDirection: 'column-reverse',
         }}
       >
         {lines.length === 0 ? (
@@ -112,12 +128,10 @@ export default function ScanMonitor({ lines, lineOffset = 0, activeJob }: Props)
             Waiting for scan output...
           </div>
         ) : (
-          // Iterate newest-first; column-reverse places the first child at the
-          // bottom, so visual order ends up oldest-top / newest-bottom.
-          lines.map((_, i) => {
-            const idx = lines.length - 1 - i;
-            const line = lines[idx];
-            const absIndex = lineOffset + idx;
+          // Oldest at top, newest at bottom. Keyed by absolute index so rows
+          // stay stable (and line numbers stay truthful) as the buffer slides.
+          lines.map((line, i) => {
+            const absIndex = lineOffset + i;
             return (
               <div key={absIndex} style={{
                 display: 'flex', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
