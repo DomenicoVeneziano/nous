@@ -18,11 +18,13 @@ router = APIRouter(prefix="/search", tags=["search"])
 def search(
     query: str = Query(..., min_length=1),
     project_id: str | None = Query(None),
-    limit: int = Query(100, le=1000),
+    limit: int | None = Query(None, ge=1),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     _: dict = Depends(require_viewer),
 ):
+    # No limit by default — every matching asset is returned and paginated
+    # client-side, matching the uncapped project asset list.
     return search_assets(db, query, project_id, limit, offset)
 
 

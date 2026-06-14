@@ -2,7 +2,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useProjectStore } from '../store/projectStore';
-import { fetchAssets, createAsset, deleteAsset } from '../api/assets';
+import { fetchAllAssets, createAsset, deleteAsset } from '../api/assets';
 import { enqueueScan } from '../api/scans';
 import type { Asset, AssetCreate, AssetSearchResult } from '../types/asset';
 import ProjectHeader from '../components/project/ProjectHeader';
@@ -57,7 +57,7 @@ export default function ProjectView() {
 
   const loadAssets = useCallback(async (): Promise<Asset[]> => {
     if (!id) return [];
-    const data = await fetchAssets(id);
+    const data = await fetchAllAssets(id);
     setAssets(data);
     return data;
   }, [id]);

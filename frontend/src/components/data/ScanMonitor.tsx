@@ -9,11 +9,6 @@ interface Props {
   activeJob?: { scan_type: string; id: string } | null;
 }
 
-// How long after the page opens we keep the view pinned to the newest line
-// while the WebSocket replays the backlog. After this, the monitor freezes so
-// live output lands below the fold and the view stays where the user left it.
-const OPEN_FOLLOW_MS = 1000;
-
 // Semantic colours for scan output
 function lineColor(line: string): string {
   if (line.includes('[!]') || line.toLowerCase().includes('error')) return 'var(--status-error)';
@@ -24,19 +19,13 @@ function lineColor(line: string): string {
 
 export default function ScanMonitor({ lines, lineOffset = 0, activeJob }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const mountedAt = useRef(Date.now());
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
 
-  // Jump to the newest line only during the brief window after the page opens
-  // (covers the WebSocket backlog replay). Once that window passes we never
-  // auto-scroll again, so the view stays exactly where the user leaves it.
+  // Follow the newest line as output streams in.
   useLayoutEffect(() => {
     const el = containerRef.current;
-    if (!el) return;
-    if (Date.now() - mountedAt.current < OPEN_FOLLOW_MS) {
-      el.scrollTop = el.scrollHeight;
-    }
+    if (el) el.scrollTop = el.scrollHeight;
   }, [lines]);
 
   const handleClear = async () => {

@@ -9,6 +9,20 @@ export async function fetchAssets(projectId: string, limit = 500, offset = 0): P
   return data;
 }
 
+// Fetch every asset for a project by paging through the backend until a short
+// page signals the end. No fixed cap — a project with tens of thousands of
+// assets is loaded in full.
+export async function fetchAllAssets(projectId: string): Promise<Asset[]> {
+  const PAGE = 2000;
+  const all: Asset[] = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const page = await fetchAssets(projectId, PAGE, offset);
+    all.push(...page);
+    if (page.length < PAGE) break;
+  }
+  return all;
+}
+
 export async function fetchAsset(projectId: string, assetId: string): Promise<Asset> {
   const { data } = await client.get<Asset>(`/projects/${projectId}/assets/${assetId}`);
   return data;

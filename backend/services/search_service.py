@@ -422,7 +422,7 @@ def search_assets(
     db: Session,
     query: str,
     project_id: str | None = None,
-    limit: int = 100,
+    limit: int | None = 100,
     offset: int = 0,
 ) -> list[Asset]:
     """
@@ -492,4 +492,7 @@ def search_assets(
             asset.highlights = asset_highlights[:MAX_HIGHLIGHTS_PER_ASSET]
             results.append(asset)
 
+    # limit=None means return every match (no cap), only honouring offset.
+    if limit is None:
+        return results[offset:]
     return results[offset:offset + limit]

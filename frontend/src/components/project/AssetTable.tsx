@@ -1,7 +1,9 @@
 // frontend/src/components/project/AssetTable.tsx
-import React, { useState } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import type { Asset, Highlight } from '../../types/asset';
 import { HighlightText } from '../shared/HighlightText';
+
+const PAGE_SIZE_OPTIONS = [100, 250, 500, 1000];
 
 interface Props {
   assets: Asset[];
@@ -44,17 +46,36 @@ function getHiddenMatchBadges(highlights: Highlight[] | undefined): string[] {
 export default function AssetTable({ assets, selectedIds, onToggleSelect, onSelectAll, onAssetClick }: Props) {
   const [sortKey, setSortKey] = useState<SortKey>('asset');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  const [pageSize, setPageSize] = useState(250);
+  const [page, setPage] = useState(0);
 
-  const sorted = [...assets].sort((a, b) => {
-    const av = a[sortKey] ?? '';
-    const bv = b[sortKey] ?? '';
-    const cmp = String(av).localeCompare(String(bv), undefined, { numeric: true });
-    return sortDir === 'asc' ? cmp : -cmp;
-  });
+  // Sort the full set (so ordering and pagination span every asset, not just
+  // the rows currently on screen); memoised so toggling a checkbox doesn't
+  // re-sort tens of thousands of rows on every render.
+  const sorted = useMemo(() => {
+    return [...assets].sort((a, b) => {
+      const av = a[sortKey] ?? '';
+      const bv = b[sortKey] ?? '';
+      const cmp = String(av).localeCompare(String(bv), undefined, { numeric: true });
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+  }, [assets, sortKey, sortDir]);
+
+  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
+
+  // Keep the current page in range when the set shrinks (search, deletion) or
+  // the page size changes.
+  useEffect(() => {
+    if (page > pageCount - 1) setPage(pageCount - 1);
+  }, [pageCount, page]);
+
+  const start = page * pageSize;
+  const pageItems = sorted.slice(start, start + pageSize);
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
     else { setSortKey(key); setSortDir('asc'); }
+    setPage(0);
   };
 
   const sortIndicator = (key: SortKey) =>
@@ -73,7 +94,16 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
     padding: '9px 16px', borderBottom: '1px solid var(--border-subtle)', fontSize: 14,
   };
 
+  const btnStyle = (disabled: boolean): React.CSSProperties => ({
+    background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
+    border: '1px solid var(--border-default)', borderRadius: 6,
+    padding: '4px 12px', fontSize: 12, fontWeight: 500,
+    cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.4 : 1,
+    fontFamily: 'var(--font-mono)',
+  });
+
   return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
     <div style={{
       overflow: 'auto',
       border: '1px solid var(--border-subtle)', borderRadius: 8,
@@ -101,7 +131,7 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
           </tr>
         </thead>
         <tbody>
-          {sorted.map((asset, i) => {
+          {pageItems.map((asset, i) => {
             const selected = selectedIds.has(asset.id);
             const highlights = (asset as Asset & { highlights?: Highlight[] }).highlights;
             const hostnameHls = getHighlightsFor(highlights, 'hostname');
@@ -193,6 +223,38 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
           })}
         </tbody>
       </table>
+    </div>
+
+      {sorted.length > 0 && (
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          gap: 12, flexWrap: 'wrap', padding: '0 2px',
+          fontSize: 12, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)',
+        }}>
+          <span>
+            Showing {start + 1}–{Math.min(start + pageSize, sorted.length)} of {sorted.length.toLocaleString()}
+          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              Per page
+              <select
+                value={pageSize}
+                onChange={(e) => { setPageSize(Number(e.target.value)); setPage(0); }}
+                style={{
+                  background: 'var(--bg-elevated)', border: '1px solid var(--border-default)',
+                  borderRadius: 6, color: 'var(--text-primary)', padding: '3px 6px',
+                  fontSize: 12, cursor: 'pointer', fontFamily: 'var(--font-mono)',
+                }}
+              >
+                {PAGE_SIZE_OPTIONS.map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </label>
+            <button style={btnStyle(page <= 0)} disabled={page <= 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>Prev</button>
+            <span>Page {page + 1} of {pageCount}</span>
+            <button style={btnStyle(page >= pageCount - 1)} disabled={page >= pageCount - 1} onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}>Next</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
