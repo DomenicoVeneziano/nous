@@ -1,6 +1,7 @@
 # backend/routers/assets.py
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from database import get_db
 from auth.middleware import require_admin, require_viewer
 from schemas.asset import AssetCreate, AssetUpdate, AssetOut
@@ -39,7 +40,15 @@ def create_asset(project_id: str, data: AssetCreate, db: Session = Depends(get_d
     proj = project_service.get_project(db, project_id)
     if not proj:
         raise HTTPException(404, "Project not found")
-    asset = asset_service.create_asset(db, project_id, data)
+    name = data.asset.strip()
+    if not name:
+        raise HTTPException(422, "Asset value is required")
+    if asset_service.get_asset_by_name(db, project_id, name):
+        raise HTTPException(409, f"Asset '{name}' already exists in this project")
+    try:
+        asset = asset_service.create_asset(db, project_id, data)
+    except IntegrityError:
+        raise HTTPException(409, f"Asset '{name}' already exists in this project")
     project_service.refresh_counts(db, project_id)
     return asset
 

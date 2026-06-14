@@ -1,9 +1,11 @@
-import React, { useRef, useLayoutEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import { clearScanOutput } from '../../api/scans';
 
 interface Props {
   lines: string[];
+  // Absolute index of lines[0] within the full stream, for stable keys/numbers.
+  lineOffset?: number;
   activeJob?: { scan_type: string; id: string } | null;
 }
 
@@ -15,9 +17,7 @@ function lineColor(line: string): string {
   return 'var(--text-code)';
 }
 
-export default function ScanMonitor({ lines, activeJob }: Props) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [autoScroll, setAutoScroll] = useState(true);
+export default function ScanMonitor({ lines, lineOffset = 0, activeJob }: Props) {
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
 
@@ -29,12 +29,6 @@ export default function ScanMonitor({ lines, activeJob }: Props) {
     setClearing(false);
     setConfirmClear(false);
   };
-
-  useLayoutEffect(() => {
-    if (autoScroll && containerRef.current) {
-      containerRef.current.scrollTop = containerRef.current.scrollHeight;
-    }
-  }, [lines, autoScroll]);
 
   return (
     <div style={{
@@ -99,31 +93,18 @@ export default function ScanMonitor({ lines, activeJob }: Props) {
               </div>
             )
           )}
-          <button
-            onClick={() => setAutoScroll(!autoScroll)}
-            style={{
-              background: autoScroll ? 'var(--accent-subtle)' : 'var(--status-muted-bg)',
-              border: `1px solid ${autoScroll ? 'var(--accent-border)' : 'var(--border-default)'}`,
-              borderRadius: 'var(--radius-sm)',
-              color: autoScroll ? 'var(--accent-primary)' : 'var(--text-muted)',
-              fontSize: 10, padding: '3px 10px', fontWeight: 600,
-              cursor: 'pointer', fontFamily: 'var(--font-mono)',
-              letterSpacing: '0.06em',
-              transition: 'all var(--transition-fast)',
-            }}
-          >
-            {autoScroll ? 'AUTO' : 'PAUSED'}
-          </button>
         </div>
       </div>
       <div
-        ref={containerRef}
         style={{
           backgroundColor: 'var(--bg-void)',
           backgroundImage: 'repeating-linear-gradient(0deg, transparent, transparent 28px, rgba(124,107,255,0.015) 28px, rgba(124,107,255,0.015) 29px)',
           padding: 0,
           minHeight: 220, maxHeight: 400,
           overflow: 'auto', fontFamily: 'var(--font-mono)', fontSize: 13, lineHeight: 1.7,
+          // column-reverse renders pinned to the newest line with no JS scroll;
+          // the user can scroll up to older lines and stays put as new ones arrive.
+          display: 'flex', flexDirection: 'column-reverse',
         }}
       >
         {lines.length === 0 ? (
@@ -131,25 +112,32 @@ export default function ScanMonitor({ lines, activeJob }: Props) {
             Waiting for scan output...
           </div>
         ) : (
-          lines.map((line, i) => (
-            <div key={i} style={{
-              display: 'flex', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
-              padding: '0 14px',
-              background: i % 2 === 0 ? 'transparent' : 'rgba(124,107,255,0.01)',
-            }}>
-              <span style={{
-                color: 'var(--text-muted)', minWidth: 42, textAlign: 'right',
-                paddingRight: 14, userSelect: 'none', fontSize: 12,
-                borderRight: '1px solid var(--border-subtle)',
-                marginRight: 14,
+          // Iterate newest-first; column-reverse places the first child at the
+          // bottom, so visual order ends up oldest-top / newest-bottom.
+          lines.map((_, i) => {
+            const idx = lines.length - 1 - i;
+            const line = lines[idx];
+            const absIndex = lineOffset + idx;
+            return (
+              <div key={absIndex} style={{
+                display: 'flex', whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+                padding: '0 14px',
+                background: absIndex % 2 === 0 ? 'transparent' : 'rgba(124,107,255,0.01)',
               }}>
-                {i + 1}
-              </span>
-              <span style={{ color: lineColor(line), flex: 1 }}>
-                {line}
-              </span>
-            </div>
-          ))
+                <span style={{
+                  color: 'var(--text-muted)', minWidth: 52, textAlign: 'right',
+                  paddingRight: 14, userSelect: 'none', fontSize: 12,
+                  borderRight: '1px solid var(--border-subtle)',
+                  marginRight: 14,
+                }}>
+                  {absIndex + 1}
+                </span>
+                <span style={{ color: lineColor(line), flex: 1 }}>
+                  {line}
+                </span>
+              </div>
+            );
+          })
         )}
       </div>
     </div>

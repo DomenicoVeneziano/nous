@@ -9,7 +9,7 @@ import ScanHistory from '../components/data/ScanHistory';
 import FileExplorer from '../components/data/FileExplorer';
 
 export default function Data() {
-  const { queue, history, scanLines, loadQueue, loadHistory, addScanLine, clearScanLines } = useScanStore();
+  const { queue, history, scanLines, scanLineOffset, loadQueue, loadHistory, addScanLine, clearScanLines } = useScanStore();
   const { projects, loadProjects } = useProjectStore();
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 
@@ -36,6 +36,7 @@ export default function Data() {
         <ScanQueue jobs={queue} onRefresh={loadQueue} />
         <ScanMonitor
           lines={scanLines}
+          lineOffset={scanLineOffset}
           activeJob={runningJob ? { scan_type: runningJob.scan_type, id: runningJob.id } : null}
         />
       </div>

@@ -1,15 +1,24 @@
 # backend/services/asset_service.py
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from models.asset import Asset
 from schemas.asset import AssetCreate, AssetUpdate
 import uuid
+
+
+def get_asset_by_name(db: Session, project_id: str, asset: str) -> Asset | None:
+    return (
+        db.query(Asset)
+        .filter(Asset.project_id == project_id, Asset.asset == asset)
+        .first()
+    )
 
 
 def create_asset(db: Session, project_id: str, data: AssetCreate) -> Asset:
     asset = Asset(
         id=str(uuid.uuid4()),
         project_id=project_id,
-        asset=data.asset,
+        asset=data.asset.strip(),
         asset_type=data.asset_type,
         manually_inserted=data.manually_inserted,
     )
@@ -19,7 +28,14 @@ def create_asset(db: Session, project_id: str, data: AssetCreate) -> Asset:
         if value is not None:
             setattr(asset, field, value)
     db.add(asset)
-    db.commit()
+    # The (project_id, asset) unique constraint can still trip on a race even
+    # after a pre-check, so roll back and re-raise so the router maps it to 409
+    # rather than leaking a 500 with a poisoned session.
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise
     db.refresh(asset)
     return asset
 
