@@ -58,7 +58,7 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
                 await ws_broadcast("job_failed", {"job_id": job_id, "error": "No assets"})
             return
 
-        all_new_subs = []
+        new_count = 0
         total_duration = 0.0
 
         total = len(hostnames)
@@ -70,68 +70,82 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
         if proxy_url:
             await line_broadcast("[*] Routing crawler traffic through configured proxy")
 
-        for i, hostname in enumerate(hostnames, 1):
-            asset_hash = hashlib.md5(hostname.encode()).hexdigest()[:12]
-            output_file = crawl_dir / f"{asset_hash}_crawl.txt"
-            url = f"https://{hostname}"
+        def persist_host(hostname: str, output_file: Path):
+            """Commit one host's crawl results immediately so completed hosts
+            survive a later timeout/cancel. Returns (created, parsed) where
+            created is the count of new assets from discovered subdomains and
+            parsed is the parsed crawl output (None if no output file exists)."""
+            if not output_file.is_file():
+                return 0, None
+            content = output_file.read_text(encoding="utf-8", errors="replace")
+            parsed = parse_crawler_output(content)
+            merge_crawled_urls_bulk(session, project_id, {hostname: parsed["endpoints"]})
+            created = insert_assets_bulk(session, project_id, parsed["subdomains"]) if parsed["subdomains"] else 0
+            refresh_project_counts(session, project_id)
+            return created, parsed
 
-            await line_broadcast(f"[*] [{i}/{total}] Crawling {hostname}")
+        try:
+            for i, hostname in enumerate(hostnames, 1):
+                asset_hash = hashlib.md5(hostname.encode()).hexdigest()[:12]
+                output_file = crawl_dir / f"{asset_hash}_crawl.txt"
+                url = f"https://{hostname}"
 
-            crawl_args = ["--start-url", url, "-o", str(output_file),
-                          "--max-pages", str(crawl_max_pages),
-                          "--delay", str(crawl_rate_limit_delay)]
-            if proxy_url:
-                crawl_args += ["--proxy", proxy_url]
+                await line_broadcast(f"[*] [{i}/{total}] Crawling {hostname}")
 
-            result = await run_script(
-                script_path=str(SCRIPTS_DIR / "crawler.py"),
-                args=crawl_args,
-                job_id=f"{job_id}_{asset_hash}",
-                timeout_seconds=int(crawl_timeout + crawl_rate_limit_delay * crawl_max_pages),
-                ws_broadcast=line_broadcast,
-                log_dir=log_dir,
-            )
+                crawl_args = ["--start-url", url, "-o", str(output_file),
+                              "--max-pages", str(crawl_max_pages),
+                              "--delay", str(crawl_rate_limit_delay)]
+                if proxy_url:
+                    crawl_args += ["--proxy", proxy_url]
 
-            total_duration += result.duration_seconds
-
-            if result.timed_out:
-                await line_broadcast(f"[!] {hostname}: TIMEOUT after {crawl_timeout}s")
-                continue  # Continue with other assets
-
-            if result.exit_code != 0:
-                await line_broadcast(f"[!] {hostname}: script exited with code {result.exit_code}")
-
-            # Parse crawl output
-            if output_file.is_file():
-                content = output_file.read_text(encoding="utf-8", errors="replace")
-                parsed = parse_crawler_output(content)
-
-                merge_crawled_urls_bulk(session, project_id, {hostname: parsed["endpoints"]})
-
-                all_new_subs.extend(parsed["subdomains"])
-
-                await line_broadcast(
-                    f"[+] {hostname}: {len(parsed['endpoints'])} endpoint(s), "
-                    f"{len(parsed['subdomains'])} subdomain(s)"
+                result = await run_script(
+                    script_path=str(SCRIPTS_DIR / "crawler.py"),
+                    args=crawl_args,
+                    job_id=f"{job_id}_{asset_hash}",
+                    timeout_seconds=int(crawl_timeout + crawl_rate_limit_delay * crawl_max_pages),
+                    ws_broadcast=line_broadcast,
+                    log_dir=log_dir,
                 )
 
-                if ws_broadcast:
-                    await ws_broadcast("asset_update", {
-                        "job_id": job_id,
-                        "domain": hostname,
-                        "endpoints_found": len(parsed["endpoints"]),
-                        "subdomains_found": len(parsed["subdomains"]),
-                    })
-            else:
-                await line_broadcast(f"[!] {hostname}: no output produced")
+                total_duration += result.duration_seconds
 
-        # Create new assets from discovered subdomains
-        if all_new_subs:
-            new_count = insert_assets_bulk(session, project_id, all_new_subs)
-        else:
-            new_count = 0
+                if result.timed_out:
+                    await line_broadcast(f"[!] {hostname}: TIMEOUT after {crawl_timeout}s")
+                    # Persist any partial output the crawler wrote before timing out.
+                    created, _ = persist_host(hostname, output_file)
+                    new_count += created
+                    continue  # Continue with other assets
 
-        refresh_project_counts(session, project_id)
+                if result.exit_code != 0:
+                    await line_broadcast(f"[!] {hostname}: script exited with code {result.exit_code}")
+
+                # Parse crawl output
+                if output_file.is_file():
+                    created, parsed = persist_host(hostname, output_file)
+                    new_count += created
+
+                    await line_broadcast(
+                        f"[+] {hostname}: {len(parsed['endpoints'])} endpoint(s), "
+                        f"{len(parsed['subdomains'])} subdomain(s)"
+                    )
+
+                    if ws_broadcast:
+                        await ws_broadcast("asset_update", {
+                            "job_id": job_id,
+                            "domain": hostname,
+                            "endpoints_found": len(parsed["endpoints"]),
+                            "subdomains_found": len(parsed["subdomains"]),
+                        })
+                else:
+                    await line_broadcast(f"[!] {hostname}: no output produced")
+        except asyncio.CancelledError:
+            # Manual cancellation — flush whatever the interrupted host produced
+            # (the crawler writes incrementally) before propagating the cancel.
+            try:
+                persist_host(hostname, output_file)
+            except Exception:
+                pass
+            raise
 
         transition_status(session, job_id, "running", "done",
                           duration_s=total_duration,

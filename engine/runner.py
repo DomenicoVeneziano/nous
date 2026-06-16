@@ -102,6 +102,12 @@ async def run_script(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=child_env,
+            # Run the script as the leader of its own process group/session so we
+            # can signal the entire tree on timeout/cancel. The shell scripts
+            # spawn long-running children (puredns -> massdns, subfinder, gau,
+            # waymore); signalling only the bash PID would leave those grandchild
+            # processes orphaned and still running after the job is stopped.
+            start_new_session=True,
         )
 
         async def read_stdout():
@@ -127,16 +133,30 @@ async def run_script(
                     log_file.write(f"[STDERR] {line}\n")
                     log_file.flush()
 
-        async def terminate_proc():
+        def _signal_group(sig: int):
+            """Signal the script's whole process group, falling back to the
+            single process if the group is already gone."""
             try:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
+                os.killpg(os.getpgid(proc.pid), sig)
             except ProcessLookupError:
                 pass
+            except OSError:
+                # Process group unavailable (e.g. leader already reaped) —
+                # signal the process directly as a best effort.
+                try:
+                    proc.send_signal(sig)
+                except ProcessLookupError:
+                    pass
+
+        async def terminate_proc():
+            # Graceful stop of the entire process tree, then force-kill the
+            # group if it does not exit within the grace period.
+            _signal_group(signal.SIGTERM)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
+            except asyncio.TimeoutError:
+                _signal_group(signal.SIGKILL)
+                await proc.wait()
 
         try:
             gather = asyncio.gather(read_stdout(), read_stderr(), proc.wait())

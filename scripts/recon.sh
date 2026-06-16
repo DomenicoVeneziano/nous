@@ -110,6 +110,35 @@ cleanup() {
           "$expanded_wordlist" "$filtered_wordlist" "$raw_archived_urls"
 }
 trap cleanup EXIT
+# Convert a cancel/timeout signal into a normal exit so the EXIT trap above runs
+# cleanup exactly once. Trapping the signals directly to cleanup would instead
+# let the script resume after the handler and overwrite the checkpointed output
+# file with the just-deleted working files, so we exit rather than clean inline.
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+# ------------------------------------------------------------------------------
+# Incremental output flush
+# ------------------------------------------------------------------------------
+# Write every subdomain discovered so far to the final output file, applying the
+# same known-subdomain filter as Step 8. Called as a checkpoint after each tool
+# invocation so a cancelled or timed-out run leaves the maximum amount of partial
+# results on disk: the output file is the engine's source of truth and is never
+# removed by cleanup(), unlike the /tmp working files. Safe to call repeatedly;
+# strips ports inline so mid-step flushes (before the Step 1 dedup) stay clean.
+flush_output() {
+    cat "$active_subs" "$bruteforced_subs" "$permuted_subs" 2>/dev/null \
+        | sed -e 's/:.*$//' \
+        | sort -u > "$combined_subs" || true
+    if [[ -n "${subs_file:-}" && -s "$subs_file" ]]; then
+        grep -vFxf "$subs_file" "$combined_subs" > "$output_file" 2>/dev/null || true
+    else
+        cp "$combined_subs" "$output_file" 2>/dev/null || true
+    fi
+    # Persist archived URLs gathered so far too (gau/waymore stream into
+    # raw_archived_urls); the engine's crawl-merge step reads archived_urls.txt.
+    sort -u "$raw_archived_urls" > "$archived_urls_file" 2>/dev/null || true
+}
 
 # ==============================================================================
 #  STEP 1: Active Scanning (subfinder, crt.sh, gau, waymore)
@@ -122,24 +151,28 @@ echo "[+] ================================================================"
 # subfinder — passive enumeration via multiple sources
 echo "[+] Running subfinder on $domain ..."
 subfinder -d "$domain" -all -o "$active_subs" 2>/dev/null || true
+flush_output  # checkpoint: subfinder results persisted
 
 # crt.sh — certificate transparency logs
 echo "[+] Querying crt.sh for $domain ..."
 crt -s -json "$domain" 2>/dev/null \
     | jq -r '.[].subdomain' \
     | sed -e 's/^\*\.//' >> "$active_subs" || true
+flush_output  # checkpoint: + crt.sh results
 
 # gau — fetch known URLs from AlienVault, Wayback, etc., extract hostnames
 echo "[+] Running gau on $domain ..."
 echo "$domain" | gau --subs 2>/dev/null \
     | tee -a "$raw_archived_urls" \
     | awk -F/ '{print $3}' | sort -u >> "$active_subs" || true
+flush_output  # checkpoint: + gau results & archived URLs
 
 # waymore — fetch URLs, extract hostnames
 echo "[+] Running waymore on $domain ..."
 waymore -i "$domain" -mode U 2>/dev/null \
     | tee -a "$raw_archived_urls" \
     | awk -F/ '{print $3}' | sort -u >> "$active_subs" || true
+flush_output  # checkpoint: + waymore results & archived URLs
 
 # Strip trailing port numbers (e.g., host:8080 → host) and deduplicate
 sed -i'' -e 's/:.*$//' "$active_subs"
@@ -149,6 +182,10 @@ sort -u "$active_subs" -o "$active_subs"
 sort -u "$raw_archived_urls" > "$archived_urls_file"
 
 echo "[+] Active scan complete. Found $(wc -l < "$active_subs") unique subdomains."
+
+# Persist active-scan results immediately so a cancel/timeout during the long
+# bruteforce/permutation phases still saves what enumeration already found.
+flush_output
 echo ""
 
 # ==============================================================================
@@ -299,6 +336,7 @@ else
         --wildcard-batch "$wildcard_batch" \
         -q >> "$bruteforced_subs" 2>/dev/null || true
     echo "[+] Bruteforce complete. Found $(wc -l < "$bruteforced_subs") resolved subdomains."
+    flush_output
 fi
 echo ""
 
@@ -321,6 +359,7 @@ if [[ -s "$bruteforced_subs" ]]; then
             --wildcard-batch "$wildcard_batch" \
             -q >> "$permuted_subs" 2>/dev/null || true
     echo "[+] Permutation complete. Found $(wc -l < "$permuted_subs") new subdomains."
+    flush_output
 else
     echo "[*] No bruteforced subdomains to permute. Skipping."
 fi

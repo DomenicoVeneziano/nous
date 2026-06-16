@@ -79,76 +79,101 @@ async def run_recon_job(job: dict, ws_broadcast=None):
                     await ws_broadcast("job_failed", {"job_id": job_id, "error": f"Unsafe {label}"})
                 return
 
-        all_subdomains = []
-        all_host_paths: dict[str, set[str]] = {}
+        output_file = project_dir / "subdomains.txt"
         archived_urls_file = project_dir / "archived_urls.txt"
         result = None
+        new_count = 0
 
-        for raw_domain in domains:
-            # Strip wildcard prefix
-            domain = raw_domain.lstrip("*.")
+        def parse_outputs() -> tuple[list[str], dict[str, set[str]]]:
+            """Parse whatever recon has written to disk so far.
 
-            if not validate_domain(domain):
-                continue
-
-            # Set up output file
-            output_file = project_dir / "subdomains.txt"
-
-            async def line_broadcast(line: str):
-                if ws_broadcast:
-                    await ws_broadcast("scan_line", {"job_id": job_id, "line": line})
-
-            script_args = ["-d", domain, "-o", str(output_file), "-w", wordlist_path,
-                           "-r", resolvers_path, "-s", known_subs_path]
-            if not dns_bruteforce_enabled:
-                script_args.append("-n")
-            result = await run_script(
-                script_path=str(SCRIPTS_DIR / "recon.sh"),
-                args=script_args,
-                job_id=job_id,
-                timeout_seconds=recon_timeout,
-                ws_broadcast=line_broadcast,
-                log_dir=log_dir,
-                env=recon_env,
-            )
-
-            if result.timed_out:
-                transition_status(session, job_id, "running", "timed_out",
-                                  duration_s=result.duration_seconds,
-                                  log_path=str(log_dir / f"{job_id}.log"))
-                if ws_broadcast:
-                    await ws_broadcast("job_failed", {"job_id": job_id, "error": "Timed out"})
-                return
-
-            if result.exit_code != 0:
-                transition_status(session, job_id, "running", "failed",
-                                  error_msg=result.stderr[:500],
-                                  duration_s=result.duration_seconds,
-                                  log_path=str(log_dir / f"{job_id}.log"))
-                if ws_broadcast:
-                    await ws_broadcast("job_failed", {"job_id": job_id, "error": result.stderr[:200]})
-                return
-
-            # Parse results
+            Best-effort: used both on the normal success path and when a run is
+            interrupted (timeout/cancel), so it must tolerate missing or partial
+            output files.
+            """
+            subs: list[str] = []
             if output_file.is_file():
                 raw = output_file.read_text(encoding="utf-8", errors="replace")
-                subdomains = parse_recon_output(raw)
-            else:
-                subdomains = parse_recon_output(result.stdout)
-
-            all_subdomains.extend(subdomains)
-
+                subs = parse_recon_output(raw)
+            elif result is not None:
+                subs = parse_recon_output(result.stdout)
+            host_paths: dict[str, set[str]] = {}
             try:
                 raw_urls = archived_urls_file.read_text(encoding="utf-8", errors="replace")
                 for host, paths in parse_archived_urls(raw_urls).items():
-                    all_host_paths.setdefault(host, set()).update(paths)
+                    host_paths.setdefault(host, set()).update(paths)
             except FileNotFoundError:
                 pass
+            return subs, host_paths
 
-        # Persist to DB
-        new_count = insert_assets_bulk(session, project_id, all_subdomains)
-        merge_crawled_urls_bulk(session, project_id, all_host_paths)
-        refresh_project_counts(session, project_id)
+        def persist(subs: list[str], host_paths: dict[str, set[str]]) -> int:
+            """Commit recon results immediately. Safe to call repeatedly so that
+            assets survive a later timeout/cancel/failure."""
+            count = insert_assets_bulk(session, project_id, subs) if subs else 0
+            if host_paths:
+                merge_crawled_urls_bulk(session, project_id, host_paths)
+            if subs or host_paths:
+                refresh_project_counts(session, project_id)
+            return count
+
+        try:
+            for raw_domain in domains:
+                # Strip wildcard prefix
+                domain = raw_domain.lstrip("*.")
+
+                if not validate_domain(domain):
+                    continue
+
+                async def line_broadcast(line: str):
+                    if ws_broadcast:
+                        await ws_broadcast("scan_line", {"job_id": job_id, "line": line})
+
+                script_args = ["-d", domain, "-o", str(output_file), "-w", wordlist_path,
+                               "-r", resolvers_path, "-s", known_subs_path]
+                if not dns_bruteforce_enabled:
+                    script_args.append("-n")
+                result = await run_script(
+                    script_path=str(SCRIPTS_DIR / "recon.sh"),
+                    args=script_args,
+                    job_id=job_id,
+                    timeout_seconds=recon_timeout,
+                    ws_broadcast=line_broadcast,
+                    log_dir=log_dir,
+                    env=recon_env,
+                )
+
+                if result.timed_out:
+                    # Persist whatever was found before the timeout fired.
+                    new_count += persist(*parse_outputs())
+                    transition_status(session, job_id, "running", "timed_out",
+                                      duration_s=result.duration_seconds,
+                                      log_path=str(log_dir / f"{job_id}.log"))
+                    if ws_broadcast:
+                        await ws_broadcast("job_failed", {"job_id": job_id, "error": "Timed out"})
+                    return
+
+                if result.exit_code != 0:
+                    # Persist partial results for this domain before failing out.
+                    new_count += persist(*parse_outputs())
+                    transition_status(session, job_id, "running", "failed",
+                                      error_msg=result.stderr[:500],
+                                      duration_s=result.duration_seconds,
+                                      log_path=str(log_dir / f"{job_id}.log"))
+                    if ws_broadcast:
+                        await ws_broadcast("job_failed", {"job_id": job_id, "error": result.stderr[:200]})
+                    return
+
+                # Domain finished cleanly — commit its results right away so a
+                # cancel/timeout on a later domain cannot discard them.
+                new_count += persist(*parse_outputs())
+        except asyncio.CancelledError:
+            # Manual cancellation — flush whatever the interrupted domain
+            # produced before propagating the cancel to the worker.
+            try:
+                persist(*parse_outputs())
+            except Exception:
+                pass
+            raise
 
         # Mark done
         transition_status(session, job_id, "running", "done",
