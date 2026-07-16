@@ -12,6 +12,11 @@ export interface AssetSearchResult extends Asset {
   highlights: Highlight[];
 }
 
+export interface CrawledUrls {
+  crawling: string[];
+  archived: string[];
+}
+
 export interface Asset {
   id: string;
   project_id: string;
@@ -25,7 +30,7 @@ export interface Asset {
   redirects_to: string | null;
   response_file_path: string | null;
   screenshot_path: string | null;
-  crawled_urls: string[];
+  crawled_urls: CrawledUrls;
   date_scanned: string | null;
   manually_inserted: boolean;
 }
@@ -38,7 +43,7 @@ export interface AssetCreate {
   title?: string;
   content_length?: number;
   dns_records?: Record<string, unknown>[];
-  crawled_urls?: string[];
+  crawled_urls?: CrawledUrls;
 }
 
 export interface AssetUpdate {
@@ -49,5 +54,5 @@ export interface AssetUpdate {
   title?: string | null;
   content_length?: number | null;
   dns_records?: Record<string, unknown>[];
-  crawled_urls?: string[];
+  crawled_urls?: CrawledUrls;
 }

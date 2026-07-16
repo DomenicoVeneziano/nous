@@ -20,7 +20,7 @@ class Asset(Base):
     redirects_to = Column(String, nullable=True)  # destination host for a cross-host redirect
     response_file_path = Column(String, nullable=True)
     screenshot_path = Column(String, nullable=True)
-    crawled_urls = Column(JSON, nullable=False, default=list)
+    crawled_urls = Column(JSON, nullable=False, default=lambda: {"crawling": [], "archived": []})
     date_scanned = Column(DateTime, nullable=True)
     manually_inserted = Column(Boolean, nullable=False, default=False)
 

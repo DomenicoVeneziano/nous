@@ -46,6 +46,26 @@ export async function deleteAssetScreenshot(projectId: string, assetId: string):
   await client.delete(`/projects/${projectId}/assets/${assetId}/screenshot`);
 }
 
+/**
+ * Download an asset's full detail as a formatted `<asset>.json` file. The
+ * request is authenticated via the shared client, so we fetch the blob and
+ * drive the browser download from an object URL rather than a bare link.
+ */
+export async function exportAsset(projectId: string, assetId: string, assetName: string): Promise<void> {
+  const { data } = await client.get(`/projects/${projectId}/assets/${assetId}/export`, {
+    responseType: 'blob',
+  });
+  const url = URL.createObjectURL(data as Blob);
+  const safeName = assetName.replace(/[^A-Za-z0-9._-]/g, '_') || 'asset';
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${safeName}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 export async function countAssets(projectId: string): Promise<number> {
   const { data } = await client.get<{ count: number }>(`/projects/${projectId}/assets/count`);
   return data.count;

@@ -1,7 +1,46 @@
 # backend/schemas/asset.py
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from datetime import datetime
 from typing import Literal
+
+
+def normalize_crawled_urls(value) -> dict:
+    """Coerce any stored/legacy shape into the canonical per-source object.
+
+    Accepts:
+      * None                      -> empty object
+      * list[str] (legacy)        -> {"crawling": [...], "archived": []}
+      * dict with any subset      -> both keys present, deduped, order-preserved
+    """
+    crawling: list[str] = []
+    archived: list[str] = []
+    if isinstance(value, list):
+        crawling = value
+    elif isinstance(value, dict):
+        crawling = value.get("crawling") or []
+        archived = value.get("archived") or []
+
+    def _dedup(items) -> list[str]:
+        seen = set()
+        out = []
+        for item in items:
+            s = str(item)
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    return {"crawling": _dedup(crawling), "archived": _dedup(archived)}
+
+
+class CrawledUrls(BaseModel):
+    crawling: list[str] = []
+    archived: list[str] = []
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _drop_none(cls, v):
+        return v or []
 
 
 class AssetCreate(BaseModel):
@@ -13,7 +52,12 @@ class AssetCreate(BaseModel):
     title: str | None = None
     content_length: int | None = None
     dns_records: list[dict] | None = None
-    crawled_urls: list[str] | None = None
+    crawled_urls: CrawledUrls | None = None
+
+    @field_validator("crawled_urls", mode="before")
+    @classmethod
+    def _normalize(cls, v):
+        return None if v is None else normalize_crawled_urls(v)
 
 
 class AssetUpdate(BaseModel):
@@ -24,7 +68,12 @@ class AssetUpdate(BaseModel):
     title: str | None = None
     content_length: int | None = None
     dns_records: list[dict] | None = None
-    crawled_urls: list[str] | None = None
+    crawled_urls: CrawledUrls | None = None
+
+    @field_validator("crawled_urls", mode="before")
+    @classmethod
+    def _normalize(cls, v):
+        return None if v is None else normalize_crawled_urls(v)
 
 
 class AssetOut(BaseModel):
@@ -40,8 +89,13 @@ class AssetOut(BaseModel):
     redirects_to: str | None
     response_file_path: str | None
     screenshot_path: str | None
-    crawled_urls: list[str]
+    crawled_urls: CrawledUrls
     date_scanned: datetime | None
     manually_inserted: bool
 
     model_config = {"from_attributes": True}
+
+    @field_validator("crawled_urls", mode="before")
+    @classmethod
+    def _normalize(cls, v):
+        return normalize_crawled_urls(v)

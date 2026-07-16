@@ -51,9 +51,11 @@ export function useWebSocket(handlers: Record<string, EventHandler>, onConnect?:
         }
       };
 
-      ws.onerror = () => {
-        ws.close();
-      };
+      // Don't close() here: an errored socket transitions to CLOSED on its own
+      // and fires onclose (which schedules the reconnect). Calling close() while
+      // the handshake is still in flight aborts it and logs a noisy
+      // "connection interrupted during page load" warning.
+      ws.onerror = () => {};
     }
 
     connect();
@@ -61,8 +63,19 @@ export function useWebSocket(handlers: Record<string, EventHandler>, onConnect?:
     return () => {
       disposed = true;
       if (reconnectTimer) clearTimeout(reconnectTimer);
-      wsRef.current?.close();
+      const ws = wsRef.current;
       wsRef.current = null;
+      if (!ws) return;
+      // We're tearing down intentionally — stop the reconnect loop.
+      ws.onclose = null;
+      ws.onerror = null;
+      if (ws.readyState === WebSocket.CONNECTING) {
+        // Closing mid-handshake triggers the "interrupted during page load"
+        // warning; wait for the socket to open, then close it cleanly.
+        ws.onopen = () => ws.close();
+      } else if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
     };
   }, []);
 

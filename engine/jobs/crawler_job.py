@@ -79,7 +79,7 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
                 return 0, None
             content = output_file.read_text(encoding="utf-8", errors="replace")
             parsed = parse_crawler_output(content)
-            merge_crawled_urls_bulk(session, project_id, {hostname: parsed["endpoints"]})
+            merge_crawled_urls_bulk(session, project_id, {hostname: parsed["endpoints"]}, source="crawling")
             created = insert_assets_bulk(session, project_id, parsed["subdomains"]) if parsed["subdomains"] else 0
             refresh_project_counts(session, project_id)
             return created, parsed

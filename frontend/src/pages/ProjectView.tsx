@@ -160,7 +160,7 @@ export default function ProjectView() {
 
   return (
     <div style={{ display: 'flex', height: '100%' }}>
-      <div style={{ flex: 1, overflow: 'auto', paddingRight: detailAsset ? 0 : undefined }}>
+      <div style={{ flex: 1, overflow: 'auto' }}>
         <ProjectHeader project={current} onRunRecon={() => setShowReconModal(true)} onEdit={() => setShowEdit(true)} />
 
         {/* Tab bar */}
@@ -278,7 +278,7 @@ export default function ProjectView() {
           }}
         />
 
-        <div style={{ display: 'grid', gridTemplateColumns: detailAsset ? '1fr' : '1fr 300px', gap: 12 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 300px', gap: 12 }}>
           <AssetTable
             assets={displayAssets}
             selectedIds={selectedIds}
@@ -286,19 +286,34 @@ export default function ProjectView() {
             onSelectAll={selectAll}
             onAssetClick={setDetailAsset}
           />
-          {!detailAsset && <TechPieChart assets={displayAssets} />}
+          <TechPieChart assets={displayAssets} />
         </div>
         </>)}
       </div>
 
       {detailAsset && (
-        <AssetDetail
-          asset={detailAsset}
-          highlights={query ? (detailAsset as AssetSearchResult).highlights : undefined}
-          onClose={() => setDetailAsset(null)}
-          onAssetUpdated={handleAssetUpdated}
-          onAssetDeleted={handleAssetDeleted}
-        />
+        <div
+          onClick={() => setDetailAsset(null)}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 900,
+            background: 'rgba(0,0,0,0.45)',
+            display: 'flex', justifyContent: 'flex-end',
+            animation: 'fadeIn 150ms ease',
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ height: '100%', animation: 'slideInRight 180ms ease' }}
+          >
+            <AssetDetail
+              asset={detailAsset}
+              highlights={query ? (detailAsset as AssetSearchResult).highlights : undefined}
+              onClose={() => setDetailAsset(null)}
+              onAssetUpdated={handleAssetUpdated}
+              onAssetDeleted={handleAssetDeleted}
+            />
+          </div>
+        </div>
       )}
 
       {current && (

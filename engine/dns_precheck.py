@@ -328,7 +328,12 @@ async def _check_asset(
             await asyncio.sleep(rate_limit_delay)
 
     if result and result.records:
-        asset["dns_records"] = [{"resolver": used_resolver, "records": result.records}] + (asset.get("dns_records") or [])
+        # Store the flat, deduplicated record set from this resolution, replacing
+        # any prior records. Each record is a {type, value, ...} dict — the shape
+        # the API and dashboard consume directly. (Previously these were wrapped
+        # in a per-resolver envelope and prepended, which both hid the records
+        # from the frontend and grew unbounded across repeated scans.)
+        asset["dns_records"] = result.records
 
     if is_live:
         record_summary = ", ".join(f"{r['type']}={r['value']}" for r in result.records[:3])

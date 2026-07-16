@@ -10,6 +10,9 @@ from pathlib import Path
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "db" / "nous.db"
 
+# Canonical empty per-source endpoint object stored in assets.crawled_urls.
+EMPTY_CRAWLED_URLS = '{"crawling": [], "archived": []}'
+
 # Valid status transitions
 VALID_TRANSITIONS = {
     "queued": {"running", "cancelled"},
@@ -195,8 +198,8 @@ def insert_assets_bulk(session: Session, project_id: str, hostnames: list[str]) 
         result = session.execute(text(
             "INSERT OR IGNORE INTO assets "
             "(id, project_id, asset, asset_type, dns_records, technologies, crawled_urls, manually_inserted) "
-            "VALUES (:id, :pid, :asset, 'subdomain', '[]', '[]', '[]', 0)"
-        ), {"id": str(uuid.uuid4()), "pid": project_id, "asset": hostname})
+            "VALUES (:id, :pid, :asset, 'subdomain', '[]', '[]', :cu, 0)"
+        ), {"id": str(uuid.uuid4()), "pid": project_id, "asset": hostname, "cu": EMPTY_CRAWLED_URLS})
         count += result.rowcount
     session.commit()
     return count
@@ -212,8 +215,8 @@ def insert_asset_if_absent(session: Session, project_id: str, hostname: str) -> 
     result = session.execute(text(
         "INSERT OR IGNORE INTO assets "
         "(id, project_id, asset, asset_type, dns_records, technologies, crawled_urls, manually_inserted) "
-        "VALUES (:id, :pid, :asset, 'subdomain', '[]', '[]', '[]', 0)"
-    ), {"id": new_id, "pid": project_id, "asset": hostname})
+        "VALUES (:id, :pid, :asset, 'subdomain', '[]', '[]', :cu, 0)"
+    ), {"id": new_id, "pid": project_id, "asset": hostname, "cu": EMPTY_CRAWLED_URLS})
     session.commit()
     return new_id if result.rowcount else None
 
@@ -241,14 +244,31 @@ def enqueue_tech_scan(session: Session, project_id: str, asset_id: str, config: 
     return job_id
 
 
+def _normalize_crawled_urls(value) -> dict:
+    """Coerce any stored/legacy shape into {"crawling": [...], "archived": [...]}."""
+    crawling, archived = [], []
+    if isinstance(value, list):          # legacy flat list -> crawling bucket
+        crawling = value
+    elif isinstance(value, dict):
+        crawling = value.get("crawling") or []
+        archived = value.get("archived") or []
+    return {"crawling": list(crawling), "archived": list(archived)}
+
+
 def merge_crawled_urls_bulk(
     session: Session,
     project_id: str,
     host_paths: dict,
+    source: str = "crawling",
 ) -> int:
-    """Merge URL paths into existing assets' crawled_urls. Returns count of assets updated."""
+    """Merge URL paths into existing assets' crawled_urls under the given source
+    section ("crawling" or "archived"). Returns count of assets updated. Paths in
+    the target section are deduped and sorted; the other section is left untouched.
+    """
     if not host_paths:
         return 0
+    if source not in ("crawling", "archived"):
+        raise ValueError(f"invalid crawled_urls source: {source}")
 
     hostnames = list(host_paths.keys())
     placeholders, params = _in_params(hostnames)
@@ -260,10 +280,11 @@ def merge_crawled_urls_bulk(
 
     updates = {}
     for asset, current_json in rows:
-        current_urls = json.loads(current_json) if current_json else []
-        merged = sorted(set(current_urls) | set(host_paths[asset]), key=str.lower)
-        if merged != current_urls:
-            updates[asset] = json.dumps(merged)
+        current = _normalize_crawled_urls(json.loads(current_json) if current_json else None)
+        merged_section = sorted(set(current[source]) | set(host_paths[asset]), key=str.lower)
+        if merged_section != current[source]:
+            current[source] = merged_section
+            updates[asset] = json.dumps(current)
 
     for asset, merged_json in updates.items():
         session.execute(text(

@@ -321,11 +321,17 @@ def _match_asset(
         return bool(spans), _spans_to_highlights(spans, field, field, target)
 
     elif field == "url":
-        urls = asset.crawled_urls or []
+        cu = asset.crawled_urls or {}
+        if isinstance(cu, list):
+            urls = cu
+        else:
+            urls = (cu.get("crawling") or []) + (cu.get("archived") or [])
         highlights = []
-        for i, url in enumerate(urls):
+        for url in urls:
             spans = _find_spans(url, value, is_regex)
-            highlights.extend(_spans_to_highlights(spans, field, field, url, index=i))
+            # Highlights are matched back to a rendered URL by snippet text
+            # (not list index) so they resolve across both source sections.
+            highlights.extend(_spans_to_highlights(spans, field, field, url))
         return bool(highlights), highlights
 
     elif field == "type":

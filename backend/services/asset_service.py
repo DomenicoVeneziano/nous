@@ -2,7 +2,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from models.asset import Asset
-from schemas.asset import AssetCreate, AssetUpdate
+from schemas.asset import AssetCreate, AssetUpdate, normalize_crawled_urls
 import uuid
 
 
@@ -26,6 +26,8 @@ def create_asset(db: Session, project_id: str, data: AssetCreate) -> Asset:
     for field in ("technologies", "status_code", "title", "content_length", "dns_records", "crawled_urls"):
         value = getattr(data, field, None)
         if value is not None:
+            if field == "crawled_urls":
+                value = normalize_crawled_urls(value.model_dump())
             setattr(asset, field, value)
     db.add(asset)
     # The (project_id, asset) unique constraint can still trip on a race even
@@ -89,7 +91,7 @@ def update_asset(db: Session, asset_id: str, data: AssetUpdate) -> Asset | None:
         return None
     for field, value in data.model_dump(exclude_unset=True).items():
         if field == "crawled_urls" and value is not None:
-            value = sorted(set(value), key=str.lower)
+            value = normalize_crawled_urls(value)
         setattr(asset, field, value)
     db.commit()
     db.refresh(asset)

@@ -71,6 +71,12 @@
   --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
 
+  /* Tailwind's preflight applies these to html and to code/pre/kbd/samp.
+     Force ligatures off so JetBrains Mono never fuses != -> => && in those
+     elements (e.g. the raw response-file <pre>). */
+  --default-font-feature-settings: "liga" 0, "calt" 0;
+  --default-mono-font-feature-settings: "liga" 0, "calt" 0;
+
   /* ── Radii ────────────────────────────────────────────── */
   --radius-sm: 3px;
   --radius-md: 6px;
@@ -113,6 +119,12 @@ body {
   background: var(--bg-base);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* Disable programming ligatures. JetBrains Mono otherwise fuses sequences
+     like != -> => && into single glyphs, which misrepresents raw URLs,
+     payloads, and HTTP responses in a tool where every character must read
+     literally. These properties inherit, so this covers all monospace text. */
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
 }
 
 a {
@@ -155,6 +167,11 @@ input, textarea, select, button {
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
 }
 
 @keyframes spin {

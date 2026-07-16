@@ -111,7 +111,7 @@ async def run_recon_job(job: dict, ws_broadcast=None):
             assets survive a later timeout/cancel/failure."""
             count = insert_assets_bulk(session, project_id, subs) if subs else 0
             if host_paths:
-                merge_crawled_urls_bulk(session, project_id, host_paths)
+                merge_crawled_urls_bulk(session, project_id, host_paths, source="archived")
             if subs or host_paths:
                 refresh_project_counts(session, project_id)
             return count

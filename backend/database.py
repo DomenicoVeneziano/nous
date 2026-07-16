@@ -1,4 +1,5 @@
 # backend/database.py
+import json
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 from config import settings
@@ -145,6 +146,28 @@ def init_db():
             "DELETE FROM asset_fts WHERE asset_id = old.id; END"
         ))
         conn.commit()
+
+        # Migrate crawled_urls from the legacy flat list to the per-source object
+        # {"crawling": [...], "archived": []}. Legacy combined endpoints land under
+        # "crawling". Runs after the FTS triggers exist so each UPDATE reindexes the
+        # row. Idempotent: only list-shaped values (JSON starting with '[') are touched.
+        legacy = conn.execute(text(
+            "SELECT id, crawled_urls FROM assets WHERE crawled_urls LIKE '[%'"
+        )).fetchall()
+        for asset_id, raw in legacy:
+            try:
+                items = json.loads(raw)
+            except (TypeError, ValueError):
+                items = []
+            if not isinstance(items, list):
+                continue
+            new_val = json.dumps({"crawling": items, "archived": []})
+            conn.execute(
+                text("UPDATE assets SET crawled_urls = :c WHERE id = :id"),
+                {"c": new_val, "id": asset_id},
+            )
+        if legacy:
+            conn.commit()
 
         # Backfill: (re)build the index from existing rows whenever it is empty,
         # using the exact same projection the triggers use so old and new rows
