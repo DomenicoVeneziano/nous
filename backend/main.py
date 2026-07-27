@@ -22,6 +22,7 @@ app.add_middleware(
 from routers.auth_router import router as auth_router
 from routers.projects import router as projects_router
 from routers.assets import router as assets_router
+from routers.tags import router as tags_router
 from routers.scans import router as scans_router
 from routers.search import router as search_router
 from routers.files import router as files_router
@@ -34,6 +35,7 @@ from routers.vuln_patterns import router as vuln_patterns_router
 app.include_router(auth_router)
 app.include_router(projects_router)
 app.include_router(assets_router)
+app.include_router(tags_router)
 app.include_router(scans_router)
 app.include_router(search_router)
 app.include_router(files_router)

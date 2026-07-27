@@ -15,10 +15,11 @@ import ProjectEditOverlay from '../components/projects/ProjectEditOverlay';
 import ReconScopeModal from '../components/project/ReconScopeModal';
 import FindingsSearchView from '../components/project/FindingsSearchView';
 import ScreenshotsView from '../components/project/ScreenshotsView';
+import TagManager from '../components/project/TagManager';
 import { useSearch } from '../hooks/useSearch';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useAuth } from '../hooks/useAuth';
-import { Plus } from 'lucide-react';
+import { Plus, Tags } from 'lucide-react';
 
 type ProjectTab = 'assets' | 'screenshots' | 'findings';
 
@@ -37,6 +38,16 @@ function parseLine(raw: string, assetType: 'subdomain' | 'ip'): AssetCreate {
   return payload;
 }
 
+/** Re-seat a displayed asset on a freshly returned row, carrying its search
+ *  highlights across: the asset endpoints return plain assets, so dropping them
+ *  would blank every match in the panel and in the table row. */
+function withHighlights(prev: Asset, fresh: Asset): Asset {
+  const { highlights } = prev as Partial<AssetSearchResult>;
+  if (!highlights) return fresh;
+  const merged: AssetSearchResult = { ...fresh, highlights };
+  return merged;
+}
+
 export default function ProjectView() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -47,6 +58,7 @@ export default function ProjectView() {
   const [showEdit, setShowEdit] = useState(false);
   const [showReconModal, setShowReconModal] = useState(false);
   const [showAddAsset, setShowAddAsset] = useState(false);
+  const [showTagManager, setShowTagManager] = useState(false);
   const [newAssetValue, setNewAssetValue] = useState('');
   const [newAssetType, setNewAssetType] = useState<'subdomain' | 'ip'>('subdomain');
   const [addingAsset, setAddingAsset] = useState(false);
@@ -134,12 +146,33 @@ export default function ProjectView() {
     }
   };
 
-  const handleAssetUpdated = async () => {
+  // Callers that already hold the server's updated asset pass it in, and that one
+  // row is patched in place rather than re-downloading every asset in the project
+  // plus the project record. The search still re-runs when a query is active: a
+  // tag change decides result-set membership under a query like `tag:Recheck` and
+  // determines which spans highlight, so patching locally would leave the list
+  // silently answering the operator's query with a stale set. That re-query is
+  // scoped to the matching subset, so it stays far cheaper than the full reload.
+  // Callers that can also reorder the list or shift the project's counters (the
+  // edit form, the tag manager) omit the asset and take the full reload below.
+  const handleAssetUpdated = async (updated?: Asset) => {
     if (!id) return;
-    const [updated] = await Promise.all([loadAssets(), loadProject(id)]);
-    if (detailAsset) {
-      setDetailAsset(updated.find((a) => a.id === detailAsset.id) ?? null);
+    if (updated) {
+      setAssets((prev) => prev.map((a) => (a.id === updated.id ? updated : a)));
+      setDetailAsset((prev) => (prev && prev.id === updated.id ? withHighlights(prev, updated) : prev));
+      if (query) search(query, id);
+      return;
     }
+    const [fresh] = await Promise.all([loadAssets(), loadProject(id)]);
+    // Reseat the open panel on the freshly fetched row.
+    setDetailAsset((prev) => {
+      if (!prev) return prev;
+      const row = fresh.find((a) => a.id === prev.id);
+      return row ? withHighlights(prev, row) : null;
+    });
+    // The table renders `results` while a query is active, and those are stale
+    // the moment an asset changes — re-run the search so the rows follow.
+    if (query) search(query, id);
   };
 
   const handleAssetDeleted = async () => {
@@ -201,6 +234,20 @@ export default function ProjectView() {
               loading={searchLoading}
             />
           </div>
+          {isAdmin && (
+            <button
+              onClick={() => setShowTagManager(true)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
+                border: '1px solid var(--border-default)',
+                borderRadius: 6, padding: '7px 14px', fontSize: 12, fontWeight: 500, cursor: 'pointer',
+                transition: 'all var(--transition-fast)',
+              }}
+            >
+              <Tags size={13} /> Tags
+            </button>
+          )}
           {isAdmin && (
             <button
               onClick={() => setShowAddAsset(!showAddAsset)}
@@ -307,13 +354,25 @@ export default function ProjectView() {
           >
             <AssetDetail
               asset={detailAsset}
-              highlights={query ? (detailAsset as AssetSearchResult).highlights : undefined}
+              highlights={query ? (detailAsset as Partial<AssetSearchResult>).highlights : undefined}
               onClose={() => setDetailAsset(null)}
               onAssetUpdated={handleAssetUpdated}
               onAssetDeleted={handleAssetDeleted}
             />
           </div>
         </div>
+      )}
+
+      {id && (
+        <TagManager
+          projectId={id}
+          open={showTagManager}
+          onClose={() => setShowTagManager(false)}
+          // Wrapped, not passed by reference: a rename or delete here rewrites
+          // many assets at once, so this must always take the full-refetch path
+          // even if the dialog ever starts calling onChanged with an argument.
+          onChanged={() => handleAssetUpdated()}
+        />
       )}
 
       {current && (

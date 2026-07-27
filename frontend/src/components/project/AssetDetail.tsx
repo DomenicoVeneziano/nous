@@ -5,14 +5,20 @@ import type { Asset, AssetUpdate, Highlight } from '../../types/asset';
 import { HighlightText } from '../shared/HighlightText';
 import { updateAsset, deleteAsset, fetchImageObjectUrl, exportAsset } from '../../api/assets';
 import client from '../../api/client';
+import { parseBackendDate } from '../../lib/datetime';
 import { useAuth } from '../../hooks/useAuth';
 import FindingsPanel from './FindingsPanel';
+import AssetTags from './AssetTags';
 
 interface Props {
   asset: Asset | null;
   highlights?: Highlight[];
   onClose: () => void;
-  onAssetUpdated?: () => void;
+  /** Called after a change. Receives the server's updated asset when the change
+   *  is narrow enough for the parent to patch it in place (tags); called with no
+   *  argument when the change can move the asset in the list or shift the
+   *  project's counters (edits), so the parent refetches instead. */
+  onAssetUpdated?: (updated?: Asset) => void;
   onAssetDeleted?: () => void;
 }
 
@@ -43,6 +49,21 @@ function resolveFileSpans(highlights: Highlight[], fileContent: string): { start
   }
   return spans;
 }
+
+/** Render an ISO timestamp in the viewer's locale, or "Unknown" when unset.
+ *  Assets that predate tagging have no recorded discovery date — that is
+ *  genuinely unknown rather than zero, so it is not faked from another field. */
+function formatTimestamp(value: string | null): string {
+  if (!value) return 'Unknown';
+  const parsed = parseBackendDate(value);
+  if (Number.isNaN(parsed.getTime())) return 'Unknown';
+  return parsed.toLocaleString();
+}
+
+const dateValueStyle: React.CSSProperties = {
+  fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)',
+  fontSize: 11, marginTop: 2,
+};
 
 type DnsRecord = Record<string, unknown>;
 
@@ -711,8 +732,31 @@ export default function AssetDetail({ asset, highlights, onClose, onAssetUpdated
                 </div>
               </div>
             )}
+            <div>
+              <span style={{ color: 'var(--text-muted)', fontSize: 11}}>Found</span>
+              <div style={dateValueStyle}>{formatTimestamp(asset.first_seen)}</div>
+            </div>
+            <div>
+              <span style={{ color: 'var(--text-muted)', fontSize: 11}}>Latest tech analysis</span>
+              <div style={dateValueStyle}>{formatTimestamp(asset.date_scanned)}</div>
+            </div>
+            <div>
+              <span style={{ color: 'var(--text-muted)', fontSize: 11}}>Latest crawl</span>
+              <div style={dateValueStyle}>{formatTimestamp(asset.last_crawl_at)}</div>
+            </div>
           </div>
         )}
+      </div>
+
+      {/* Tags */}
+      <div style={sectionStyle}>
+        <div style={labelStyle}>Tags</div>
+        <AssetTags
+          asset={asset}
+          highlights={highlights}
+          isAdmin={isAdmin}
+          onTagsChanged={(updated) => onAssetUpdated?.(updated)}
+        />
       </div>
 
       {/* Technologies */}

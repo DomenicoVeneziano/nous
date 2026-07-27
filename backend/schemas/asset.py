@@ -3,6 +3,8 @@ from pydantic import BaseModel, field_validator
 from datetime import datetime
 from typing import Literal
 
+from schemas.tag import TagOut
+
 
 def normalize_crawled_urls(value) -> dict:
     """Coerce any stored/legacy shape into the canonical per-source object.
@@ -46,7 +48,6 @@ class CrawledUrls(BaseModel):
 class AssetCreate(BaseModel):
     asset: str
     asset_type: Literal["subdomain", "ip"] = "subdomain"
-    manually_inserted: bool = True
     technologies: list[str] | None = None
     status_code: int | None = None
     title: str | None = None
@@ -90,8 +91,13 @@ class AssetOut(BaseModel):
     response_file_path: str | None
     screenshot_path: str | None
     crawled_urls: CrawledUrls
-    date_scanned: datetime | None
-    manually_inserted: bool
+    date_scanned: datetime | None  # last tech analysis
+    first_seen: datetime | None
+    last_crawl_at: datetime | None
+    tags: list[TagOut] = []
+    # Derived, never stored: true when this asset was first seen by the
+    # project's most recent recon job. See services/tag_service.py.
+    is_new: bool = False
 
     model_config = {"from_attributes": True}
 

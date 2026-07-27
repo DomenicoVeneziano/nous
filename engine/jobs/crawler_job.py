@@ -10,7 +10,7 @@ from parsers.crawler_parser import parse_crawler_output
 from queue_manager import (
     get_session, transition_status, get_asset_hostnames,
     get_all_project_asset_details, insert_assets_bulk, merge_crawled_urls_bulk,
-    refresh_project_counts,
+    refresh_project_counts, set_last_crawl_at, SOURCE_CRAWLING,
 )
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -80,7 +80,13 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
             content = output_file.read_text(encoding="utf-8", errors="replace")
             parsed = parse_crawler_output(content)
             merge_crawled_urls_bulk(session, project_id, {hostname: parsed["endpoints"]}, source="crawling")
-            created = insert_assets_bulk(session, project_id, parsed["subdomains"]) if parsed["subdomains"] else 0
+            set_last_crawl_at(session, project_id, [hostname])
+            # Hosts the crawler turned up are attributed to Crawling; the host
+            # that was crawled keeps whatever source originally found it.
+            created = insert_assets_bulk(
+                session, project_id, parsed["subdomains"],
+                source=SOURCE_CRAWLING, scan_job_id=job_id,
+            ) if parsed["subdomains"] else 0
             refresh_project_counts(session, project_id)
             return created, parsed
 

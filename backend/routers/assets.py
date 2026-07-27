@@ -10,7 +10,7 @@ from database import get_db
 from auth.middleware import require_admin, require_viewer
 from models.finding import Finding
 from schemas.asset import AssetCreate, AssetUpdate, AssetOut, normalize_crawled_urls
-from services import asset_service, project_service
+from services import asset_service, project_service, tag_service
 from config import settings
 
 router = APIRouter(prefix="/projects/{project_id}/assets", tags=["assets"])
@@ -80,9 +80,18 @@ def _build_asset_export(db: Session, asset) -> dict:
             "title": asset.title,
             "content_length": asset.content_length,
             "redirects_to": asset.redirects_to,
+            "first_seen": asset.first_seen.isoformat() if asset.first_seen else None,
             "date_scanned": asset.date_scanned.isoformat() if asset.date_scanned else None,
-            "manually_inserted": asset.manually_inserted,
+            "last_crawl_at": asset.last_crawl_at.isoformat() if asset.last_crawl_at else None,
+            # Deliberately no "New!" flag, here or in export_service: it is
+            # derived from whichever recon job ran last, so it describes the
+            # project's scan history at download time rather than the asset. A
+            # snapshot field that flips on the next scan is worse than no field.
         },
+        "tags": [
+            {"name": t.name, "is_system": t.is_system}
+            for t in tag_service.ordered_tags(asset.tags)
+        ],
         "technologies": asset.technologies or [],
         "dns_records": _flatten_dns_records(asset.dns_records),
         "endpoints": {
@@ -118,7 +127,8 @@ def list_assets(
     db: Session = Depends(get_db),
     _: dict = Depends(require_viewer),
 ):
-    return asset_service.list_assets(db, project_id, limit, offset)
+    assets = asset_service.list_assets(db, project_id, limit, offset)
+    return tag_service.decorate_assets(db, assets)
 
 
 @router.get("/count")
@@ -131,6 +141,7 @@ def get_asset(project_id: str, asset_id: str, db: Session = Depends(get_db), _: 
     asset = asset_service.get_asset(db, asset_id)
     if not asset or asset.project_id != project_id:
         raise HTTPException(404, "Asset not found")
+    tag_service.decorate_assets(db, [asset])
     return asset
 
 
@@ -165,6 +176,7 @@ def create_asset(project_id: str, data: AssetCreate, db: Session = Depends(get_d
     except IntegrityError:
         raise HTTPException(409, f"Asset '{name}' already exists in this project")
     project_service.refresh_counts(db, project_id)
+    tag_service.decorate_assets(db, [asset])
     return asset
 
 
@@ -173,6 +185,7 @@ def update_asset(project_id: str, asset_id: str, data: AssetUpdate, db: Session 
     asset = asset_service.update_asset(db, asset_id, data)
     if not asset or asset.project_id != project_id:
         raise HTTPException(404, "Asset not found")
+    tag_service.decorate_assets(db, [asset])
     return asset
 
 

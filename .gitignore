@@ -16,11 +16,15 @@ data/db/
 data/projects/
 
 # ── DNS wordlists & resolvers ─────────────────────────────────
-# Ship the default seed files; ignore any other user-supplied lists.
+# Ship the default resolver list and an empty wordlist placeholder (the user
+# supplies its contents); ignore any other user-supplied lists.
 data/wordlists/*
 !data/wordlists/dns_wordlist.txt
 data/resolvers/*
 !data/resolvers/resolvers.txt
+
+# ── Local maintenance helper (not part of the published project) ──
+install/clean.sh
 
 # ── Python ────────────────────────────────────────────────────
 __pycache__/

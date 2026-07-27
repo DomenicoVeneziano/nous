@@ -5,7 +5,6 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from datetime import datetime, timezone
 
 from runner import run_script
 from parsers.tech_parser import parse_tech_output
@@ -15,7 +14,7 @@ from queue_manager import (
     get_session, transition_status, get_asset_details,
     get_all_project_asset_details, update_asset_record, refresh_project_counts,
     get_project_domains, get_project_asset_hostnames,
-    insert_asset_if_absent, enqueue_tech_scan,
+    insert_asset_if_absent, enqueue_tech_scan, SOURCE_REDIRECT, utc_now_str,
 )
 
 
@@ -265,7 +264,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
         )
 
         # Mark dead assets: status_code=0, set title to DNS failure reason
-        now = datetime.now(timezone.utc).isoformat()
+        now = utc_now_str()
         for asset in dead_assets:
             reason = asset.get("dns_fail_reason", "NO_RECORDS")
             update_asset_record(
@@ -388,7 +387,10 @@ async def run_tech_job(job: dict, ws_broadcast=None):
                 dest = (dest or "").strip().lower()
                 if not dest or dest in existing or not _in_scope(dest, root_domains):
                     continue
-                new_id = insert_asset_if_absent(session, project_id, dest)
+                new_id = insert_asset_if_absent(
+                    session, project_id, dest,
+                    source=SOURCE_REDIRECT, scan_job_id=job_id,
+                )
                 if new_id:
                     existing.add(dest)
                     enqueue_tech_scan(session, project_id, new_id, cfg)

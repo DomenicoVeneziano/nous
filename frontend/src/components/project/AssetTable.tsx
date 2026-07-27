@@ -1,9 +1,16 @@
 // frontend/src/components/project/AssetTable.tsx
 import React, { useState, useMemo, useEffect } from 'react';
 import type { Asset, Highlight } from '../../types/asset';
+import { NEW_TAG_LABEL } from '../../types/tag';
 import { HighlightText } from '../shared/HighlightText';
+import TagChip, { orderTags } from '../shared/TagChip';
 
 const PAGE_SIZE_OPTIONS = [100, 250, 500, 1000];
+
+// Chips shown inline per row before collapsing into a "+n tags" counter. Source
+// tags accumulate, so an established asset can carry a lot of them; the cap
+// keeps the row readable and the asset panel holds the full list.
+const ROW_TAG_LIMIT = 4;
 
 interface Props {
   assets: Asset[];
@@ -127,6 +134,7 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
             <th style={thStyle} onClick={() => handleSort('content_length')}>
               Length{sortIndicator('content_length')}
             </th>
+            <th style={{ ...thStyle, cursor: 'default' }}>Tags</th>
             <th style={{ ...thStyle, cursor: 'default' }}>Technologies</th>
           </tr>
         </thead>
@@ -138,6 +146,22 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
             const titleHls = getHighlightsFor(highlights, 'title');
             const techHls = getHighlightsFor(highlights, 'tech');
             const hiddenBadges = getHiddenMatchBadges(highlights);
+            // Matched by snippet text rather than list index: the server builds
+            // its tag list in its own order, and the chips are reordered here.
+            const tagHls = getHighlightsFor(highlights, 'tag');
+            // "New!" is always shown — it is the reason to look at the row at
+            // all — and only the stored tags are capped.
+            const ordered = orderTags(asset.tags || []);
+            // A tag that matched the query has to survive the cap: reading
+            // order puts discovery sources first, so a matching user tag can
+            // otherwise collapse into "+n tags" and leave the row with nothing
+            // on screen explaining why the search returned it.
+            const matched = new Set(tagHls.map((h) => h.snippet));
+            const prioritized = matched.size > 0
+              ? [...ordered.filter((t) => matched.has(t.name)), ...ordered.filter((t) => !matched.has(t.name))]
+              : ordered;
+            const visibleTags = prioritized.slice(0, ROW_TAG_LIMIT);
+            const hiddenTagCount = prioritized.length - visibleTags.length;
 
             return (
               <tr
@@ -181,6 +205,40 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
                 </td>
                 <td style={{ ...tdStyle, fontFamily: 'var(--font-mono)', color: 'var(--text-code)', fontSize: 12 }}>
                   {asset.content_length != null ? asset.content_length.toLocaleString() : '-'}
+                </td>
+                <td style={tdStyle}>
+                  {visibleTags.length === 0 && !asset.is_new ? (
+                    <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>-</span>
+                  ) : (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center' }}>
+                      {asset.is_new && (
+                        <TagChip
+                          label={NEW_TAG_LABEL}
+                          variant="new"
+                          title="First seen by the most recent recon scan"
+                          spans={tagHls.filter((h) => h.snippet === NEW_TAG_LABEL)}
+                        />
+                      )}
+                      {visibleTags.map((tag) => (
+                        <TagChip
+                          key={tag.id}
+                          label={tag.name}
+                          variant={tag.is_system ? 'system' : 'user'}
+                          color={tag.color}
+                          title={tag.is_system ? `Discovery source: ${tag.name}` : tag.name}
+                          spans={tagHls.filter((h) => h.snippet === tag.name)}
+                        />
+                      ))}
+                      {hiddenTagCount > 0 && (
+                        <span style={{
+                          fontSize: 10, color: 'var(--text-muted)',
+                          fontFamily: 'var(--font-mono)', textDecoration: 'underline dotted',
+                        }}>
+                          +{hiddenTagCount} tag{hiddenTagCount === 1 ? '' : 's'}
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </td>
                 <td style={tdStyle}>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>

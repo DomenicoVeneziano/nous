@@ -72,8 +72,21 @@ if [[ -z "${skip_bruteforce:-}" ]]; then
     [[ ! -f "$wordlist" || ! -r "$wordlist" ]] && {
         echo "[!] Error: Wordlist '$wordlist' not found or unreadable."; exit 1;
     }
+    # No wordlist ships with Nous — the operator supplies one. An empty file is
+    # a hard error rather than a silent zero-result bruteforce.
+    [[ ! -s "$wordlist" ]] && {
+        echo "[!] Error: Wordlist '$wordlist' is empty."
+        echo "[!]        DNS bruteforce needs a wordlist you provide. Populate it, e.g.:"
+        echo "[!]          curl -sSL https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/DNS/subdomains-top1million-110000.txt \\"
+        echo "[!]            -o '$wordlist'"
+        echo "[!]        Or re-run the scan with DNS bruteforce disabled."
+        exit 1
+    }
     [[ ! -f "$resolvers" || ! -r "$resolvers" ]] && {
         echo "[!] Error: Resolvers '$resolvers' not found or unreadable."; exit 1;
+    }
+    [[ ! -s "$resolvers" ]] && {
+        echo "[!] Error: Resolvers file '$resolvers' is empty. Add one resolver IP per line."; exit 1;
     }
 fi
 
@@ -103,11 +116,16 @@ expanded_wordlist=$(mktemp /tmp/nous_expanded_wl.XXXXXX)
 filtered_wordlist=$(mktemp /tmp/nous_filtered_wl.XXXXXX)
 raw_archived_urls=$(mktemp /tmp/nous_archived_urls.XXXXXX)
 archived_urls_file="$(dirname "$output_file")/archived_urls.txt"
+# source<TAB>hostname, one line per (source, host) pair. Written alongside the
+# flat output file so the engine can attribute each subdomain to the phase that
+# produced it instead of losing that in the Step 7 merge.
+sources_file="$(dirname "$output_file")/subdomain_sources.tsv"
 
 cleanup() {
     rm -f "$active_subs" "$bruteforced_subs" "$permuted_subs" \
           "$combined_subs" "$wildcard_domains" "$new_words" \
-          "$expanded_wordlist" "$filtered_wordlist" "$raw_archived_urls"
+          "$expanded_wordlist" "$filtered_wordlist" "$raw_archived_urls" \
+          "$output_file.tmp.$$" "$archived_urls_file.tmp.$$" "$sources_file.tmp.$$"
 }
 trap cleanup EXIT
 # Convert a cancel/timeout signal into a normal exit so the EXIT trap above runs
@@ -118,6 +136,21 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 
 # ------------------------------------------------------------------------------
+# Atomic file replacement
+# ------------------------------------------------------------------------------
+# Replace "$1" with whatever is read from stdin. Redirecting straight at the
+# destination truncates it before the writer produces a byte, so a crash or a
+# kill mid-write leaves a truncated or empty checkpoint that the engine then
+# reads as authoritative. Staging in the same directory and renaming makes the
+# swap atomic: readers see either the old file or the complete new one.
+atomic_write() {
+    local dest="$1"
+    local tmp="${dest}.tmp.$$"
+    cat > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$dest"
+}
+
+# ------------------------------------------------------------------------------
 # Incremental output flush
 # ------------------------------------------------------------------------------
 # Write every subdomain discovered so far to the final output file, applying the
@@ -125,19 +158,32 @@ trap 'exit 130' INT
 # invocation so a cancelled or timed-out run leaves the maximum amount of partial
 # results on disk: the output file is the engine's source of truth and is never
 # removed by cleanup(), unlike the /tmp working files. Safe to call repeatedly;
-# strips ports inline so mid-step flushes (before the Step 1 dedup) stay clean.
+# strips userinfo and ports inline so mid-step flushes (before the Step 1 dedup)
+# stay clean. Every destination is replaced atomically.
 flush_output() {
+    # Strip any user:pass@ userinfo prefix before the port, otherwise
+    # "user:pass@host" collapses to "user" instead of "host".
     cat "$active_subs" "$bruteforced_subs" "$permuted_subs" 2>/dev/null \
-        | sed -e 's/:.*$//' \
+        | sed -e 's/^[^@]*@//' -e 's/:.*$//' \
         | sort -u > "$combined_subs" || true
     if [[ -n "${subs_file:-}" && -s "$subs_file" ]]; then
-        grep -vFxf "$subs_file" "$combined_subs" > "$output_file" 2>/dev/null || true
+        grep -vFxf "$subs_file" "$combined_subs" 2>/dev/null \
+            | atomic_write "$output_file" || true
     else
-        cp "$combined_subs" "$output_file" 2>/dev/null || true
+        atomic_write "$output_file" < "$combined_subs" 2>/dev/null || true
     fi
     # Persist archived URLs gathered so far too (gau/waymore stream into
     # raw_archived_urls); the engine's crawl-merge step reads archived_urls.txt.
-    sort -u "$raw_archived_urls" > "$archived_urls_file" 2>/dev/null || true
+    sort -u "$raw_archived_urls" 2>/dev/null \
+        | atomic_write "$archived_urls_file" || true
+    # Per-source attribution. Deliberately NOT filtered against subs_file: an
+    # already-known host that bruteforce independently rediscovers has genuinely
+    # been found by two sources, and the engine accumulates both tags.
+    {
+        awk -v s="Passive"      'NF {sub(/^[^@]*@/, ""); sub(/:.*$/, ""); print s"\t"$0}' "$active_subs"
+        awk -v s="Bruteforce"   'NF {sub(/^[^@]*@/, ""); sub(/:.*$/, ""); print s"\t"$0}' "$bruteforced_subs"
+        awk -v s="Permutations" 'NF {sub(/^[^@]*@/, ""); sub(/:.*$/, ""); print s"\t"$0}' "$permuted_subs"
+    } 2>/dev/null | sort -u | atomic_write "$sources_file" || true
 }
 
 # ==============================================================================
@@ -174,12 +220,13 @@ waymore -i "$domain" -mode U 2>/dev/null \
     | awk -F/ '{print $3}' | sort -u >> "$active_subs" || true
 flush_output  # checkpoint: + waymore results & archived URLs
 
-# Strip trailing port numbers (e.g., host:8080 → host) and deduplicate
-sed -i'' -e 's/:.*$//' "$active_subs"
+# Strip userinfo prefixes (user:pass@host → host) and trailing port numbers
+# (host:8080 → host), then deduplicate
+sed -i'' -e 's/^[^@]*@//' -e 's/:.*$//' "$active_subs"
 sort -u "$active_subs" -o "$active_subs"
 
 # Write deduplicated archived URLs for the Python job to process
-sort -u "$raw_archived_urls" > "$archived_urls_file"
+sort -u "$raw_archived_urls" | atomic_write "$archived_urls_file"
 
 echo "[+] Active scan complete. Found $(wc -l < "$active_subs") unique subdomains."
 
@@ -385,10 +432,10 @@ echo "[+] ================================================================"
 
 if [[ -n "${subs_file:-}" && -s "$subs_file" ]]; then
     echo "[+] Excluding entries found in $subs_file ..."
-    grep -vFxf "$subs_file" "$combined_subs" > "$output_file" || true
+    grep -vFxf "$subs_file" "$combined_subs" | atomic_write "$output_file" || true
 else
     echo "[*] No known-subdomains file provided. Writing all results."
-    cp "$combined_subs" "$output_file"
+    atomic_write "$output_file" < "$combined_subs"
 fi
 echo ""
 

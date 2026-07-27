@@ -12,7 +12,6 @@ class Settings(BaseSettings):
     # Leave empty to derive it deterministically from SECRET_KEY (both backend and
     # engine read SECRET_KEY from the same .env, so the derived value matches).
     ENGINE_WS_SECRET: str = ""
-    DATABASE_URL: str = "sqlite:///data/db/nous.db"
     DATA_DIR: Path = Path("./data")
     SCRIPTS_DIR: Path = Path("./scripts")
     WORDLIST_PATH: Path = Path("./data/wordlists/dns_wordlist.txt")
@@ -45,7 +44,25 @@ class Settings(BaseSettings):
     PROXY_TECH: bool = False            # route tech-analysis traffic through the proxy
     PROXY_CRAWL: bool = False           # route crawler traffic through the proxy
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # Anchor the .env lookup to the project root rather than the process's
+    # working directory: running `uvicorn main:app` from backend/ would
+    # otherwise find no .env and fall back to the placeholder credentials
+    # above, silently signing tokens with a key that is public in the repo.
+    #
+    # Under Docker this resolves to /.env, which does not exist — harmless,
+    # because compose passes the same .env in as environment variables via
+    # env_file, and those take precedence anyway. It only matters for the
+    # bare-metal path.
+    #
+    # extra="ignore" because .env is shared with docker compose, which reads
+    # keys that are not application settings (BACKEND_PORT, FRONTEND_PORT).
+    # Without it, loading the .env that install/setup.sh generates fails
+    # validation outright.
+    model_config = {
+        "env_file": Path(__file__).resolve().parent.parent / ".env",
+        "env_file_encoding": "utf-8",
+        "extra": "ignore",
+    }
 
 
 settings = Settings()

@@ -2,6 +2,7 @@
 import React, { useState } from 'react';
 import type { ScanJob } from '../../types/scan';
 import { cancelJob, clearHistory } from '../../api/scans';
+import { parseBackendDate } from '../../lib/datetime';
 import StatusBadge from '../shared/StatusBadge';
 import { Trash2 } from 'lucide-react';
 
@@ -154,7 +155,7 @@ export default function ScanHistory({ jobs, onRefresh }: Props) {
                   {formatDuration(job.duration_s)}
                 </td>
                 <td style={{ ...tdStyle, color: 'var(--text-muted)', fontSize: 11, fontFamily: 'var(--font-mono)' }}>
-                  {job.started_at ? new Date(job.started_at).toLocaleString() : '-'}
+                  {job.started_at ? parseBackendDate(job.started_at).toLocaleString() : '-'}
                 </td>
                 <td style={{
                   ...tdStyle, color: 'var(--status-error)', fontSize: 11,

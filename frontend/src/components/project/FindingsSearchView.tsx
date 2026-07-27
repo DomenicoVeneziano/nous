@@ -4,6 +4,7 @@ import { Search, X, ChevronLeft, ChevronRight } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import type { FindingSearchResult, Severity } from '../../types/finding';
 import { searchFindings } from '../../api/findings';
+import { parseBackendDate } from '../../lib/datetime';
 import { mdComponents } from '../shared/markdownComponents';
 
 interface Props {
@@ -96,7 +97,7 @@ export default function FindingsSearchView({ projectId }: Props) {
     return () => window.removeEventListener('keydown', onKey);
   }, [overlayIdx, prevFinding, nextFinding, closeOverlay]);
 
-  const formatDate = (iso: string) => new Date(iso).toLocaleDateString('en-US', {
+  const formatDate = (iso: string) => parseBackendDate(iso).toLocaleDateString('en-US', {
     year: 'numeric', month: 'short', day: 'numeric',
   });
 

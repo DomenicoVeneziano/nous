@@ -27,6 +27,7 @@ const ASSET_SEARCH_SECTIONS = [
       { label: 'content_length:', desc: 'Response size in bytes' },
       { label: 'dns:',            desc: 'DNS record content' },
       { label: 'url:',            desc: 'Crawled URL paths' },
+      { label: 'tag:',            desc: 'Tag name, including sources and New! (e.g. tag:Bruteforce)' },
     ],
   },
   {

@@ -12,7 +12,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import websockets
 
 from sqlalchemy.exc import OperationalError
-from queue_manager import get_session, fetch_next_job, get_job_status
+from queue_manager import get_session, fetch_next_job, get_job_status, migrations_complete
 from jobs.recon_job import run_recon_job
 from jobs.tech_job import run_tech_job
 from jobs.crawler_job import run_crawler_job
@@ -99,18 +99,27 @@ class WSBroadcaster:
 
 
 def wait_for_db(retries: int = 10, delay: int = 3):
-    """Block until scan_jobs table is accessible, retrying on OperationalError."""
+    """Block until the backend's schema migrations have committed.
+
+    Waits on the migration sentinel rather than on a table: scan_jobs exists
+    before the tagging ALTERs have run, so probing it let the worker start
+    mid-migration and write assets against columns (first_seen, tags_text) that
+    were not there yet. An absent sentinel is as much "not ready" as an absent
+    table, so both retry.
+    """
     for attempt in range(1, retries + 1):
         session = get_session()
         try:
-            fetch_next_job(session)
-            log.info("Database ready.")
-            return
+            if migrations_complete(session):
+                log.info("Database ready.")
+                return
+            reason = "migrations not finished"
         except OperationalError as e:
-            log.warning(f"DB not ready (attempt {attempt}/{retries}): {e.orig} — retrying in {delay}s")
-            time.sleep(delay)
+            reason = e.orig
         finally:
             session.close()
+        log.warning(f"DB not ready (attempt {attempt}/{retries}): {reason} — retrying in {delay}s")
+        time.sleep(delay)
     log.error("Database never became ready — aborting.")
     sys.exit(1)
 

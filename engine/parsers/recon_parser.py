@@ -4,6 +4,9 @@ from urllib.parse import urlparse
 
 _HOSTNAME_RE = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*$')
 
+# Source labels recon.sh writes into subdomain_sources.tsv.
+_KNOWN_SOURCES = {"Passive", "Bruteforce", "Permutations"}
+
 _STATIC_PATTERN = re.compile(
     r'\.(png|jpg|jpeg|gif|svg|ico|css|woff|woff2|ttf|eot|mp4|webm)(\?|/|$)',
     re.IGNORECASE
@@ -36,6 +39,30 @@ def parse_recon_output(raw_stdout: str) -> list[str]:
             results.append(hostname)
 
     return results
+
+
+def parse_subdomain_sources(raw_content: str) -> dict[str, set[str]]:
+    """
+    Parse recon.sh's subdomain_sources.tsv into {source: {hostname, ...}}.
+
+    Format is `source<TAB>hostname`, one line per pair; a hostname legitimately
+    appears under more than one source when independent phases both found it.
+    Unknown sources and malformed hostnames are dropped.
+    """
+    by_source: dict[str, set[str]] = {}
+
+    for line in raw_content.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) != 2:
+            continue
+        source, hostname = parts[0].strip(), parts[1].strip().lower()
+        if source not in _KNOWN_SOURCES or not hostname:
+            continue
+        if len(hostname) > 253 or not _HOSTNAME_RE.match(hostname):
+            continue
+        by_source.setdefault(source, set()).add(hostname)
+
+    return by_source
 
 
 def parse_archived_urls(raw_content: str) -> dict[str, list[str]]:

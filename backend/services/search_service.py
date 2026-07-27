@@ -1,8 +1,8 @@
 # backend/services/search_service.py
 import re
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 from models.asset import Asset
+from models.tag import DERIVED_NEW_TAG
 from config import settings
 from schemas.asset_search import Highlight
 
@@ -19,16 +19,9 @@ _FILE_SNIPPET_PAD = 80
 # Strict field whitelist
 VALID_FIELDS = {
     "hostname", "tech", "status", "title", "content", "content_length", "dns",
-    "url", "type", "date", "header", "body", "severity",
+    "url", "type", "date", "header", "body", "severity", "tag",
     "vuln",  # expanded to pattern checks at search time
 }
-
-# Fields that search response files on disk (slow)
-_FILE_FIELDS = {"content", "header", "body"}
-
-# Fields excluded from FTS5 pre-filter
-_NO_FTS_FIELDS = _FILE_FIELDS | {"url", "type", "date", "severity", "vuln"}
-
 
 _OPERATORS = {"AND", "OR", "NOT", "XOR"}
 
@@ -230,6 +223,24 @@ def _find_spans(target: str, value: str, is_regex: bool) -> list[tuple[int, int]
     return spans
 
 
+def _derived_tag_spans(value: str, is_regex: bool) -> list[tuple[int, int]]:
+    """Match spans of a `tag:` clause against the derived "New!" name.
+
+    Stored tags match on substrings, which is what an operator wants when they
+    can see the name in the tag list and type part of it. "New!" is not in that
+    list — it is synthesised per request — so substring semantics there mean
+    `tag:e` and even `tag:!` silently select every new asset. Require equality
+    (case-insensitively, matching how tag_service treats the reserved name)
+    instead; a regex clause keeps regex semantics, since a /…/ pattern is an
+    explicit request for pattern matching rather than an incidental substring.
+    """
+    if is_regex:
+        return _find_spans(DERIVED_NEW_TAG, value, True)
+    if value.lower() == DERIVED_NEW_TAG.lower():
+        return [(0, len(DERIVED_NEW_TAG))]
+    return []
+
+
 def _build_window(text: str, start: int, end: int, pad: int = _FILE_SNIPPET_PAD) -> tuple[str, int, int]:
     """
     Extract a context window around [start, end) from `text`.
@@ -334,6 +345,24 @@ def _match_asset(
             highlights.extend(_spans_to_highlights(spans, field, field, url))
         return bool(highlights), highlights
 
+    elif field == "tag":
+        # Stored tags come from assets.tags; "New!" is derived and lives only on
+        # the decorated attribute, so it is checked separately rather than
+        # indexed — and under the stricter predicate in _derived_tag_spans.
+        names = [t.name for t in asset.tags]
+        highlights = []
+        for i, name in enumerate(names):
+            spans = _find_spans(name, value, is_regex)
+            highlights.extend(_spans_to_highlights(spans, field, field, name, index=i))
+        if getattr(asset, "is_new", False):
+            # Indexed one past the stored tags, the position the marker occupies
+            # in the rendered chip list.
+            highlights.extend(_spans_to_highlights(
+                _derived_tag_spans(value, is_regex), field, field,
+                DERIVED_NEW_TAG, index=len(names),
+            ))
+        return bool(highlights), highlights
+
     elif field == "type":
         target = asset.asset_type or ""
         spans = _find_spans(target, value, is_regex)
@@ -433,7 +462,7 @@ def search_assets(
 ) -> list[Asset]:
     """
     Search assets using structured query syntax.
-    Uses FTS5 for initial candidate filtering, then applies regex/field matching.
+    Scans every candidate asset and applies regex/field matching.
     Each matched asset has a .highlights attribute attached (list[Highlight]).
     """
     clauses = _parse_query(query)
@@ -445,34 +474,27 @@ def search_assets(
     vuln_checks_map = _build_vuln_checks_map(db, clauses)
     severity_map = _build_severity_map(db, clauses)
 
-    # Try FTS5 pre-filter for eligible fields only
-    fts_terms = []
-    for c in clauses:
-        if c["field"] not in _NO_FTS_FIELDS and not c["is_regex"]:
-            fts_terms.append(c["value"])
-
-    if fts_terms:
-        fts_query = " OR ".join(f'"{t}"' for t in fts_terms)
-        rows = db.execute(
-            text("SELECT asset_id FROM asset_fts WHERE asset_fts MATCH :q"),
-            {"q": fts_query},
-        ).fetchall()
-        candidate_ids = [r[0] for r in rows]
-
-        if candidate_ids:
-            q = db.query(Asset).filter(Asset.id.in_(candidate_ids))
-        else:
-            # FTS returned nothing — fall back to a full project scan so that
-            # regex clauses and any FTS tokenization mismatches still work.
-            # (FTS is an optimisation, not a correctness gate.)
-            q = db.query(Asset)
-    else:
-        q = db.query(Asset)
+    # Every row is a candidate; the matcher alone decides. There used to be an
+    # asset_fts MATCH prefilter here, but a plain clause matches substrings
+    # (`_find_spans` walks the target with str.find) while FTS5's unicode61
+    # tokenizer only ever matches whole tokens — so `hostname:admin` indexes as
+    # the token "admin" and never sees `admin1.example.com`. A token index
+    # cannot bound a substring search, which makes any candidate set it produces
+    # a subset, not a superset, of the truth; falling back only on an *empty*
+    # set hid that, because a partial set silently became the answer. The scan
+    # is the correctness guarantee. asset_fts is left in place and maintained by
+    # its triggers, it just no longer gates search.
+    q = db.query(Asset)
 
     if project_id:
         q = q.filter(Asset.project_id == project_id)
 
     candidates = q.all()
+
+    # Resolve the derived "New!" marker before matching so `tag:` clauses can
+    # see it alongside the stored tags.
+    from services.tag_service import decorate_assets
+    decorate_assets(db, candidates)
 
     # Apply detailed matching and collect highlights
     results = []

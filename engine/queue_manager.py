@@ -13,6 +13,36 @@ DB_PATH = DATA_DIR / "db" / "nous.db"
 # Canonical empty per-source endpoint object stored in assets.crawled_urls.
 EMPTY_CRAWLED_URLS = '{"crawling": [], "archived": []}'
 
+# Discovery-source tag names for the paths the engine discovers through. A
+# partial mirror of backend/models/tag.py — the engine runs as a separate service
+# and cannot import backend code — deliberately leaving out Manual and Seed,
+# which only the backend ever applies. Keep the shared names in step.
+SOURCE_PASSIVE = "Passive"
+SOURCE_BRUTEFORCE = "Bruteforce"
+SOURCE_PERMUTATIONS = "Permutations"
+SOURCE_CRAWLING = "Crawling"
+SOURCE_REDIRECT = "Redirect"
+
+# SQLite caps bound parameters per statement; chunk long id lists well under it.
+_ID_CHUNK = 500
+
+# Sentinel row the backend writes into app_settings in the same transaction as
+# its schema migrations (mirrors _FTS_SENTINEL in backend/database.py).
+MIGRATION_SENTINEL = "FTS_ROWID_REBUILD"
+
+# SQLAlchemy stores DateTime columns on SQLite as naive "%Y-%m-%d %H:%M:%S.%f".
+# The engine writes those same columns through raw SQL, so it has to emit that
+# exact shape: an isoformat() offset value ("...T...+00:00") does not parse back
+# through the ORM, and mixing the two breaks ORDER BY — ' ' (0x20) sorts before
+# 'T', so offset rows collate as if they were older than every naive one.
+_TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+
+
+def utc_now_str() -> str:
+    """Current UTC time in the textual format SQLAlchemy uses for DateTime."""
+    return datetime.now(timezone.utc).strftime(_TS_FORMAT)
+
+
 # Valid status transitions
 VALID_TRANSITIONS = {
     "queued": {"running", "cancelled"},
@@ -63,6 +93,19 @@ def _parse_dns(raw) -> list:
     return _parse_json(raw, default=[])
 
 
+def migrations_complete(session: Session) -> bool:
+    """True once the backend has committed its schema migrations.
+
+    The sentinel is written in the same transaction that adds the tagging
+    columns, so its presence is the only cheap proof the engine can write to
+    them. Raises OperationalError while app_settings itself is still missing.
+    """
+    row = session.execute(text(
+        "SELECT 1 FROM app_settings WHERE key = :k"
+    ), {"k": MIGRATION_SENTINEL}).fetchone()
+    return row is not None
+
+
 def fetch_next_job(session: Session) -> dict | None:
     """Get the next queued job ordered by queue_pos."""
     row = session.execute(text(
@@ -94,9 +137,9 @@ def transition_status(session: Session, job_id: str, from_status: str, to_status
 
     updates = {"status": to_status}
     if to_status == "running":
-        updates["started_at"] = datetime.now(timezone.utc).isoformat()
+        updates["started_at"] = utc_now_str()
     if to_status in ("done", "failed", "timed_out", "cancelled"):
-        updates["finished_at"] = datetime.now(timezone.utc).isoformat()
+        updates["finished_at"] = utc_now_str()
 
     updates.update(kwargs)
 
@@ -188,24 +231,162 @@ def update_asset_record(session: Session, hostname: str, project_id: str, **fiel
     session.commit()
 
 
-def insert_assets_bulk(session: Session, project_id: str, hostnames: list[str]) -> int:
-    """Insert new asset records, skipping duplicates. Returns count created."""
+def ensure_tag(session: Session, project_id: str, name: str) -> str:
+    """Get-or-create a system tag for a project. Returns its id."""
+    row = session.execute(text(
+        "SELECT id FROM tags WHERE project_id = :pid AND name = :name"
+    ), {"pid": project_id, "name": name}).fetchone()
+    if row:
+        return row[0]
+    tag_id = str(uuid.uuid4())
+    session.execute(text(
+        "INSERT OR IGNORE INTO tags (id, project_id, name, is_system, created_at) "
+        "VALUES (:id, :pid, :name, 1, :now)"
+    ), {"id": tag_id, "pid": project_id, "name": name, "now": utc_now_str()})
+    session.commit()
+    # A concurrent writer may have won the race; re-read rather than assume.
+    row = session.execute(text(
+        "SELECT id FROM tags WHERE project_id = :pid AND name = :name"
+    ), {"pid": project_id, "name": name}).fetchone()
+    return row[0]
+
+
+# The tags_text mirror rendered from the join table. Byte-identical to the
+# expression in backend/services/tag_service.py: both processes write this column
+# and identical SQL is what stops them ping-ponging two renderings of the same
+# tag set at each other. Change one only by changing the other.
+_TAGS_TEXT_EXPR = (
+    "COALESCE(("
+    " SELECT GROUP_CONCAT(t.name, ' ') FROM asset_tags at"
+    " JOIN tags t ON t.id = at.tag_id WHERE at.asset_id = assets.id"
+    "), '')"
+)
+_SYNC_TAGS_TEXT_SQL = f"UPDATE assets SET tags_text = {_TAGS_TEXT_EXPR}"
+
+# Restrict the rewrite to rows whose mirror does not already hold what the SET
+# would write. Every UPDATE on `assets` fires assets_au, which deletes and
+# reinserts the entire FTS row, so an id-scoped rewrite with no value comparison
+# pays full reindex cost for assets whose tags did not change — and attach_source_tag
+# is handed the whole result set on every recon pass, most of it already tagged.
+#
+# `IS NOT`, never `!=`: SQLite evaluates `NULL != x` to NULL, so `!=` would drop a
+# NULL mirror from the update set and leave that row's drift unrepaired. tags_text
+# is NOT NULL on every path today, so this guards a future nullable column rather
+# than a reachable bug — but `!=` has no upside to trade for that.
+#
+# The subquery is spelled out on both sides on purpose — SET and WHERE have to
+# evaluate the identical expression. GROUP_CONCAT's order is plan-determined
+# (neither alphabetical nor insertion order), which is harmless precisely because
+# both sides are the same subquery inside one statement, so a skip can only mean
+# stored == computed. Do not add ORDER BY to one side alone.
+#
+# One incidental effect is lost: the unconditional form also rewrote the other
+# eight FTS columns, so it repaired rows that had gone stale for reasons having
+# nothing to do with tags. Repairing those is the rebuild path's job, not this one's.
+_DRIFTED_ONLY = f"tags_text IS NOT {_TAGS_TEXT_EXPR}"
+
+
+def sync_tags_text(session: Session, asset_ids: list[str]) -> None:
+    """Refresh the denormalized tags_text mirror on `assets`.
+
+    The FTS triggers fire on `assets` only, so writing to the asset_tags join
+    table alone would leave the search index stale. Every tag change has to end
+    in an UPDATE here. Mirrors backend/services/tag_service.sync_tags_text.
+    """
+    for start in range(0, len(asset_ids), _ID_CHUNK):
+        chunk = asset_ids[start:start + _ID_CHUNK]
+        placeholders, params = _in_params(chunk)
+        session.execute(text(
+            f"{_SYNC_TAGS_TEXT_SQL} WHERE id IN ({placeholders}) AND {_DRIFTED_ONLY}"
+        ), params)
+
+
+def attach_source_tag(session: Session, project_id: str, hostnames: list[str], source: str) -> None:
+    """Tag every named asset with a discovery source.
+
+    Applied to hostnames that already existed as well as newly inserted ones:
+    an asset independently re-found by bruteforce genuinely has two sources, and
+    that accumulation is the signal. Source tags are never removed automatically.
+    """
+    names = [h.strip().lower() for h in hostnames if h and h.strip()]
+    if not names:
+        return
+    tag_id = ensure_tag(session, project_id, source)
+    asset_ids: list[str] = []
+    for start in range(0, len(names), _ID_CHUNK):
+        chunk = names[start:start + _ID_CHUNK]
+        placeholders, params = _in_params(chunk)
+        params["pid"] = project_id
+        rows = session.execute(text(
+            f"SELECT id FROM assets WHERE project_id = :pid AND asset IN ({placeholders})"
+        ), params).fetchall()
+        asset_ids.extend(r[0] for r in rows)
+    for asset_id in asset_ids:
+        session.execute(text(
+            "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (:a, :t)"
+        ), {"a": asset_id, "t": tag_id})
+    sync_tags_text(session, asset_ids)
+    session.commit()
+
+
+def set_last_crawl_at(session: Session, project_id: str, hostnames: list[str]) -> None:
+    """Stamp the crawl timestamp on the given assets."""
+    names = [h.strip().lower() for h in hostnames if h and h.strip()]
+    if not names:
+        return
+    now = utc_now_str()
+    for start in range(0, len(names), _ID_CHUNK):
+        chunk = names[start:start + _ID_CHUNK]
+        placeholders, params = _in_params(chunk)
+        params["pid"] = project_id
+        params["now"] = now
+        session.execute(text(
+            f"UPDATE assets SET last_crawl_at = :now "
+            f"WHERE project_id = :pid AND asset IN ({placeholders})"
+        ), params)
+    session.commit()
+
+
+def insert_assets_bulk(
+    session: Session,
+    project_id: str,
+    hostnames: list[str],
+    source: str | None = None,
+    scan_job_id: str | None = None,
+) -> int:
+    """Insert new asset records, skipping duplicates. Returns count created.
+
+    first_seen / first_seen_scan_id are set on insert only, never on a
+    re-discovery: they record when the asset entered the project, and the
+    scan id is what the derived "New!" badge is compared against.
+    """
     count = 0
+    now = utc_now_str()
     for hostname in hostnames:
         hostname = hostname.strip().lower()
         if not hostname:
             continue
         result = session.execute(text(
             "INSERT OR IGNORE INTO assets "
-            "(id, project_id, asset, asset_type, dns_records, technologies, crawled_urls, manually_inserted) "
-            "VALUES (:id, :pid, :asset, 'subdomain', '[]', '[]', :cu, 0)"
-        ), {"id": str(uuid.uuid4()), "pid": project_id, "asset": hostname, "cu": EMPTY_CRAWLED_URLS})
+            "(id, project_id, asset, asset_type, dns_records, technologies, crawled_urls, "
+            "first_seen, first_seen_scan_id, tags_text) "
+            "VALUES (:id, :pid, :asset, 'subdomain', '[]', '[]', :cu, :now, :job, '')"
+        ), {"id": str(uuid.uuid4()), "pid": project_id, "asset": hostname,
+            "cu": EMPTY_CRAWLED_URLS, "now": now, "job": scan_job_id})
         count += result.rowcount
     session.commit()
+    if source:
+        attach_source_tag(session, project_id, hostnames, source)
     return count
 
 
-def insert_asset_if_absent(session: Session, project_id: str, hostname: str) -> str | None:
+def insert_asset_if_absent(
+    session: Session,
+    project_id: str,
+    hostname: str,
+    source: str | None = None,
+    scan_job_id: str | None = None,
+) -> str | None:
     """Insert a single subdomain asset if it does not already exist.
     Returns the new asset id if created, or None if it was already present."""
     hostname = hostname.strip().lower()
@@ -214,10 +395,14 @@ def insert_asset_if_absent(session: Session, project_id: str, hostname: str) -> 
     new_id = str(uuid.uuid4())
     result = session.execute(text(
         "INSERT OR IGNORE INTO assets "
-        "(id, project_id, asset, asset_type, dns_records, technologies, crawled_urls, manually_inserted) "
-        "VALUES (:id, :pid, :asset, 'subdomain', '[]', '[]', :cu, 0)"
-    ), {"id": new_id, "pid": project_id, "asset": hostname, "cu": EMPTY_CRAWLED_URLS})
+        "(id, project_id, asset, asset_type, dns_records, technologies, crawled_urls, "
+        "first_seen, first_seen_scan_id, tags_text) "
+        "VALUES (:id, :pid, :asset, 'subdomain', '[]', '[]', :cu, :now, :job, '')"
+    ), {"id": new_id, "pid": project_id, "asset": hostname, "cu": EMPTY_CRAWLED_URLS,
+        "now": utc_now_str(), "job": scan_job_id})
     session.commit()
+    if source:
+        attach_source_tag(session, project_id, [hostname], source)
     return new_id if result.rowcount else None
 
 
@@ -237,7 +422,7 @@ def enqueue_tech_scan(session: Session, project_id: str, asset_id: str, config: 
         "pid": project_id,
         "pos": next_pos,
         "aids": json.dumps([asset_id]),
-        "created": datetime.now(timezone.utc).isoformat(),
+        "created": utc_now_str(),
         "cfg": json.dumps(config) if config is not None else None,
     })
     session.commit()

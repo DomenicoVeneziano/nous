@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import { Pencil, Check, X, Copy, KeyRound } from 'lucide-react';
 import type { ApiKey, ApiKeyCreated } from '../../types/apiKey';
 import { fetchApiKeys, createApiKey, renameApiKey, deleteApiKey } from '../../api/apiKeys';
+import { parseBackendDate } from '../../lib/datetime';
 import { useAuth } from '../../hooks/useAuth';
 import ConfirmModal from '../shared/ConfirmModal';
 
@@ -44,7 +45,7 @@ function typeBadgeStyle(key_type: 'edit' | 'view'): React.CSSProperties {
 
 function formatDate(iso: string | null): string {
   if (!iso) return '—';
-  return new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  return parseBackendDate(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
 export default function ApiKeyManagement() {

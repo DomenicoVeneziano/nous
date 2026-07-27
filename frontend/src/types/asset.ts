@@ -1,4 +1,6 @@
 // frontend/src/types/asset.ts
+import type { Tag } from './tag';
+
 export interface Highlight {
   field: string;
   source: string;
@@ -31,8 +33,12 @@ export interface Asset {
   response_file_path: string | null;
   screenshot_path: string | null;
   crawled_urls: CrawledUrls;
-  date_scanned: string | null;
-  manually_inserted: boolean;
+  date_scanned: string | null; // last tech analysis
+  first_seen: string | null;
+  last_crawl_at: string | null;
+  tags: Tag[];
+  /** Derived server-side: first seen by the project's most recent recon job. */
+  is_new: boolean;
 }
 
 export interface AssetCreate {

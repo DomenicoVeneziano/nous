@@ -4,8 +4,11 @@ from models.project import Project
 from models.asset import Asset
 from models.scan import ScanJob
 from models.finding import Finding
+from models.tag import SOURCE_SEED, Tag, asset_tags
 from schemas.project import ProjectCreate, ProjectUpdate
+from services import tag_service
 from config import settings
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import shutil
@@ -36,23 +39,49 @@ def _split_domains_and_assets(entries: list[str]) -> tuple[list[str], list[str]]
 
 
 def _create_assets_from_hostnames(db: Session, project_id: str, hostnames: list[str]):
-    """Create assets for each hostname, skipping duplicates."""
+    """Create assets for each hostname, skipping duplicates.
+
+    These come from the project's scope field rather than a scan, so they carry
+    the Seed source tag.
+    """
     existing = {
-        a.asset
-        for a in db.query(Asset.asset).filter(Asset.project_id == project_id).all()
+        a.asset: a.id
+        for a in db.query(Asset.asset, Asset.id).filter(Asset.project_id == project_id).all()
     }
+    now = datetime.now(timezone.utc)
+    created_ids: list[str] = []
+    # Hostnames the scope names that are already assets — found by an earlier
+    # scan, or carried over from a previous scope edit. Skipping the insert does
+    # not mean skipping the tag: the scope naming them is what Seed records, the
+    # same reasoning that has the engine's attach_source_tag stamp its source on
+    # rows it did not create. Ids, so a repeated hostname tags one asset once.
+    seeded_ids: set[str] = set()
     for hostname in hostnames:
         hostname = hostname.strip()
-        if not hostname or hostname in existing:
+        if not hostname:
             continue
+        asset_id = existing.get(hostname)
+        if asset_id:
+            seeded_ids.add(asset_id)
+            continue
+        asset_id = str(uuid.uuid4())
         db.add(Asset(
-            id=str(uuid.uuid4()),
+            id=asset_id,
             project_id=project_id,
             asset=hostname,
             asset_type="subdomain",
-            manually_inserted=True,
+            first_seen=now,
         ))
-        existing.add(hostname)
+        existing[hostname] = asset_id
+        created_ids.append(asset_id)
+    if not created_ids and not seeded_ids:
+        return
+    db.commit()
+    tag = tag_service.ensure_system_tag(db, project_id, SOURCE_SEED)
+    # INSERT OR IGNORE on the join table, and the mirror rewrite skips rows whose
+    # tags_text already matches, so re-seeding an asset that carries Seed costs
+    # nothing and reindexes nothing.
+    tag_service.assign_tag_bulk(db, created_ids + sorted(seeded_ids), tag.id)
 
 
 def create_project(db: Session, data: ProjectCreate) -> Project:
@@ -132,7 +161,14 @@ def delete_project(db: Session, project_id: str) -> bool:
         return False
     db.query(Finding).filter(Finding.project_id == project_id).delete()
     db.query(ScanJob).filter(ScanJob.project_id == project_id).delete()
+    # Drop tag links before the assets they belong to: these are bulk deletes,
+    # which bypass ORM cascades, and tags.project_id carries no foreign key of
+    # its own, so nothing would reclaim these rows otherwise.
+    asset_ids = [a.id for a in db.query(Asset.id).filter(Asset.project_id == project_id)]
+    if asset_ids:
+        db.execute(asset_tags.delete().where(asset_tags.c.asset_id.in_(asset_ids)))
     db.query(Asset).filter(Asset.project_id == project_id).delete()
+    db.query(Tag).filter(Tag.project_id == project_id).delete()
     db.delete(project)
     db.commit()
     project_dir = settings.DATA_DIR / "projects" / project_id

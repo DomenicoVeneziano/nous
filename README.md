@@ -32,7 +32,9 @@ bash install/setup.sh && docker compose up --build -d
 
 ### Recon Pipeline
 
-Full subdomain enumeration via subfinder, amass, crt.sh, gau, and waymore; followed by DNS bruteforce with puredns + ripgen permutations, wildcard detection, and deduplication. Results are queued in a SQLite-backed job queue that survives restarts.
+Full subdomain enumeration via subfinder, crt.sh, gau, and waymore; followed by DNS bruteforce with puredns + ripgen permutations, wildcard detection, and deduplication. Results are queued in a SQLite-backed job queue that survives restarts.
+
+DNS bruteforce is disabled by default and needs a wordlist you supply — `data/wordlists/dns_wordlist.txt` ships empty. Drop your own list there (e.g. a SecLists DNS list) before enabling it; recon aborts with an explicit error rather than silently finding nothing.
 
 ### Tech Detection & Crawling
 

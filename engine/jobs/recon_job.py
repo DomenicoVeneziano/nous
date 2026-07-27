@@ -6,11 +6,13 @@ import tempfile
 from pathlib import Path
 
 from runner import run_script, validate_domain, validate_path_within, proxy_env
-from parsers.recon_parser import parse_recon_output, parse_archived_urls
+from parsers.recon_parser import (
+    parse_recon_output, parse_archived_urls, parse_subdomain_sources,
+)
 from queue_manager import (
     get_session, transition_status, get_project_domains,
     get_project_asset_hostnames, insert_assets_bulk, merge_crawled_urls_bulk,
-    refresh_project_counts,
+    refresh_project_counts, attach_source_tag,
 )
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -81,10 +83,20 @@ async def run_recon_job(job: dict, ws_broadcast=None):
 
         output_file = project_dir / "subdomains.txt"
         archived_urls_file = project_dir / "archived_urls.txt"
+        sources_file = project_dir / "subdomain_sources.tsv"
         result = None
         new_count = 0
 
-        def parse_outputs() -> tuple[list[str], dict[str, set[str]]]:
+        # Clear the intermediates up front as well as in the finally block. The
+        # script only rewrites them once it is past its own argument/dependency
+        # checks, and a hard-killed worker never reaches its finally, so a file
+        # left by an earlier run would otherwise be parsed as this run's output
+        # and attribute source tags that were never rediscovered. Source tags
+        # are never removed automatically, so a wrong one is permanent.
+        archived_urls_file.unlink(missing_ok=True)
+        sources_file.unlink(missing_ok=True)
+
+        def parse_outputs() -> tuple[list[str], dict[str, set[str]], dict[str, set[str]]]:
             """Parse whatever recon has written to disk so far.
 
             Best-effort: used both on the normal success path and when a run is
@@ -104,12 +116,29 @@ async def run_recon_job(job: dict, ws_broadcast=None):
                     host_paths.setdefault(host, set()).update(paths)
             except FileNotFoundError:
                 pass
-            return subs, host_paths
+            sources: dict[str, set[str]] = {}
+            try:
+                raw_sources = sources_file.read_text(encoding="utf-8", errors="replace")
+                sources = parse_subdomain_sources(raw_sources)
+            except FileNotFoundError:
+                pass
+            return subs, host_paths, sources
 
-        def persist(subs: list[str], host_paths: dict[str, set[str]]) -> int:
+        def persist(
+            subs: list[str],
+            host_paths: dict[str, set[str]],
+            sources: dict[str, set[str]],
+        ) -> int:
             """Commit recon results immediately. Safe to call repeatedly so that
             assets survive a later timeout/cancel/failure."""
-            count = insert_assets_bulk(session, project_id, subs) if subs else 0
+            count = insert_assets_bulk(
+                session, project_id, subs, scan_job_id=job_id
+            ) if subs else 0
+            # Tag after the insert so newly created rows are resolvable. Hosts
+            # already known to the project are tagged too — an independent
+            # rediscovery is a real second source.
+            for source, hosts in sources.items():
+                attach_source_tag(session, project_id, sorted(hosts), source)
             if host_paths:
                 merge_crawled_urls_bulk(session, project_id, host_paths, source="archived")
             if subs or host_paths:
@@ -202,4 +231,5 @@ async def run_recon_job(job: dict, ws_broadcast=None):
             except OSError:
                 pass
         (project_dir / "archived_urls.txt").unlink(missing_ok=True)
+        (project_dir / "subdomain_sources.tsv").unlink(missing_ok=True)
         session.close()

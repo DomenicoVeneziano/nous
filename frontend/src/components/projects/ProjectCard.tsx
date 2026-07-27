@@ -2,6 +2,7 @@
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { Project } from '../../types/project';
+import { parseBackendDate } from '../../lib/datetime';
 import ProjectIcon from './ProjectIcon';
 
 interface Props {
@@ -142,7 +143,7 @@ export default function ProjectCard({ project, selectable, selected, onToggleSel
 
       {project.last_scan_date && (
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 10, fontFamily: 'var(--font-mono)' }}>
-          Last scan: {new Date(project.last_scan_date).toLocaleDateString()}
+          Last scan: {parseBackendDate(project.last_scan_date).toLocaleDateString()}
         </div>
       )}
     </div>
