@@ -276,7 +276,7 @@ else
             while IFS= read -r word; do
                 # Skip empty tokens
                 [[ -z "$word" ]] && continue
-                if ! grep -qxF "$word" "$expanded_wordlist"; then
+                if ! grep -qxF -- "$word" "$expanded_wordlist"; then
                     echo "$word" >> "$expanded_wordlist"
                     ((added++)) || true
                 fi
