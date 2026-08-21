@@ -28,8 +28,13 @@ export async function fetchAsset(projectId: string, assetId: string): Promise<As
   return data;
 }
 
-export async function createAsset(projectId: string, payload: AssetCreate): Promise<Asset> {
-  const { data } = await client.post<Asset>(`/projects/${projectId}/assets/`, payload);
+/**
+ * Create one asset entry. The response is a list because a CIDR value expands
+ * server-side into one asset per address — a plain hostname simply comes back
+ * as a single-element list.
+ */
+export async function createAsset(projectId: string, payload: AssetCreate): Promise<Asset[]> {
+  const { data } = await client.post<Asset[]>(`/projects/${projectId}/assets/`, payload);
   return data;
 }
 

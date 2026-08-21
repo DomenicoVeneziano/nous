@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from database import get_db
 from auth.middleware import require_admin, require_viewer
 from models.finding import Finding
+from models.tag import SOURCE_MANUAL
 from schemas.asset import AssetCreate, AssetUpdate, AssetOut, normalize_crawled_urls
 from services import asset_service, project_service, tag_service
 from config import settings
@@ -161,23 +162,71 @@ def export_asset(project_id: str, asset_id: str, db: Session = Depends(get_db), 
     )
 
 
-@router.post("/", response_model=AssetOut, status_code=201)
+# Per-asset metadata has no meaning for a range: one title or status code
+# fanned across up to MAX_CIDR_HOSTS rows would be a fact about none of them.
+_CIDR_REJECTED_FIELDS = (
+    "status_code", "title", "content_length", "technologies",
+    "dns_records", "crawled_urls",
+)
+
+
+@router.post("/", response_model=list[AssetOut], status_code=201)
 def create_asset(project_id: str, data: AssetCreate, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
+    """Add one asset, or expand a CIDR range into one asset per address.
+
+    Always a list, one element long for a normal asset and N for a range.
+
+    Duplicates are handled differently in the two branches, on purpose. A single
+    asset that already exists is a 409: the operator named exactly one thing and
+    it is already there, so there is nothing to do and saying so is more useful
+    than silence. A CIDR names a range, not a row — addresses inside it that are
+    already assets are skipped rather than refused, and the response carries
+    those pre-existing rows alongside the created ones. Both get the Manual tag,
+    matching how project_service._create_assets_from_hostnames tags rows the
+    scope names but did not create.
+    """
     proj = project_service.get_project(db, project_id)
     if not proj:
         raise HTTPException(404, "Project not found")
     name = data.asset.strip()
     if not name:
         raise HTTPException(422, "Asset value is required")
-    if asset_service.get_asset_by_name(db, project_id, name):
-        raise HTTPException(409, f"Asset '{name}' already exists in this project")
-    try:
-        asset = asset_service.create_asset(db, project_id, data)
-    except IntegrityError:
-        raise HTTPException(409, f"Asset '{name}' already exists in this project")
+
+    cidr = asset_service.parse_cidr(name)
+    if cidr is None:
+        if asset_service.get_asset_by_name(db, project_id, name):
+            raise HTTPException(409, f"Asset '{name}' already exists in this project")
+        try:
+            assets = [asset_service.create_asset(db, project_id, data)]
+        except IntegrityError:
+            raise HTTPException(409, f"Asset '{name}' already exists in this project")
+    else:
+        rejected = [f for f in _CIDR_REJECTED_FIELDS if getattr(data, f, None) is not None]
+        # "ip" is redundant but consistent with what the expansion produces;
+        # "subdomain" contradicts it.
+        if data.asset_type == "subdomain":
+            rejected.append("asset_type")
+        if rejected:
+            raise HTTPException(
+                422,
+                f"'{name}' is a CIDR range and expands into one asset per "
+                f"address; these fields cannot be applied to it: "
+                f"{', '.join(rejected)}",
+            )
+        try:
+            addresses = asset_service.expand_cidr(name)
+        except asset_service.CidrError as exc:
+            raise HTTPException(422, str(exc))
+        asset_ids = asset_service.create_assets_bulk(
+            db, project_id, addresses, SOURCE_MANUAL
+        )
+        # The router is the only caller that needs the rows themselves:
+        # it serializes them. create_assets_bulk hands back ids so the
+        # scope-seeding path pays for no ORM load at all.
+        assets = asset_service.load_assets_by_ids(db, asset_ids)
+
     project_service.refresh_counts(db, project_id)
-    tag_service.decorate_assets(db, [asset])
-    return asset
+    return tag_service.decorate_assets(db, assets)
 
 
 @router.put("/{asset_id}", response_model=AssetOut)

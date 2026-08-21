@@ -10,7 +10,7 @@ import logging
 import urllib.error
 import urllib.request
 from datetime import timedelta
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin
 
 # Forcefully suppress all logs, tracebacks, and warnings as required.
 # NOTE: do NOT set sys.tracebacklimit = 0 here. Combined with the asyncio /
@@ -179,6 +179,34 @@ async def _initial_redirect_status(response):
         return None
 
 
+def attach_navigation_recorder(page, on_response):
+    """Report every main-frame navigation response on `page` to `on_response`
+    and return a callable that detaches the listener again.
+
+    Two callers need responses that the ordinary return value cannot give them:
+    the plaintext-to-TLS retry, whose goto may raise after the navigation has
+    already committed, and the pre-navigation hook, which needs the redirect
+    chain of a navigation that may never reach the request handler at all.
+    Callers must invoke the returned detach on every path so no listener
+    accumulates on a page reused across the batch."""
+    def _listener(resp) -> None:
+        try:
+            if resp.request.is_navigation_request() and resp.frame is page.main_frame:
+                on_response(resp)
+        except Exception:
+            pass
+
+    page.on('response', _listener)
+
+    def _detach() -> None:
+        try:
+            page.remove_listener('response', _listener)
+        except Exception:
+            pass
+
+    return _detach
+
+
 def build_proxy_options(proxy_url: str | None) -> dict | None:
     """Parse a proxy URL (scheme://[user:pass@]host:port) into Playwright proxy options."""
     if not proxy_url:
@@ -220,7 +248,10 @@ async def main() -> None:
     for url in raw_urls:
         parsed = urlparse(url)
         if not parsed.scheme:
-            target_urls.append(f"http://{url}")
+            # Default to TLS: plaintext is what hosts reject with 426. The
+            # engine always supplies an explicit scheme, so this only affects
+            # manual CLI use.
+            target_urls.append(f"https://{url}")
         else:
             target_urls.append(url)
 
@@ -253,9 +284,30 @@ async def main() -> None:
     """
 
     nav_timeout = int(os.environ.get("TECH_NAV_TIMEOUT", "30"))
+
+    # Seconds of the handler's own budget held back for the extraction and
+    # screenshot work that must still run after a plaintext → TLS retry, so a
+    # retry can never consume request_handler_timeout and cost the asset its
+    # result line.
+    retry_reserve_s = min(10.0, nav_timeout / 3)
+    # crawlee starts counting request_handler_timeout fractionally before the
+    # handler body runs; this margin keeps the final capture from racing it.
+    handler_margin_s = min(1.0, nav_timeout / 10)
+    # Budget for the post-load settle ladder, and what is held back from it for
+    # the capture call itself.
+    settle_budget_s = 8.0
+    shot_reserve_s = min(5.0, nav_timeout / 6)
+    # A viewport-sized solid-colour frame encodes to a couple of KB; anything
+    # above this is assumed to carry real pixels. Deliberately conservative —
+    # the in-page content assertion is the primary blank signal.
+    blank_png_max_bytes = 8192
+
     browser_launch_options = {"proxy": proxy_options} if proxy_options else {}
     crawler = PlaywrightCrawler(
         max_requests_per_crawl=len(target_urls),
+        # No automatic retries: a handler timeout would otherwise revisit the
+        # host and emit a second line for the same domain.
+        max_request_retries=0,
         browser_pool=BrowserPool(plugins=[CamoufoxPlugin(
             browser_launch_options=browser_launch_options,
             browser_new_context_options={"ignore_https_errors": True},
@@ -267,9 +319,110 @@ async def main() -> None:
 
     first_request = True
 
+    # Navigation responses recorded per request. A navigation that never reaches
+    # the request handler — a 3xx whose destination is dead fails the whole
+    # navigation — would otherwise produce no line at all and be recorded as
+    # SCAN_ERROR, hiding the fact that the asset itself answered. Entries are
+    # added by the pre-navigation hook and popped by that request's deferred
+    # cleanup, which crawlee runs after both the request handler and the
+    # failed-request handler, so the dict only ever holds in-flight requests.
+    nav_records: dict[str, list[dict]] = {}
+    max_nav_records = 10  # bounds a redirect chain (or loop) per request
+    # Request keys that already produced a line, so the normal and the failure
+    # path can never both emit for the same host.
+    emitted: set[str] = set()
+
+    def emit_line(request_key: str, line: str) -> None:
+        """Write one result line to -o (or stdout), at most once per request."""
+        if request_key in emitted:
+            return
+        emitted.add(request_key)
+        if args.output:
+            with open(args.output, 'a', encoding='utf-8') as f:
+                f.write(line + '\n')
+        else:
+            sys.__stdout__.write(line + '\n')
+            sys.__stdout__.flush()
+
+    @crawler.pre_navigation_hook
+    async def record_navigation(context) -> None:
+        # Fully guarded: an exception raised here fails the request before it
+        # ever navigates, which would cost the asset its result line. Recording
+        # is an aid, never a precondition.
+        detach = None
+        try:
+            key = context.request.unique_key
+            records: list[dict] = []
+            nav_records[key] = records
+
+            def _record(resp) -> None:
+                if len(records) >= max_nav_records:
+                    return
+                try:
+                    records.append({
+                        'status': resp.status,
+                        'url': resp.url,
+                        'location': resp.headers.get('location', ''),
+                    })
+                except Exception:
+                    pass
+
+            detach = attach_navigation_recorder(context.page, _record)
+
+            async def _cleanup() -> None:
+                # Runs in crawlee's finally, after both the request handler and
+                # the failed-request handler, so nothing outlives its request.
+                detach()
+                nav_records.pop(key, None)
+                emitted.discard(key)
+
+            context.register_deferred_cleanup(_cleanup)
+        except Exception:
+            # Leave no half-registered state behind: drop the record slot and
+            # detach the listener if it was already attached.
+            if detach is not None:
+                detach()
+            nav_records.pop(context.request.unique_key, None)
+
+    @crawler.failed_request_handler
+    async def failed_request(context, error) -> None:
+        """Last chance to report a request whose navigation failed outright.
+
+        An asset that answers with a cross-host redirect has been observed even
+        when the destination never loads, so report the redirect exactly as the
+        in-handler branch does — original hostname, the first cross-host 3xx
+        status, destination host. Anything else stays unreported, leaving a
+        genuinely unreachable host to be recorded as a failure by the engine."""
+        try:
+            key = context.request.unique_key
+            requested_url = context.request.url
+            requested_host = urlparse(requested_url).hostname
+            domain = urlparse(requested_url).netloc
+            for rec in nav_records.get(key) or []:
+                if not (300 <= rec['status'] < 400) or not rec['location']:
+                    continue
+                # Location may be relative; resolve it against the hop it came from.
+                dest_host = urlparse(urljoin(rec['url'], rec['location'])).hostname
+                if dest_host and requested_host and dest_host != requested_host:
+                    emit_line(key, f"[{domain}][{rec['status']}][][][][{dest_host}]")
+                    return
+        except Exception:
+            pass
+
     @crawler.router.default_handler
     async def request_handler(context: PlaywrightCrawlingContext) -> None:
         nonlocal first_request
+        # Every wait this handler performs is measured against one deadline set
+        # at entry (before the rate-limit sleep, which is charged to the same
+        # request_handler_timeout), so no combination of retry and settle waits
+        # can push the handler past that timeout.
+        deadline = time.monotonic() + nav_timeout - handler_margin_s
+
+        def remaining_s(reserve: float = 0.0) -> float:
+            """Seconds left of the handler budget, minus a reserve for the work
+            that must still follow. Never negative."""
+            return max(0.0, deadline - time.monotonic() - reserve)
+
         if args.delay > 0 and not first_request:
             await asyncio.sleep(args.delay)
         first_request = False
@@ -281,6 +434,69 @@ async def main() -> None:
             response = context.response
             status_code = response.status if response else 0
             headers = response.headers if response else {}
+
+            # Plaintext rejection: a host that only serves TLS answers http://
+            # with 426 (Upgrade Required), 497 (HTTP request sent to HTTPS port)
+            # or a bare 400 from a TLS terminator. Retry the same host over
+            # https inline and carry on extracting from the new response.
+            # Inline goto rather than context.add_requests because the crawler
+            # is capped at max_requests_per_crawl=len(target_urls) (a queued
+            # retry would simply be dropped) and because the engine keys results
+            # by netloc with last-wins — a second emitted line for the same host
+            # would make the stored result order-dependent. Exactly one line per
+            # host is emitted either way.
+            # The engine now sends https:// whenever the TCP pre-check found 443
+            # open, so this fires only when 443 looked closed (or on a terminator
+            # that demands TLS on port 80) and for manual CLI runs.
+            if status_code in (426, 497, 400) and url.startswith("http://"):
+                https_url = "https://" + url[len("http://"):]
+                retry_timeout_ms = int(remaining_s(retry_reserve_s) * 1000)
+                if retry_timeout_ms > 0:
+                    # A goto can raise AFTER the navigation commits (TLS done,
+                    # document loading, domcontentloaded never reached). The page
+                    # is then on the https document while `response` still
+                    # describes the http 426 — and every extraction below reads
+                    # the page. Record the main-frame navigation response as it
+                    # arrives so the committed document can be reported with its
+                    # own status even when the goto itself raises.
+                    committed = {}
+                    detach_recorder = attach_navigation_recorder(
+                        context.page, lambda resp: committed.__setitem__('response', resp)
+                    )
+                    try:
+                        retry_response = await context.page.goto(
+                            https_url,
+                            timeout=retry_timeout_ms,
+                            wait_until='domcontentloaded',
+                        )
+                    except Exception:
+                        retry_response = committed.get('response')
+                    finally:
+                        detach_recorder()
+
+                    page_is_https = False
+                    try:
+                        page_is_https = context.page.url.startswith("https://")
+                    except Exception:
+                        pass
+
+                    if retry_response is not None:
+                        # Report the https document with a status substantiated
+                        # by its own response, even if the load never finished.
+                        url = https_url
+                        domain = urlparse(url).netloc
+                        response = retry_response
+                        status_code = response.status
+                        headers = response.headers
+                    elif page_is_https:
+                        # Committed to https with no response object to back it:
+                        # nothing here can describe status and body as the same
+                        # document, and an http status over an https body is a
+                        # corrupt row. Abandon the asset — the engine records it
+                        # as SCAN_ERROR, which is true, and no line is emitted.
+                        raise RuntimeError("https retry left an unattributable document")
+                    # Otherwise the navigation never committed: the page still
+                    # shows the plaintext document that `response` describes.
 
             # Cross-host redirect handling: if the asset redirected to a
             # different host, record the redirect itself (the originating 3xx
@@ -295,12 +511,7 @@ async def main() -> None:
                 if redirect_status is None:
                     redirect_status = status_code
                 out_str = f"[{domain}][{redirect_status}][][][][{final_host}]"
-                if args.output:
-                    with open(args.output, 'a', encoding='utf-8') as f:
-                        f.write(out_str + '\n')
-                else:
-                    sys.__stdout__.write(out_str + '\n')
-                    sys.__stdout__.flush()
+                emit_line(context.request.unique_key, out_str)
                 return  # no tech extraction, dump, or screenshot for redirects
 
             title = await context.page.title()
@@ -323,13 +534,7 @@ async def main() -> None:
 
             # Strict formatting output (trailing [] = no cross-host redirect)
             out_str = f"[{domain}][{status_code}][{title}][{content_length}][{tech_string}][]"
-
-            if args.output:
-                with open(args.output, 'a', encoding='utf-8') as f:
-                    f.write(out_str + '\n')
-            else:
-                sys.__stdout__.write(out_str + '\n')
-                sys.__stdout__.flush()
+            emit_line(context.request.unique_key, out_str)
 
             # Handle raw dump request
             if args.folder:
@@ -353,11 +558,73 @@ async def main() -> None:
                 safe_domain = domain.replace('.', '_')
                 shot_path = os.path.join(args.screenshot_dir, f"{safe_domain}.png")
                 try:
-                    try:
-                        await context.page.wait_for_load_state('load', timeout=15000)
-                    except Exception:
-                        pass  # proceed with whatever has rendered so far
-                    await context.page.screenshot(path=shot_path, full_page=False)
+                    # Settle ladder, every step capped by BOTH its own budget and
+                    # what is left of the handler deadline after reserving
+                    # shot_reserve_s for the capture itself — so the ladder can
+                    # never eat request_handler_timeout and cost this asset its
+                    # already-emitted line's screenshot. Each step is swallowed:
+                    # a step that times out just means the next one runs with
+                    # less budget.
+                    settle_deadline = min(
+                        time.monotonic() + settle_budget_s,
+                        deadline - shot_reserve_s,
+                    )
+
+                    def settle_left(cap: float) -> float:
+                        return max(0.0, min(cap, settle_deadline - time.monotonic()))
+
+                    for state, cap in (('domcontentloaded', 3.0), ('networkidle', 5.0)):
+                        left = settle_left(cap)
+                        if left <= 0:
+                            break
+                        try:
+                            await context.page.wait_for_load_state(state, timeout=int(left * 1000))
+                        except Exception:
+                            pass  # proceed with whatever has rendered so far
+
+                    # Assert real rendered content rather than trusting load
+                    # events: bot-manager interstitials return a genuine 200 whose
+                    # body is a white challenge page that then calls
+                    # location.reload(). That reload destroys the execution
+                    # context underneath the wait, so a raised error gets one more
+                    # attempt against the reloaded page while budget remains.
+                    content_ok = False
+                    for _ in range(2):
+                        left = settle_left(3.0)
+                        if left <= 0:
+                            break
+                        try:
+                            await context.page.wait_for_function(
+                                "document.body && (document.body.innerText.trim().length > 0 "
+                                "|| document.querySelector('img,svg,canvas,video'))",
+                                timeout=int(left * 1000),
+                            )
+                            content_ok = True
+                            break
+                        except Exception:
+                            continue
+
+                    # Capture to a buffer so a blank frame can be rejected before
+                    # it reaches disk. No image library is available in the engine
+                    # image, so blankness is inferred from the in-page assertion
+                    # above (primary) plus an encoded-size floor: a solid-colour
+                    # viewport compresses to a couple of KB.
+                    shot_budget_ms = int(remaining_s() * 1000)
+                    if shot_budget_ms <= 0:
+                        raise TimeoutError("handler budget exhausted before capture")
+                    png = await context.page.screenshot(
+                        full_page=False, timeout=shot_budget_ms
+                    )
+                    if not content_ok and len(png) < blank_png_max_bytes:
+                        try:
+                            os.unlink(shot_path)
+                        except OSError:
+                            pass
+                        sys.__stdout__.write(f"[screenshot-blank][{domain}]\n")
+                        sys.__stdout__.flush()
+                    else:
+                        with open(shot_path, 'wb') as sf:
+                            sf.write(png)
                 except Exception as se:
                     sys.__stdout__.write(f"[screenshot-error][{domain}] {se}\n")
                     sys.__stdout__.flush()

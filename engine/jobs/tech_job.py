@@ -6,7 +6,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from runner import run_script
+from runner import run_script, validate_path_within
 from parsers.tech_parser import parse_tech_output
 from dns_precheck import dns_precheck
 from sqlalchemy import text
@@ -39,25 +39,75 @@ TCP_PRECHECK_TIMEOUT = float(os.environ.get("TECH_TCP_PRECHECK_TIMEOUT", "5"))
 TECH_BATCH_SIZE = int(os.environ.get("TECH_BATCH_SIZE", "10"))
 TECH_RATE_LIMIT_DELAY = float(os.environ.get("TECH_RATE_LIMIT_DELAY", "0"))
 DNS_RATE_LIMIT_DELAY = float(os.environ.get("DNS_RATE_LIMIT_DELAY", "0"))
+TCP_PRECHECK_CONCURRENCY = int(os.environ.get("TECH_TCP_PRECHECK_CONCURRENCY", "100"))
 
 
-async def _tcp_reachable(hostname: str, ports: tuple[int, ...] = (80, 443)) -> int | None:
-    """Return the first open port, or None if unreachable within timeout."""
-    for port in ports:
-        try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(hostname, port),
-                timeout=TCP_PRECHECK_TIMEOUT,
-            )
+async def _probe_port(hostname: str, port: int) -> int | None:
+    """Open and immediately close a TCP connection to (hostname, port).
+    Returns the port when it accepts, None otherwise. The writer is closed on
+    every path — including the losing branch of a concurrent probe — so no
+    socket is left behind."""
+    writer = None
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(hostname, port),
+            timeout=TCP_PRECHECK_TIMEOUT,
+        )
+        return port
+    except Exception:
+        return None
+    finally:
+        if writer is not None:
             writer.close()
             try:
                 await writer.wait_closed()
             except Exception:
                 pass
-            return port
-        except Exception:
-            continue
-    return None
+
+
+async def _tcp_reachable(
+    hostname: str,
+    ports: tuple[int, ...] = (80, 443),
+    semaphore: asyncio.Semaphore | None = None,
+) -> tuple[int, ...]:
+    """Return the open ports among `ports` (in the given order), or an empty
+    tuple when none answered within the timeout.
+
+    Both ports are probed concurrently, so an unreachable host still costs a
+    single timeout instead of one per port, and the caller learns the full set
+    rather than just the first hit — a host with 80 and 443 both open must be
+    scanned over TLS, not plaintext.
+
+    `semaphore` bounds how many hosts are in flight at once; each holder owns at
+    most len(ports) sockets."""
+    async def _probe_all() -> tuple[int, ...]:
+        results = await asyncio.gather(
+            *[_probe_port(hostname, port) for port in ports],
+            return_exceptions=True,
+        )
+        return tuple(r for r in results if isinstance(r, int))
+
+    if semaphore is None:
+        return await _probe_all()
+    async with semaphore:
+        return await _probe_all()
+
+
+def _remove_screenshot(screenshots_dir: Path | None, safe_domain: str) -> None:
+    """Delete an asset's screenshot, confining the path under `screenshots_dir`
+    before touching the filesystem so a crafted hostname cannot escape it.
+
+    Only for hosts this run demonstrably handled. Every other failure path
+    detaches the screenshot (screenshot_path=None) and leaves the file alone."""
+    if screenshots_dir is None:
+        return
+    shot_file = screenshots_dir / f"{safe_domain}.png"
+    if not validate_path_within(shot_file, screenshots_dir):
+        return
+    try:
+        shot_file.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 async def _scan_batch(
@@ -100,6 +150,12 @@ async def _scan_batch(
         script_args += ["--proxy", proxy_url]
     script_args.append(tmp_path)
 
+    # Cutoff for "was this screenshot written by THIS run": the -1 absorbs
+    # filesystem mtime granularity. Preferred over pre-deleting the batch's
+    # PNGs, which would destroy a good screenshot even when the script never
+    # starts; the cutoff only discards a file this run demonstrably did not write.
+    run_started = time.time() - 1
+
     try:
         result = await run_script(
             script_path=str(SCRIPTS_DIR / "tech_analysis.py"),
@@ -125,6 +181,7 @@ async def _scan_batch(
     success_count = 0
     for asset in assets:
         hostname = asset["hostname"]
+        safe_domain = hostname.replace(".", "_")
         entry = parsed_by_domain.get(hostname)
         if entry and entry.get("redirects_to"):
             # Cross-host redirect: record the redirect itself (3xx status +
@@ -142,6 +199,7 @@ async def _scan_batch(
                 screenshot_path=None,
                 date_scanned=now,
             )
+            _remove_screenshot(screenshots_dir, safe_domain)
             redirect_targets.add(dest)
             if ws_broadcast:
                 await ws_broadcast("asset_update", {
@@ -154,18 +212,30 @@ async def _scan_batch(
                 })
             success_count += 1
         elif entry:
-            safe_domain = hostname.replace(".", "_")
             extra_fields = {}
             if screenshots_dir is not None:
                 shot_file = screenshots_dir / f"{safe_domain}.png"
-                if shot_file.is_file():
+                # A capture that never completed leaves the previous run's PNG
+                # untouched, so existence alone is not proof this result has a
+                # screenshot — only an mtime at or after the run start is. One
+                # stat per asset in the batch (batch size TECH_BATCH_SIZE).
+                try:
+                    fresh = shot_file.stat().st_mtime >= run_started
+                except OSError:
+                    fresh = False
+                if fresh:
                     # Overwritten in place by the script, so the path is stable
                     # across re-scans — only the latest screenshot is retained.
                     # Stored relative to the projects dir (the convention the
                     # /files/image endpoint expects).
                     extra_fields["screenshot_path"] = f"{project_id}/screenshots/{safe_domain}.png"
-                elif line_broadcast:
-                    await line_broadcast(f"[!] Screenshot capture failed for {hostname} (continuing)")
+                else:
+                    # No image from this run: drop any older one rather than
+                    # attributing it to this result.
+                    _remove_screenshot(screenshots_dir, safe_domain)
+                    extra_fields["screenshot_path"] = None
+                    if line_broadcast:
+                        await line_broadcast(f"[!] Screenshot capture failed for {hostname} (continuing)")
             update_asset_record(
                 session, hostname, project_id,
                 status_code=entry["status_code"],
@@ -192,6 +262,12 @@ async def _scan_batch(
                 session, hostname, project_id,
                 status_code=0,
                 title=reason,
+                # Detach, but do NOT delete: run_script's timeout covers the
+                # whole batch, so a missing entry cannot distinguish "this host
+                # failed" from "the batch aborted before reaching it". Deleting
+                # here would destroy a still-good screenshot for every host the
+                # run never got to.
+                screenshot_path=None,
                 date_scanned=now,
             )
             if ws_broadcast:
@@ -272,6 +348,10 @@ async def run_tech_job(job: dict, ws_broadcast=None):
                 status_code=0,
                 title=reason,
                 dns_records=json.dumps(asset.get("dns_records") or []),
+                # Same policy as an in-batch failure: detach the stale image so
+                # the two paths do not present the same condition differently.
+                # The file itself stays — this run never handled the host.
+                screenshot_path=None,
                 date_scanned=now,
             )
             if ws_broadcast:
@@ -309,14 +389,22 @@ async def run_tech_job(job: dict, ws_broadcast=None):
         if ws_broadcast:
             await line_broadcast(f"[*] TCP pre-check: testing reachability of {len(live_assets)} asset(s)")
 
+        # One semaphore for the whole pass: still a single fully parallel sweep,
+        # but at most TCP_PRECHECK_CONCURRENCY hosts are in flight, so a project
+        # with thousands of assets cannot open a socket per asset at once and
+        # exhaust the container's file-descriptor limit.
+        tcp_semaphore = asyncio.Semaphore(TCP_PRECHECK_CONCURRENCY)
         tcp_results = await asyncio.gather(*[
-            _tcp_reachable(a["hostname"]) for a in live_assets
+            _tcp_reachable(a["hostname"], semaphore=tcp_semaphore) for a in live_assets
         ])
 
         scannable_assets = []
-        for asset, open_port in zip(live_assets, tcp_results):
-            if open_port is not None:
-                scheme = "https" if open_port == 443 else "http"
+        for asset, open_ports in zip(live_assets, tcp_results):
+            if open_ports:
+                # Prefer TLS whenever 443 answers. A host serving both commonly
+                # rejects plaintext with 426 Upgrade Required, which would
+                # otherwise be recorded as the asset's status and tech.
+                scheme = "https" if 443 in open_ports else "http"
                 asset["url"] = f"{scheme}://{asset['hostname']}"
                 scannable_assets.append(asset)
             else:
@@ -324,6 +412,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
                     session, asset["hostname"], project_id,
                     status_code=0,
                     title="TCP_UNREACHABLE",
+                    screenshot_path=None,  # detach only; the file is left alone
                     date_scanned=now,
                 )
                 if ws_broadcast:

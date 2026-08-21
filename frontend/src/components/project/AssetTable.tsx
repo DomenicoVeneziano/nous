@@ -1,5 +1,5 @@
 // frontend/src/components/project/AssetTable.tsx
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import type { Asset, Highlight } from '../../types/asset';
 import { NEW_TAG_LABEL } from '../../types/tag';
 import { HighlightText } from '../shared/HighlightText';
@@ -27,6 +27,8 @@ interface Props {
   onToggleSelect: (id: string) => void;
   onSelectAll: () => void;
   onAssetClick: (asset: Asset) => void;
+  /** Asset deep-linked via `?asset=` — paged to, scrolled to and outlined. */
+  focusAssetId?: string | null;
 }
 
 // Semantic status colours
@@ -59,11 +61,20 @@ function getHiddenMatchBadges(highlights: Highlight[] | undefined): string[] {
   return Array.from(seen);
 }
 
-export default function AssetTable({ assets, selectedIds, onToggleSelect, onSelectAll, onAssetClick }: Props) {
+export default function AssetTable({ assets, selectedIds, onToggleSelect, onSelectAll, onAssetClick, focusAssetId }: Props) {
   const [sortKey, setSortKey] = useState<SortKey>('asset');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
   const [pageSize, setPageSize] = useState(250);
   const [page, setPage] = useState(0);
+  const focusRowRef = useRef<HTMLTableRowElement | null>(null);
+  // Last id already scrolled to, so a WS-driven reload does not yank the
+  // viewport back while the same asset stays focused.
+  const scrolledForRef = useRef<string | null>(null);
+  // Last id the page jump actually fired for. `?asset=` stays in the URL for as
+  // long as a panel is open, and `sorted` is re-derived on every WS asset
+  // reload, so without this the effect below would drag the operator back to
+  // the focused row's page every time a running scan refreshes the set.
+  const jumpedForRef = useRef<string | null>(null);
 
   // Sort the full set (so ordering and pagination span every asset, not just
   // the rows currently on screen); memoised so toggling a checkbox doesn't
@@ -85,8 +96,42 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
     if (page > pageCount - 1) setPage(pageCount - 1);
   }, [pageCount, page]);
 
+  // Deep-linked row: jump to the page holding it. The sorted set is scanned
+  // rather than the current page — the target is usually somewhere else
+  // entirely, and a search result can point anywhere in the project.
+  useEffect(() => {
+    if (!focusAssetId) {
+      // Reset on clear so re-opening the same asset later jumps again.
+      jumpedForRef.current = null;
+      return;
+    }
+    if (jumpedForRef.current === focusAssetId) return;
+    const idx = sorted.findIndex((a) => a.id === focusAssetId);
+    // A miss is not recorded: the row may still be on its way in, and the jump
+    // has to remain pending until it arrives.
+    if (idx < 0) return;
+    jumpedForRef.current = focusAssetId;
+    setPage(Math.floor(idx / pageSize));
+  }, [focusAssetId, sorted, pageSize]);
+
   const start = page * pageSize;
   const pageItems = sorted.slice(start, start + pageSize);
+
+  // Scrolling is a second pass: the row only mounts — and the ref only fills —
+  // once the page holding it has rendered. Keyed on the row actually being on
+  // the current page rather than on `page` changing, because the jump above
+  // frequently resolves to the page already displayed and so would never
+  // re-trigger a `page`-keyed effect.
+  useEffect(() => {
+    if (!focusAssetId) {
+      scrolledForRef.current = null;
+      return;
+    }
+    if (scrolledForRef.current === focusAssetId) return;
+    if (!pageItems.some((a) => a.id === focusAssetId)) return;
+    scrolledForRef.current = focusAssetId;
+    focusRowRef.current?.scrollIntoView({ block: 'center' });
+  }, [focusAssetId, pageItems]);
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
@@ -150,6 +195,7 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
         <tbody>
           {pageItems.map((asset, i) => {
             const selected = selectedIds.has(asset.id);
+            const focused = asset.id === focusAssetId;
             const highlights = (asset as Asset & { highlights?: Highlight[] }).highlights;
             const hostnameHls = getHighlightsFor(highlights, 'hostname');
             const titleHls = getHighlightsFor(highlights, 'title');
@@ -175,12 +221,19 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
             return (
               <tr
                 key={asset.id}
+                // Only the deep-linked row takes the ref; React clears it back
+                // to null on the previous row when the focus moves or lifts.
+                ref={focused ? focusRowRef : undefined}
                 onClick={() => onAssetClick(asset)}
                 style={{
                   backgroundColor: selected ? 'var(--bg-selected)' : (i % 2 === 0 ? 'var(--bg-base)' : 'var(--bg-surface)'),
                   cursor: 'pointer',
                   transition: 'background var(--transition-fast)',
                   borderLeft: selected ? '2px solid var(--accent-primary)' : '2px solid transparent',
+                  // Outline rather than a border: it is drawn outside the cells
+                  // and so marks the row without shifting the table's layout.
+                  outline: focused ? '1px solid var(--accent-primary)' : 'none',
+                  outlineOffset: -1,
                 }}
                 onMouseEnter={(e) => {
                   if (!selected) e.currentTarget.style.backgroundColor = 'var(--bg-hover)';

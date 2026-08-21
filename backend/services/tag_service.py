@@ -261,14 +261,20 @@ def assign_tag(db: Session, asset_id: str, tag_id: str) -> None:
 
 
 def assign_tag_bulk(db: Session, asset_ids: list[str], tag_id: str) -> None:
-    """Attach one tag to many assets in a single commit."""
+    """Attach one tag to many assets in a single commit.
+
+    One executemany rather than a statement per id: the seed and recon paths
+    hand this whole result sets, and a CIDR expansion hands it up to
+    asset_service.MAX_CIDR_HOSTS ids at once. Same statement, same semantics —
+    OR IGNORE still absorbs the ids that already carry the tag, including a
+    repeat inside the list itself.
+    """
     if not asset_ids:
         return
-    for asset_id in asset_ids:
-        db.execute(
-            text("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (:a, :t)"),
-            {"a": asset_id, "t": tag_id},
-        )
+    db.execute(
+        text("INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (:a, :t)"),
+        [{"a": asset_id, "t": tag_id} for asset_id in asset_ids],
+    )
     sync_tags_text(db, asset_ids)
     db.commit()
 

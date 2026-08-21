@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from auth.middleware import require_admin, require_viewer
 from schemas.project import ProjectCreate, ProjectUpdate, ProjectOut, BulkProjectAction
-from services import project_service
+from services import asset_service, project_service
 from config import settings
 from pathlib import Path
 
@@ -22,7 +22,12 @@ def list_projects(db: Session = Depends(get_db), _: dict = Depends(require_viewe
 
 @router.post("/", response_model=ProjectOut, status_code=201)
 def create_project(data: ProjectCreate, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
-    return project_service.create_project(db, data)
+    try:
+        return project_service.create_project(db, data)
+    except asset_service.CidrError as exc:
+        # Raised before anything is written, so there is no partial project to
+        # clean up here.
+        raise HTTPException(422, str(exc))
 
 
 @router.post("/bulk-delete", status_code=200)
@@ -106,7 +111,11 @@ def get_project(project_id: str, db: Session = Depends(get_db), _: dict = Depend
 
 @router.put("/{project_id}", response_model=ProjectOut)
 def update_project(project_id: str, data: ProjectUpdate, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
-    project = project_service.update_project(db, project_id, data)
+    try:
+        project = project_service.update_project(db, project_id, data)
+    except asset_service.CidrError as exc:
+        # Raised before `project` is mutated, so the stored scope is untouched.
+        raise HTTPException(422, str(exc))
     if not project:
         raise HTTPException(404, "Project not found")
     return project

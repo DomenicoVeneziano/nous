@@ -36,7 +36,10 @@ export default function GlobalSearch() {
   const handleAssetClick = (asset: AssetSearchResult) => {
     setOpen(false);
     search('');
-    navigate(`/projects/${asset.project_id}`);
+    // Deep-link to the asset itself: ProjectView reads `?asset` and opens the
+    // detail panel, so the click lands on the row the operator searched for
+    // instead of the project's default view.
+    navigate(`/projects/${asset.project_id}?asset=${encodeURIComponent(asset.id)}`);
   };
 
   const handleClear = () => {
