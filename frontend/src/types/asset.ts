@@ -43,7 +43,6 @@ export interface Asset {
 
 export interface AssetCreate {
   asset: string;
-  asset_type?: 'subdomain' | 'ip';
   technologies?: string[];
   status_code?: number;
   title?: string;

@@ -7,6 +7,7 @@ from models.asset import Asset
 from models.tag import SOURCE_MANUAL
 from schemas.asset import AssetCreate, AssetUpdate, normalize_crawled_urls
 from services import tag_service
+import ipaddress
 import uuid
 
 
@@ -18,12 +19,27 @@ def get_asset_by_name(db: Session, project_id: str, asset: str) -> Asset | None:
     )
 
 
+def detect_asset_type(value: str) -> str:
+    """Classify an asset string when the caller did not state its type.
+
+    Mirrors the engine's `_is_ip` (see engine/dns_precheck.py) by using the
+    stdlib `ipaddress`, so both IPv4 and IPv6 literals classify as "ip", while
+    bracketed forms, CIDR and host:port fall through to "subdomain".
+    """
+    try:
+        ipaddress.ip_address(value.strip())
+        return "ip"
+    except ValueError:
+        return "subdomain"
+
+
 def create_asset(db: Session, project_id: str, data: AssetCreate) -> Asset:
+    name = data.asset.strip()
     asset = Asset(
         id=str(uuid.uuid4()),
         project_id=project_id,
-        asset=data.asset.strip(),
-        asset_type=data.asset_type,
+        asset=name,
+        asset_type=data.asset_type or detect_asset_type(name),
         first_seen=datetime.now(timezone.utc),
     )
     # Apply optional fields if provided

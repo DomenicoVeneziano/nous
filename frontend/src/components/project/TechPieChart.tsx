@@ -39,7 +39,12 @@ export default function TechPieChart({ assets }: Props) {
       </ResponsiveContainer>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
         {data.map((d, i) => (
-          <span key={d.name} style={{ fontSize: 10, color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: 5 }}>
+          <span key={d.name} style={{
+            fontSize: 10, color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: 5,
+            // A single very long technology name must wrap inside the card
+            // rather than extend the page's scroll region.
+            minWidth: 0, overflowWrap: 'anywhere',
+          }}>
             <span style={{
               width: 10, height: 10, borderRadius: 2, display: 'inline-block', flexShrink: 0,
               backgroundColor: COLORS[i % COLORS.length],

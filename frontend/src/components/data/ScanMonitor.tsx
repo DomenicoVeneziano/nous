@@ -102,13 +102,16 @@ export default function ScanMonitor({ lines, lineOffset = 0, activeJob }: Props)
           )}
         </div>
       </div>
+      {/* Fills the card: the /data grid row has a bounded height, so this pane
+          takes whatever the card leaves after the header. Long output scrolls
+          inside the pane rather than growing the page. */}
       <div
         ref={containerRef}
         style={{
           backgroundColor: 'var(--bg-void)',
           backgroundImage: 'repeating-linear-gradient(0deg, transparent, transparent 28px, rgba(124,107,255,0.015) 28px, rgba(124,107,255,0.015) 29px)',
           padding: 0,
-          minHeight: 220, maxHeight: 400,
+          flex: 1, minHeight: 220,
           overflow: 'auto', fontFamily: 'var(--font-mono)', fontSize: 13, lineHeight: 1.7,
         }}
       >

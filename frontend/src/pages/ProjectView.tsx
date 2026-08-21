@@ -25,12 +25,12 @@ type ProjectTab = 'assets' | 'screenshots' | 'findings';
 
 const LINE_RE = /^(\S+)(?:\s+\[(\d+)\])?(?:\s+\[([^\]]+)\])?(?:\s+\[(\d+)\])?(?:\s+\[([^\]]+)\])?$/;
 
-function parseLine(raw: string, assetType: 'subdomain' | 'ip'): AssetCreate {
+function parseLine(raw: string): AssetCreate {
   const trimmed = raw.trim();
   const match = trimmed.match(LINE_RE);
-  if (!match) return { asset: trimmed, asset_type: assetType };
+  if (!match) return { asset: trimmed };
   const [, hostname, statusRaw, titleRaw, lengthRaw, techRaw] = match;
-  const payload: AssetCreate = { asset: hostname, asset_type: assetType };
+  const payload: AssetCreate = { asset: hostname };
   if (statusRaw !== undefined) payload.status_code = parseInt(statusRaw, 10);
   if (titleRaw !== undefined) payload.title = titleRaw.trim();
   if (lengthRaw !== undefined) payload.content_length = parseInt(lengthRaw, 10);
@@ -60,7 +60,6 @@ export default function ProjectView() {
   const [showAddAsset, setShowAddAsset] = useState(false);
   const [showTagManager, setShowTagManager] = useState(false);
   const [newAssetValue, setNewAssetValue] = useState('');
-  const [newAssetType, setNewAssetType] = useState<'subdomain' | 'ip'>('subdomain');
   const [addingAsset, setAddingAsset] = useState(false);
   const { results, loading: searchLoading, search, query } = useSearch();
   const assetUpdateTimer = useRef<ReturnType<typeof setTimeout>>();
@@ -137,7 +136,7 @@ export default function ProjectView() {
     setAddingAsset(true);
     try {
       const lines = newAssetValue.split('\n').map((v) => v.trim()).filter(Boolean);
-      await Promise.allSettled(lines.map((line) => createAsset(id, parseLine(line, newAssetType))));
+      await Promise.allSettled(lines.map((line) => createAsset(id, parseLine(line))));
     } finally {
       await Promise.all([loadAssets(), loadProject(id)]);
       setNewAssetValue('');
@@ -193,7 +192,9 @@ export default function ProjectView() {
 
   return (
     <div style={{ display: 'flex', height: '100%' }}>
-      <div style={{ flex: 1, overflow: 'auto' }}>
+      {/* minWidth 0 lets this flex item shrink below its content's min-content
+          width; without it the asset table widens the page instead. */}
+      <div style={{ flex: 1, minWidth: 0, overflow: 'auto' }}>
         <ProjectHeader project={current} onRunRecon={() => setShowReconModal(true)} onEdit={() => setShowEdit(true)} />
 
         {/* Tab bar */}
@@ -225,7 +226,7 @@ export default function ProjectView() {
 
         {activeTab === 'assets' && (<>
         <div style={{ display: 'flex', gap: 12, marginBottom: 16, alignItems: 'center' }}>
-          <div style={{ flex: 1 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
             <SearchBar
               value={query}
               onChange={handleSearch}
@@ -282,30 +283,20 @@ export default function ProjectView() {
                   style={{ ...inputStyle, resize: 'vertical', lineHeight: 1.6, fontSize: 12 }}
                 />
               </div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                <select
-                  value={newAssetType}
-                  onChange={(e) => setNewAssetType(e.target.value as 'subdomain' | 'ip')}
-                  style={{ ...inputStyle, width: 120, cursor: 'pointer', fontSize: 12 }}
-                >
-                  <option value="subdomain">Subdomain</option>
-                  <option value="ip">IP</option>
-                </select>
-                <button
-                  onClick={handleAddAsset}
-                  disabled={addingAsset || !newAssetValue.trim()}
-                  style={{
-                    background: 'var(--accent-primary)',
-                    color: 'var(--bg-base)', border: '1px solid var(--accent-dim)',
-                    borderRadius: 6, padding: '7px 14px', fontSize: 12, fontWeight: 600,
-                    cursor: addingAsset ? 'not-allowed' : 'pointer',
-                    opacity: addingAsset || !newAssetValue.trim() ? 0.45 : 1,
-                    transition: 'all var(--transition-fast)',
-                  }}
-                >
-                  {addingAsset ? 'Adding...' : 'Add'}
-                </button>
-              </div>
+              <button
+                onClick={handleAddAsset}
+                disabled={addingAsset || !newAssetValue.trim()}
+                style={{
+                  background: 'var(--accent-primary)',
+                  color: 'var(--bg-base)', border: '1px solid var(--accent-dim)',
+                  borderRadius: 6, padding: '7px 14px', fontSize: 12, fontWeight: 600,
+                  cursor: addingAsset ? 'not-allowed' : 'pointer',
+                  opacity: addingAsset || !newAssetValue.trim() ? 0.45 : 1,
+                  transition: 'all var(--transition-fast)',
+                }}
+              >
+                {addingAsset ? 'Adding...' : 'Add'}
+              </button>
             </div>
           </div>
         )}

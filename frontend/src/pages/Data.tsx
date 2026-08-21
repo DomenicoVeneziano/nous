@@ -8,6 +8,15 @@ import ScanMonitor from '../components/data/ScanMonitor';
 import ScanHistory from '../components/data/ScanHistory';
 import FileExplorer from '../components/data/FileExplorer';
 
+// The queue/monitor grid row is what bounds both cards. `fit-content()` lets the
+// row grow with whichever card is taller — a longer queue, a few lines of output —
+// but never past this cap, which hands both children a definite height so their
+// internal `overflow:auto` panes actually scroll instead of growing the page.
+// A plain `auto` row (or a `min-content` minimum) is sized by the terminal's own
+// content, so a full 1000-line buffer would stretch the row to ~22,000px, defeat
+// the pane's scrolling, and push Scan History far down the page.
+const MONITOR_ROW_MAX_HEIGHT = 520;
+
 export default function Data() {
   const { queue, history, scanLines, scanLineOffset, loadQueue, loadHistory, addScanLine, clearScanLines } = useScanStore();
   const { projects, loadProjects } = useProjectStore();
@@ -32,7 +41,11 @@ export default function Data() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-      <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: 14 }}>
+      <div style={{
+        display: 'grid', gridTemplateColumns: '300px 1fr',
+        gridTemplateRows: `fit-content(${MONITOR_ROW_MAX_HEIGHT}px)`,
+        gap: 14,
+      }}>
         <ScanQueue jobs={queue} onRefresh={loadQueue} />
         <ScanMonitor
           lines={scanLines}

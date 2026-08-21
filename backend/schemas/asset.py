@@ -47,7 +47,9 @@ class CrawledUrls(BaseModel):
 
 class AssetCreate(BaseModel):
     asset: str
-    asset_type: Literal["subdomain", "ip"] = "subdomain"
+    # Omitted (or null) means the server classifies it from the asset string;
+    # an explicit "subdomain"/"ip" from an API client is stored verbatim.
+    asset_type: Literal["subdomain", "ip"] | None = None
     technologies: list[str] | None = None
     status_code: int | None = None
     title: str | None = None

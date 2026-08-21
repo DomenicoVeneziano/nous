@@ -12,6 +12,15 @@ const PAGE_SIZE_OPTIONS = [100, 250, 500, 1000];
 // keeps the row readable and the asset panel holds the full list.
 const ROW_TAG_LIMIT = 4;
 
+// Hostname cell cap: a long hostname must not widen the table and put a
+// horizontal scrollbar on the whole page.
+const HOSTNAME_MAX_WIDTH = 340;
+
+// Title cell cap: page titles come straight from the crawled markup and CMS
+// pages routinely emit a few hundred characters, which would widen the table
+// the same way.
+const TITLE_MAX_WIDTH = 260;
+
 interface Props {
   assets: Asset[];
   selectedIds: Set<string>;
@@ -110,7 +119,7 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
   });
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0 }}>
     <div style={{
       overflow: 'auto',
       border: '1px solid var(--border-subtle)', borderRadius: 8,
@@ -187,7 +196,17 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
                   ...tdStyle, fontFamily: 'var(--font-mono)',
                   color: 'var(--text-code)', fontSize: 13, fontWeight: 500,
                 }}>
-                  <HighlightText text={asset.asset} spans={hostnameHls} />
+                  {/* Capped on an inner block, not the <td>: auto table layout
+                      ignores a cell's max-width (CSS 2.1 17.5.2), so bounding
+                      the column has to happen inside it. The full hostname stays
+                      in the DOM so it remains selectable and find-in-page-able,
+                      and the highlight spans keep their absolute offsets. */}
+                  <span title={asset.asset} style={{
+                    display: 'block', maxWidth: HOSTNAME_MAX_WIDTH, overflow: 'hidden',
+                    textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                  }}>
+                    <HighlightText text={asset.asset} spans={hostnameHls} />
+                  </span>
                 </td>
                 <td style={{
                   ...tdStyle, fontFamily: 'var(--font-mono)',
@@ -195,13 +214,22 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
                 }}>
                   {asset.status_code ?? '-'}
                 </td>
-                <td style={{
-                  ...tdStyle, maxWidth: 200, overflow: 'hidden',
-                  textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-secondary)',
-                }}>
-                  {asset.title
-                    ? <HighlightText text={asset.title} spans={titleHls} />
-                    : '-'}
+                <td style={{ ...tdStyle, color: 'var(--text-secondary)' }}>
+                  {/* Same reason as the hostname cell: the cap lives on an inner
+                      block because auto table layout ignores max-width on a
+                      <td>. The title is never sliced in JS either — the
+                      highlight spans are absolute offsets into the full string. */}
+                  <span
+                    title={asset.title || undefined}
+                    style={{
+                      display: 'block', maxWidth: TITLE_MAX_WIDTH, overflow: 'hidden',
+                      textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {asset.title
+                      ? <HighlightText text={asset.title} spans={titleHls} />
+                      : '-'}
+                  </span>
                 </td>
                 <td style={{ ...tdStyle, fontFamily: 'var(--font-mono)', color: 'var(--text-code)', fontSize: 12 }}>
                   {asset.content_length != null ? asset.content_length.toLocaleString() : '-'}
