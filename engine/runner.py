@@ -1,7 +1,9 @@
 # engine/runner.py
 import asyncio
 import os
+import shutil
 import signal
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +13,76 @@ import re
 # Strict domain validation — prevents command injection
 DOMAIN_RE = re.compile(r'^[a-zA-Z0-9._\-]+$')
 GRACEFUL_SHUTDOWN_TIMEOUT = int(os.environ.get("GRACEFUL_SHUTDOWN_TIMEOUT", "5"))
+# Grace given to processes that escaped the group kill before they are forced.
+ESCAPEE_SHUTDOWN_TIMEOUT = float(os.environ.get("ESCAPEE_SHUTDOWN_TIMEOUT", "2"))
+
+
+def _proc_stat(pid: int) -> tuple[int, int] | None:
+    """Return (ppid, starttime) for a pid, or None if it is gone.
+
+    The comm field can contain spaces and parentheses, so parsing resumes
+    after the final ')' where the layout is fixed again.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as f:
+            data = f.read()
+    except (OSError, ValueError):
+        return None
+    tail = data[data.rfind(")") + 2:].split()
+    try:
+        return int(tail[1]), int(tail[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _descendants(root_pid: int) -> list[tuple[int, int]]:
+    """Snapshot (pid, starttime) for every descendant of root_pid.
+
+    Camoufox starts each browser in its own process group *and* session, so the
+    killpg in terminate_proc never reaches them: they are orphaned, linger until
+    their driver pipe closes, and are left for PID 1 to reap. The parent/child
+    chain is still intact while the tree is alive, so it is walked here — before
+    any signal is sent — and the survivors are signalled directly afterwards.
+
+    Each pid is paired with its start time so a pid recycled by an unrelated
+    process between the snapshot and the kill is never signalled.
+    """
+    try:
+        pids = [int(e) for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return []
+    info: dict[int, tuple[int, int]] = {}
+    for pid in pids:
+        stat = _proc_stat(pid)
+        if stat is not None:
+            info[pid] = stat
+    children: dict[int, list[int]] = {}
+    for pid, (ppid, _) in info.items():
+        children.setdefault(ppid, []).append(pid)
+    found: list[tuple[int, int]] = []
+    stack = [root_pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            found.append((child, info[child][1]))
+            stack.append(child)
+    return found
+
+
+def _signal_survivors(snapshot: list[tuple[int, int]], sig: int) -> int:
+    """Signal pids from a descendant snapshot that are still the same process."""
+    signalled = 0
+    for pid, starttime in snapshot:
+        if pid <= 1:
+            continue
+        stat = _proc_stat(pid)
+        if stat is None or stat[1] != starttime:
+            continue  # already exited, or the pid now belongs to something else
+        try:
+            os.kill(pid, sig)
+            signalled += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    return signalled
 
 
 @dataclass
@@ -86,9 +158,14 @@ async def run_script(
         log_path = log_dir / f"{job_id}.log"
         log_file = open(log_path, "w", encoding="utf-8")
 
-    child_env = None
+    # Give the script its own TMPDIR so anything it leaves behind — most of all
+    # the Playwright/camoufox profile and artifact trees, which survive a hard
+    # kill — is removed wholesale in the finally block below rather than
+    # accumulating in a shared /tmp for the lifetime of the container.
+    run_tmpdir = tempfile.mkdtemp(prefix="nous_run_")
+    child_env = {**os.environ, "TMPDIR": run_tmpdir}
     if env:
-        child_env = {**os.environ, **env}
+        child_env.update(env)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -150,13 +227,20 @@ async def run_script(
 
         async def terminate_proc():
             # Graceful stop of the entire process tree, then force-kill the
-            # group if it does not exit within the grace period.
+            # group if it does not exit within the grace period. The descendant
+            # snapshot is taken first, while the parent/child links still exist.
+            escapees = _descendants(proc.pid)
             _signal_group(signal.SIGTERM)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
             except asyncio.TimeoutError:
                 _signal_group(signal.SIGKILL)
                 await proc.wait()
+            # Anything that put itself in its own process group outlived the
+            # killpg above; signal those directly so no browser survives the job.
+            if _signal_survivors(escapees, signal.SIGTERM):
+                await asyncio.sleep(ESCAPEE_SHUTDOWN_TIMEOUT)
+                _signal_survivors(escapees, signal.SIGKILL)
 
         try:
             gather = asyncio.gather(read_stdout(), read_stderr(), proc.wait())
@@ -183,6 +267,7 @@ async def run_script(
     finally:
         if log_file:
             log_file.close()
+        shutil.rmtree(run_tmpdir, ignore_errors=True)
 
     duration = time.time() - start_time
 

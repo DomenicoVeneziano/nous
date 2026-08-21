@@ -25,6 +25,12 @@ services:
     build:
       context: ./engine
       dockerfile: Dockerfile
+    # worker.py runs as PID 1 and only reaps the children it spawns itself.
+    # Camoufox's Firefox subprocesses outlive tech_analysis.py, get reparented
+    # here, and accumulate as zombies until the container's PID cgroup is
+    # exhausted — after which Firefox can no longer fork and every tech scan
+    # fails with SCAN_ERROR. tini as PID 1 reaps them.
+    init: true
     env_file:
       - .env
     volumes:

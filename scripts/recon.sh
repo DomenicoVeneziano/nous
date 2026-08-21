@@ -106,15 +106,15 @@ check_dependencies
 # ------------------------------------------------------------------------------
 # Temp files & cleanup
 # ------------------------------------------------------------------------------
-active_subs=$(mktemp /tmp/nous_active.XXXXXX)
-bruteforced_subs=$(mktemp /tmp/nous_brute.XXXXXX)
-permuted_subs=$(mktemp /tmp/nous_perm.XXXXXX)
-combined_subs=$(mktemp /tmp/nous_combined.XXXXXX)
-wildcard_domains=$(mktemp /tmp/nous_wildcard.XXXXXX)
-new_words=$(mktemp /tmp/nous_newwords.XXXXXX)
-expanded_wordlist=$(mktemp /tmp/nous_expanded_wl.XXXXXX)
-filtered_wordlist=$(mktemp /tmp/nous_filtered_wl.XXXXXX)
-raw_archived_urls=$(mktemp /tmp/nous_archived_urls.XXXXXX)
+active_subs=$(mktemp "${TMPDIR:-/tmp}/nous_active.XXXXXX")
+bruteforced_subs=$(mktemp "${TMPDIR:-/tmp}/nous_brute.XXXXXX")
+permuted_subs=$(mktemp "${TMPDIR:-/tmp}/nous_perm.XXXXXX")
+combined_subs=$(mktemp "${TMPDIR:-/tmp}/nous_combined.XXXXXX")
+wildcard_domains=$(mktemp "${TMPDIR:-/tmp}/nous_wildcard.XXXXXX")
+new_words=$(mktemp "${TMPDIR:-/tmp}/nous_newwords.XXXXXX")
+expanded_wordlist=$(mktemp "${TMPDIR:-/tmp}/nous_expanded_wl.XXXXXX")
+filtered_wordlist=$(mktemp "${TMPDIR:-/tmp}/nous_filtered_wl.XXXXXX")
+raw_archived_urls=$(mktemp "${TMPDIR:-/tmp}/nous_archived_urls.XXXXXX")
 archived_urls_file="$(dirname "$output_file")/archived_urls.txt"
 # source<TAB>hostname, one line per (source, host) pair. Written alongside the
 # flat output file so the engine can attribute each subdomain to the phase that
