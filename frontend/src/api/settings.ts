@@ -26,6 +26,7 @@ export interface ProxyConfig {
   recon: boolean;
   tech: boolean;
   crawl: boolean;
+  retries: boolean;
 }
 
 export async function fetchProxyConfig(): Promise<ProxyConfig> {

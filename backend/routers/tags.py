@@ -36,7 +36,7 @@ def _reject_system(tag: Tag) -> None:
     """System tags record how an asset was discovered. They are read-only over
     the API — enforced here, not merely hidden in the UI."""
     if tag.is_system:
-        raise HTTPException(403, f"'{tag.name}' is a discovery-source tag and cannot be modified")
+        raise HTTPException(403, f"'{tag.name}' is a system tag and cannot be modified")
 
 
 def _require_asset(db: Session, project_id: str, asset_id: str):
@@ -144,7 +144,7 @@ def attach_tag(project_id: str, asset_id: str, data: TagAssign,
         reserved = tag_service.system_tag_name(data.name)
         if reserved:
             raise HTTPException(
-                403, f"'{reserved}' is a discovery-source tag and cannot be modified"
+                403, f"'{reserved}' is a system tag and cannot be modified"
             )
         try:
             name = tag_service.normalize_name(data.name)

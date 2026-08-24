@@ -62,6 +62,7 @@ class ProxyConfigUpdate(BaseModel):
     recon: bool | None = None
     tech: bool | None = None
     crawl: bool | None = None
+    retries: bool | None = None
 
     @field_validator("scheme")
     @classmethod

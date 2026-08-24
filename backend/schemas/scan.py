@@ -1,5 +1,5 @@
 # backend/schemas/scan.py
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 from datetime import datetime
 from typing import Literal
 
@@ -30,5 +30,24 @@ class ScanOut(BaseModel):
     log_path: str | None
     error_msg: str | None
     config: dict | None = None
+
+    # The scan job config holds proxy URLs of the form
+    # scheme://user:password@host:port. /scans/queue and /scans/history are
+    # viewer-readable, so the raw config would hand the proxy credentials to
+    # every viewer-role user. Replace the URLs with a non-secret marker that
+    # still tells a client a proxy was in use.
+    @field_serializer("config")
+    def _mask_proxy_urls(self, config: dict | None) -> dict | None:
+        if not config:
+            return config
+        if not any(k in config for k in ("proxy_url", "retry_proxy_url")):
+            return config
+        # Shallow copy: the input may be the live ORM attribute and must not be
+        # mutated, or the masked value would be written back to the row.
+        masked = dict(config)
+        for key in ("proxy_url", "retry_proxy_url"):
+            if key in masked:
+                masked[key] = "configured"
+        return masked
 
     model_config = {"from_attributes": True}

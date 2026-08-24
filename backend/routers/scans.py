@@ -7,7 +7,7 @@ from schemas.scan import ScanCreate, ScanPositionUpdate, ScanOut
 from models.scan import ScanJob
 from services.project_service import get_project
 from ws.scan_stream import clear_buffer_and_broadcast
-from services.settings_store import proxy_url_for_scan_type
+from services.settings_store import proxy_url_for_scan_type, retry_proxy_url_for_scan_type
 from config import settings
 import uuid
 from datetime import datetime, timezone
@@ -63,11 +63,21 @@ def enqueue_scan(data: ScanCreate, db: Session = Depends(get_db), _: dict = Depe
 
     # Snapshot the proxy URL for this scan type (None if proxy disabled or this
     # type is not selected) so the engine routes — or bypasses — accordingly.
+    # The retry URL is snapshotted the same way: it is independent of the
+    # per-phase flags and lets the engine run a direct pass first and re-attempt
+    # blocked hosts through the proxy within the same job. Both are enqueue-time
+    # snapshots, so a later settings change never alters an already queued job.
     proxy_url = proxy_url_for_scan_type(data.scan_type)
     if proxy_url:
         if job_config is None:
             job_config = {}
         job_config["proxy_url"] = proxy_url
+
+    retry_proxy_url = retry_proxy_url_for_scan_type(data.scan_type)
+    if retry_proxy_url:
+        if job_config is None:
+            job_config = {}
+        job_config["retry_proxy_url"] = retry_proxy_url
 
     job = ScanJob(
         id=str(uuid.uuid4()),

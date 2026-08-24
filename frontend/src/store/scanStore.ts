@@ -1,6 +1,6 @@
 // frontend/src/store/scanStore.ts
 import { create } from 'zustand';
-import type { ScanJob } from '../types/scan';
+import type { ScanJob, ScanProgress } from '../types/scan';
 import { fetchQueue, fetchHistory } from '../api/scans';
 
 const MAX_SCAN_LINES = 1000;
@@ -12,11 +12,14 @@ interface ScanState {
   // Absolute index of scanLines[0] within the full stream. Climbs as the ring
   // buffer drops old lines, so line numbers and React keys stay stable.
   scanLineOffset: number;
+  // Single latest progress snapshot for the job being watched; never a history.
+  scanProgress: ScanProgress | null;
   loading: boolean;
   loadQueue: () => Promise<void>;
   loadHistory: () => Promise<void>;
   addScanLine: (line: string) => void;
   clearScanLines: () => void;
+  setScanProgress: (p: ScanProgress | null) => void;
   updateJob: (job: Partial<ScanJob> & { id: string }) => void;
 }
 
@@ -25,6 +28,7 @@ export const useScanStore = create<ScanState>((set) => ({
   history: [],
   scanLines: [],
   scanLineOffset: 0,
+  scanProgress: null,
   loading: false,
 
   loadQueue: async () => {
@@ -65,7 +69,10 @@ export const useScanStore = create<ScanState>((set) => ({
       return { scanLines: next };
     }),
 
-  clearScanLines: () => set({ scanLines: [], scanLineOffset: 0 }),
+  clearScanLines: () => set({ scanLines: [], scanLineOffset: 0, scanProgress: null }),
+
+  // Replaces the snapshot outright, so at most one is ever held.
+  setScanProgress: (p) => set({ scanProgress: p }),
 
   updateJob: (job) =>
     set((state) => ({

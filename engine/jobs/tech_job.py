@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from runner import run_script, validate_path_within
@@ -15,6 +16,7 @@ from queue_manager import (
     get_all_project_asset_details, update_asset_record, refresh_project_counts,
     get_project_domains, get_project_asset_hostnames,
     insert_asset_if_absent, enqueue_tech_scan, SOURCE_REDIRECT, utc_now_str,
+    attach_tag, detach_tag, job_is_cancelled, SYSTEM_TAG_PROXIED,
 )
 
 
@@ -40,6 +42,36 @@ TECH_BATCH_SIZE = int(os.environ.get("TECH_BATCH_SIZE", "10"))
 TECH_RATE_LIMIT_DELAY = float(os.environ.get("TECH_RATE_LIMIT_DELAY", "0"))
 DNS_RATE_LIMIT_DELAY = float(os.environ.get("DNS_RATE_LIMIT_DELAY", "0"))
 TCP_PRECHECK_CONCURRENCY = int(os.environ.get("TECH_TCP_PRECHECK_CONCURRENCY", "100"))
+# Upper bound on how many assets EITHER retry pass may touch. Proxy traffic is
+# metered, and the direct retry runs at widened spacing, so a project whose whole
+# DNS-live set fails pass 1 would otherwise push every asset through both passes
+# and add hours of wall clock to a run least likely to benefit. 0 means unbounded.
+TECH_RETRY_MAX_ASSETS = int(os.environ.get("TECH_RETRY_MAX_ASSETS", "1000"))
+
+# Deliberately narrow: only outcomes a different vantage point can plausibly
+# change. Blocks (403), throttling (429) and edge/origin errors (5xx) qualify.
+# Redirects, 404, 401, malformed-URL 400s and ordinary 2xx/3xx never do — no
+# exit IP turns those into a different answer, so retrying them is pure cost.
+RETRY_STATUSES = frozenset({403, 429, 503, 520, 521, 522, 523, 524})
+
+
+@dataclass(frozen=True)
+class PassSpec:
+    """Everything one tech-analysis pass is allowed to do.
+
+    All write-policy branching reads from this object, so the rule "the last
+    SUCCESSFUL pass wins" lives in exactly one place instead of being spread
+    across pass-number conditionals at each write site. A later pass may add or
+    replace a result; it may never downgrade a good earlier one to a failure.
+    """
+    index: int
+    total: int
+    label: str
+    proxy_url: str | None
+    delay: float
+    write_failures: bool
+    may_delete_stale_screenshot: bool
+    tag_proxied: bool
 
 
 async def _probe_port(hostname: str, port: int) -> int | None:
@@ -115,26 +147,32 @@ async def _scan_batch(
     project_id: str,
     session,
     job_id: str,
-    batch_num: int,
+    batch_id: str,
+    spec: PassSpec,
     responses_dir: Path,
     log_dir: Path,
     now: str,
     ws_broadcast=None,
     line_broadcast=None,
     per_domain_timeout: int = PER_DOMAIN_TIMEOUT,
-    tech_rate_limit_delay: float = TECH_RATE_LIMIT_DELAY,
-    proxy_url: str | None = None,
     screenshots_dir: Path | None = None,
     redirect_targets: set | None = None,
-) -> int:
+) -> dict[str, tuple[str, int | None]]:
     """
     Run tech analysis on a batch of assets in a single script invocation.
     Each asset must have 'hostname' and 'url' (scheme://hostname).
-    Returns count of assets successfully analyzed.
+
+    Returns the per-asset outcome map {hostname: (kind, status_code)} where kind
+    is "ok", "redirect" or "missing" (status_code None for "missing"). The
+    caller builds retry candidate sets from this map alone — never by
+    re-querying the assets table, which would not hold at project scale.
+
+    `batch_id` must be unique across passes: it keys both the summary file and
+    the runner log, so a later pass cannot clobber an earlier pass's artifacts.
     """
     if redirect_targets is None:
         redirect_targets = set()
-    batch_summary = responses_dir / f"batch_{batch_num}_summary.log"
+    batch_summary = responses_dir / f"batch_{batch_id}_summary.log"
     if batch_summary.is_file():
         batch_summary.unlink()
 
@@ -143,11 +181,11 @@ async def _scan_batch(
         tmp_path = tmp.name
 
     script_args = ["-o", str(batch_summary), "-f", str(responses_dir),
-                   "--delay", str(tech_rate_limit_delay)]
+                   "--delay", str(spec.delay)]
     if screenshots_dir is not None:
         script_args += ["-s", str(screenshots_dir)]
-    if proxy_url:
-        script_args += ["--proxy", proxy_url]
+    if spec.proxy_url:
+        script_args += ["--proxy", spec.proxy_url]
     script_args.append(tmp_path)
 
     # Cutoff for "was this screenshot written by THIS run": the -1 absorbs
@@ -160,8 +198,11 @@ async def _scan_batch(
         result = await run_script(
             script_path=str(SCRIPTS_DIR / "tech_analysis.py"),
             args=script_args,
-            job_id=f"{job_id}_batch_{batch_num}",
-            timeout_seconds=int((per_domain_timeout + tech_rate_limit_delay) * len(assets)) if per_domain_timeout > 0 else 0,
+            job_id=f"{job_id}_batch_{batch_id}",
+            # Budget follows THIS pass's delay. A widened retry delay against
+            # pass 1's budget would kill the process mid-pass and mislabel every
+            # host it never reached.
+            timeout_seconds=int((per_domain_timeout + spec.delay) * len(assets)) if per_domain_timeout > 0 else 0,
             ws_broadcast=line_broadcast,
             log_dir=log_dir,
         )
@@ -178,7 +219,7 @@ async def _scan_batch(
 
     parsed_by_domain = {entry["domain"]: entry for entry in parsed}
 
-    success_count = 0
+    outcomes: dict[str, tuple[str, int | None]] = {}
     for asset in assets:
         hostname = asset["hostname"]
         safe_domain = hostname.replace(".", "_")
@@ -199,6 +240,11 @@ async def _scan_batch(
                 screenshot_path=None,
                 date_scanned=now,
             )
+            # Deleted on EVERY pass, retry passes included. This is not a
+            # violation of the additive-only screenshot rule: it is part of a
+            # write that SUCCEEDED. The row now states "redirects away", and
+            # leaving a page screenshot attached to it would be a worse lie
+            # than having no image at all.
             _remove_screenshot(screenshots_dir, safe_domain)
             redirect_targets.add(dest)
             if ws_broadcast:
@@ -210,7 +256,7 @@ async def _scan_batch(
                     "technologies": [],
                     "redirects_to": dest,
                 })
-            success_count += 1
+            outcomes[hostname] = ("redirect", entry["status_code"])
         elif entry:
             extra_fields = {}
             if screenshots_dir is not None:
@@ -229,13 +275,20 @@ async def _scan_batch(
                     # Stored relative to the projects dir (the convention the
                     # /files/image endpoint expects).
                     extra_fields["screenshot_path"] = f"{project_id}/screenshots/{safe_domain}.png"
-                else:
+                elif spec.may_delete_stale_screenshot:
                     # No image from this run: drop any older one rather than
                     # attributing it to this result.
                     _remove_screenshot(screenshots_dir, safe_domain)
                     extra_fields["screenshot_path"] = None
                     if line_broadcast:
                         await line_broadcast(f"[!] Screenshot capture failed for {hostname} (continuing)")
+                else:
+                    # Retry pass, no fresh capture: screenshot handling here is
+                    # additive-only. Omit screenshot_path from the update
+                    # entirely — neither detach nor delete — so this pass can
+                    # only ever REPLACE an image with a newer one, never destroy
+                    # one an earlier pass legitimately captured.
+                    pass
             update_asset_record(
                 session, hostname, project_id,
                 status_code=entry["status_code"],
@@ -255,8 +308,15 @@ async def _scan_batch(
                     "title": entry["title"],
                     "technologies": entry["technologies"],
                 })
-            success_count += 1
+            outcomes[hostname] = ("ok", entry["status_code"])
         else:
+            outcomes[hostname] = ("missing", None)
+            if not spec.write_failures:
+                # A retry pass that also failed says nothing new. Writing the
+                # failure here would overwrite whatever an earlier pass stored,
+                # so record the outcome in memory only: no DB write, no
+                # broadcast. The caller uses it to build the next candidate set.
+                continue
             reason = "TIMEOUT" if result.timed_out else "SCAN_ERROR"
             update_asset_record(
                 session, hostname, project_id,
@@ -279,7 +339,22 @@ async def _scan_batch(
                     "technologies": [],
                 })
 
-    return success_count
+    return outcomes
+
+
+def _retry_candidates(outcomes: dict[str, tuple[str, int | None]]) -> set[str]:
+    """Hostnames worth another pass: nothing came back at all, or the response
+    was a block/throttle/edge error. Everything else is a settled answer that a
+    different exit IP would return identically."""
+    return {
+        host for host, (kind, status) in outcomes.items()
+        if kind == "missing" or (kind == "ok" and status in RETRY_STATUSES)
+    }
+
+
+def _stored_hosts(outcomes: dict[str, tuple[str, int | None]]) -> list[str]:
+    """Hostnames whose result this pass actually wrote to the DB."""
+    return [h for h, (kind, _) in outcomes.items() if kind in ("ok", "redirect")]
 
 
 async def run_tech_job(job: dict, ws_broadcast=None):
@@ -304,6 +379,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
     dns_rate_limit_delay = cfg.get("dns_rate_limit_delay", DNS_RATE_LIMIT_DELAY)
     resolvers_path = cfg.get("resolvers_path")
     proxy_url = cfg.get("proxy_url")
+    retry_proxy_url = cfg.get("retry_proxy_url")
     screenshots_enabled = cfg.get("screenshots_enabled", False)
 
     screenshots_dir = None
@@ -399,6 +475,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
         ])
 
         scannable_assets = []
+        unreachable_assets = []
         for asset, open_ports in zip(live_assets, tcp_results):
             if open_ports:
                 # Prefer TLS whenever 443 answers. A host serving both commonly
@@ -408,6 +485,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
                 asset["url"] = f"{scheme}://{asset['hostname']}"
                 scannable_assets.append(asset)
             else:
+                unreachable_assets.append(asset)
                 update_asset_record(
                     session, asset["hostname"], project_id,
                     status_code=0,
@@ -430,40 +508,213 @@ async def run_tech_job(job: dict, ws_broadcast=None):
                 f"{len(live_assets) - len(scannable_assets)} unreachable"
             )
 
-        # ── Batched tech analysis ───────────────────────────────────
-        total = len(scannable_assets)
-        analyzed = 0
+        # ── Multi-pass tech analysis ────────────────────────────────
         start_time = time.time()
-        batches = [scannable_assets[i:i + TECH_BATCH_SIZE] for i in range(0, total, TECH_BATCH_SIZE)]
-
-        if ws_broadcast:
-            await line_broadcast(
-                f"[*] Running tech analysis on {total} asset(s) in {len(batches)} batch(es) of up to {TECH_BATCH_SIZE}"
-            )
-
         redirect_targets: set[str] = set()
-        for batch_num, batch in enumerate(batches, 1):
-            if ws_broadcast:
+        # A host that fails in pass 1 and recovers in pass 3 must count ONCE, so
+        # the reported total can never exceed the asset count.
+        succeeded: set[str] = set()
+        asset_by_host = {a["hostname"]: a for a in scannable_assets}
+        pass_total = 3 if retry_proxy_url else 2
+
+        # Progress is ASSET-weighted: assets_total starts at the pass-1 sweep
+        # size and GROWS at each pass boundary, as each candidate set becomes
+        # known. Tradeoff, accepted deliberately: the bar can tick backwards by
+        # the retry-set fraction at a boundary. Retry sets are small by
+        # construction, and this beats pass-count weighting, which would stall
+        # through the long first pass and then jump.
+        progress = {"done": 0, "total": len(scannable_assets)}
+
+        async def emit_progress(spec: PassSpec, pass_done: int, pass_size: int):
+            if not ws_broadcast:
+                return
+            await ws_broadcast("scan_progress", {
+                "job_id": job_id,
+                "scan_type": "tech",
+                "pass_index": spec.index,
+                "pass_total": spec.total,
+                "pass_label": spec.label,
+                "assets_done": progress["done"],
+                "assets_total": progress["total"],
+                "pass_assets_done": pass_done,
+                "pass_assets_total": pass_size,
+            })
+
+        # Set by the pass-boundary checks below AND by the in-pass batch
+        # checkpoint in _run_pass. One flag, one cancelled exit path.
+        cancelled = False
+
+        async def _run_pass(spec: PassSpec, pass_assets: list[dict]) -> dict[str, tuple[str, int | None]]:
+            """Run one full pass over `pass_assets`, batched, and return the
+            merged per-asset outcome map.
+
+            Stops at the next batch boundary if the job is cancelled: the
+            returned map then covers only the batches that actually ran, and
+            everything already written stays written."""
+            nonlocal cancelled
+            outcomes: dict[str, tuple[str, int | None]] = {}
+            batches = [
+                pass_assets[i:i + TECH_BATCH_SIZE]
+                for i in range(0, len(pass_assets), TECH_BATCH_SIZE)
+            ]
+            # Label and count only. This line must never carry a proxy URL —
+            # those embed credentials.
+            await line_broadcast(
+                f"[*] Pass {spec.index}/{spec.total} - {spec.label}: {len(pass_assets)} asset(s)"
+            )
+            await emit_progress(spec, 0, len(pass_assets))
+
+            pass_done = 0
+            for batch_num, batch in enumerate(batches, 1):
                 domains = ", ".join(a["hostname"] for a in batch)
                 await line_broadcast(f"[*] Batch {batch_num}/{len(batches)}: {domains}")
+                outcomes.update(await _scan_batch(
+                    assets=batch,
+                    project_id=project_id,
+                    session=session,
+                    job_id=job_id,
+                    # Unique per pass: batch 1 of pass 2 must not overwrite
+                    # batch 1 of pass 1's summary file or runner log.
+                    batch_id=f"p{spec.index}_b{batch_num}",
+                    spec=spec,
+                    responses_dir=responses_dir,
+                    log_dir=log_dir,
+                    now=now,
+                    ws_broadcast=ws_broadcast,
+                    line_broadcast=line_broadcast,
+                    per_domain_timeout=per_domain_timeout,
+                    screenshots_dir=screenshots_dir,
+                    redirect_targets=redirect_targets,
+                ))
+                pass_done += len(batch)
+                progress["done"] += len(batch)
+                await emit_progress(spec, pass_done, len(pass_assets))
 
-            analyzed += await _scan_batch(
-                assets=batch,
-                project_id=project_id,
-                session=session,
-                job_id=job_id,
-                batch_num=batch_num,
-                responses_dir=responses_dir,
-                log_dir=log_dir,
-                now=now,
-                ws_broadcast=ws_broadcast,
-                line_broadcast=line_broadcast,
-                per_domain_timeout=per_domain_timeout,
-                tech_rate_limit_delay=tech_rate_limit_delay,
-                proxy_url=proxy_url,
-                screenshots_dir=screenshots_dir,
-                redirect_targets=redirect_targets,
-            )
+                # The batch boundary is the in-pass checkpoint. job_is_cancelled
+                # commits and runs a SELECT, so it is polled once per batch and
+                # never per asset — per-asset polling would be per-row work that
+                # scales with the project's asset count. Skipped on the final
+                # batch, where the pass is over either way.
+                if batch_num < len(batches) and job_is_cancelled(session, job_id):
+                    cancelled = True
+                    await line_broadcast(
+                        f"[!] Cancellation requested - stopping pass {spec.index} "
+                        f"after batch {batch_num}/{len(batches)}"
+                    )
+                    break
+
+            # Runs on the cancelled path too: the hosts this pass DID store are
+            # committed, so their proxied-vantage tag must match what is stored.
+            stored = _stored_hosts(outcomes)
+            succeeded.update(stored)
+            # One bulk call per pass, never per asset. The tag must always
+            # describe the vantage point of the CURRENTLY STORED result, so a
+            # host that recovers on a direct pass loses it again. detach_tag
+            # early-returns after a single SELECT for projects that have never
+            # used a proxy, so this is cheap in the common case.
+            if spec.tag_proxied:
+                attach_tag(session, project_id, stored, SYSTEM_TAG_PROXIED)
+            else:
+                detach_tag(session, project_id, stored, SYSTEM_TAG_PROXIED)
+            return outcomes
+
+        # ── Pass 1: direct sweep over everything reachable ──────────
+        outcomes_1 = await _run_pass(
+            PassSpec(
+                index=1, total=pass_total, label="direct sweep",
+                proxy_url=proxy_url, delay=tech_rate_limit_delay,
+                write_failures=True, may_delete_stale_screenshot=True,
+                tag_proxied=bool(proxy_url),
+            ),
+            scannable_assets,
+        )
+
+        # ── Pass 2: direct retry at wider spacing ───────────────────
+        # TCP_UNREACHABLE hosts are excluded: they never entered
+        # scannable_assets, and the precheck already proved the direct path
+        # fails, so re-probing them directly is guaranteed-useless work.
+        retry_1 = _retry_candidates(outcomes_1)
+        outcomes_2: dict[str, tuple[str, int | None]] = {}
+        if retry_1 and not cancelled:
+            # Pass boundary is the checkpoint: the worker only polls for
+            # cancellation every POLL_INTERVAL, so without this a whole extra
+            # pass could start after a cancel was already requested.
+            if job_is_cancelled(session, job_id):
+                cancelled = True
+            else:
+                # Bounded exactly like the proxy pass. This pass runs at widened
+                # spacing (>= 2s/host), so an unbounded set turns a wholesale
+                # pass-1 failure into hours of added wall clock.
+                #
+                # Ordering is deterministic, and priority-ordered rather than
+                # arbitrary: hosts that ANSWERED with a block/throttle/edge error
+                # come first, then hosts nothing came back from. Wider spacing is
+                # precisely the remedy for 403/429/5xx, while a "missing" host is
+                # the wholesale-failure case a slower direct retry rarely fixes.
+                # Within each group, hostname order — the same tie-break the
+                # proxy pass uses — so the cut is stable run to run.
+                pass_2_hosts = sorted(
+                    retry_1,
+                    key=lambda h: (0 if outcomes_1.get(h, ("missing", None))[0] == "ok" else 1, h),
+                )
+                if TECH_RETRY_MAX_ASSETS > 0 and len(pass_2_hosts) > TECH_RETRY_MAX_ASSETS:
+                    await line_broadcast(
+                        f"[!] Direct retry set truncated to {TECH_RETRY_MAX_ASSETS} "
+                        f"of {len(pass_2_hosts)} asset(s)"
+                    )
+                    pass_2_hosts = pass_2_hosts[:TECH_RETRY_MAX_ASSETS]
+                progress["total"] += len(pass_2_hosts)
+                outcomes_2 = await _run_pass(
+                    PassSpec(
+                        index=2, total=pass_total, label="direct retry",
+                        proxy_url=None,
+                        delay=max(2.0, 3 * tech_rate_limit_delay),
+                        write_failures=False, may_delete_stale_screenshot=False,
+                        tag_proxied=False,
+                    ),
+                    [asset_by_host[h] for h in pass_2_hosts],
+                )
+
+        # ── Pass 3: proxy retry ─────────────────────────────────────
+        # Skipped entirely without a retry proxy — no candidate set is even
+        # built. Rotating exit IPs make per-IP throttling a non-issue, so this
+        # pass runs at the NORMAL delay rather than the widened one.
+        if retry_proxy_url and not cancelled:
+            if job_is_cancelled(session, job_id):
+                cancelled = True
+            else:
+                pass_3_hosts = _retry_candidates(outcomes_2) | (retry_1 - set(outcomes_2))
+                candidates = [asset_by_host[h] for h in sorted(pass_3_hosts)]
+                for asset in unreachable_assets:
+                    # Included on purpose: the TCP precheck measures this
+                    # container's own egress — exactly the vantage point this
+                    # pass exists to replace, and a datacenter-range SYN drop is
+                    # the canonical "reachable only from residential" case. The
+                    # local precheck is BYPASSED here because it cannot probe
+                    # through an HTTP proxy; let the proxy do the connecting.
+                    asset["url"] = f"https://{asset['hostname']}"
+                    candidates.append(asset)
+
+                if TECH_RETRY_MAX_ASSETS > 0 and len(candidates) > TECH_RETRY_MAX_ASSETS:
+                    await line_broadcast(
+                        f"[!] Proxy retry set truncated to {TECH_RETRY_MAX_ASSETS} "
+                        f"of {len(candidates)} asset(s)"
+                    )
+                    candidates = candidates[:TECH_RETRY_MAX_ASSETS]
+
+                if candidates:
+                    progress["total"] += len(candidates)
+                    await _run_pass(
+                        PassSpec(
+                            index=3, total=pass_total, label="proxy retry",
+                            proxy_url=retry_proxy_url, delay=tech_rate_limit_delay,
+                            write_failures=False, may_delete_stale_screenshot=False,
+                            tag_proxied=True,
+                        ),
+                        candidates,
+                    )
+
+        analyzed = len(succeeded)
 
         # ── Follow in-scope cross-host redirects ────────────────────
         # For each new host an asset redirected to, if it is in project scope
@@ -495,6 +746,14 @@ async def run_tech_job(job: dict, ws_broadcast=None):
             "UPDATE projects SET last_scan_date = :d, last_scan_duration_s = :dur WHERE id = :pid"
         ), {"d": now, "dur": total_duration, "pid": project_id})
         session.commit()
+
+        if cancelled:
+            # The API already wrote the cancelled status; overwriting it with
+            # "done" would erase the user's action. Everything above this point
+            # (counts, redirect follow-up, project timestamps) still runs so the
+            # work the passes DID complete is not lost.
+            await line_broadcast("[!] Scan cancelled - stopped early; completed results kept")
+            return
 
         transition_status(session, job_id, "running", "done",
                           duration_s=total_duration,

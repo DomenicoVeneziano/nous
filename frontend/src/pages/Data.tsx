@@ -1,5 +1,5 @@
 // frontend/src/pages/Data.tsx
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useScanStore } from '../store/scanStore';
 import { useProjectStore } from '../store/projectStore';
 import { useWebSocket } from '../hooks/useWebSocket';
@@ -18,7 +18,7 @@ import FileExplorer from '../components/data/FileExplorer';
 const MONITOR_ROW_MAX_HEIGHT = 520;
 
 export default function Data() {
-  const { queue, history, scanLines, scanLineOffset, loadQueue, loadHistory, addScanLine, clearScanLines } = useScanStore();
+  const { queue, history, scanLines, scanLineOffset, scanProgress, loadQueue, loadHistory, addScanLine, clearScanLines, setScanProgress } = useScanStore();
   const { projects, loadProjects } = useProjectStore();
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 
@@ -29,15 +29,63 @@ export default function Data() {
     loadProjects();
   }, []);
 
+  const runningJob = queue.find((j) => j.status === 'running');
+  const runningJobId = runningJob?.id ?? null;
+
+  // Which job may drive the progress bar. `job_started` carries the id, so the
+  // bar no longer waits on the async queue fetch: a scan whose whole first pass
+  // finishes before `/scans/queue` returns still renders. Refs, so the socket
+  // handlers always read the current value without re-subscribing.
+  const startedJobIdRef = useRef<string | null>(null);
+  // The queue's running job is the fallback authority when the page mounts in
+  // the middle of a scan and no `job_started` was ever received here.
+  const runningJobIdRef = useRef<string | null>(null);
+  runningJobIdRef.current = runningJobId;
+
+  const isWatchedJob = (jobId: string) =>
+    jobId === startedJobIdRef.current ||
+    (startedJobIdRef.current === null && jobId === runningJobIdRef.current);
+
+  // A job reached a terminal state: stop letting it drive the bar and drop its
+  // snapshot, so the label and fill do not linger at their final values.
+  const finishJob = (data: Record<string, unknown>) => {
+    const jobId = typeof data.job_id === 'string' ? data.job_id : startedJobIdRef.current;
+    if (jobId !== null && jobId === startedJobIdRef.current) startedJobIdRef.current = null;
+    const current = useScanStore.getState().scanProgress;
+    if (current && (jobId === null || current.job_id === jobId)) setScanProgress(null);
+    loadQueue();
+    loadHistory();
+  };
+
   useWebSocket({
     scan_line: (data) => addScanLine(data.line as string),
-    job_started: () => { loadQueue(); },
-    job_complete: () => { loadQueue(); loadHistory(); },
-    job_failed: () => { loadQueue(); loadHistory(); },
+    scan_progress: (data) => {
+      // The store keeps whatever it is handed, so the job filter lives here:
+      // only the job the monitor is watching may drive the bar.
+      if (typeof data.job_id !== 'string' || !isWatchedJob(data.job_id)) return;
+      if (typeof data.scan_type !== 'string' || typeof data.pass_label !== 'string') return;
+      const counts = ['pass_index', 'pass_total', 'assets_done', 'assets_total', 'pass_assets_done', 'pass_assets_total'];
+      if (counts.some((k) => typeof data[k] !== 'number' || !Number.isFinite(data[k] as number))) return;
+      setScanProgress({
+        job_id: data.job_id,
+        scan_type: data.scan_type,
+        pass_label: data.pass_label,
+        pass_index: data.pass_index as number,
+        pass_total: data.pass_total as number,
+        assets_done: data.assets_done as number,
+        assets_total: data.assets_total as number,
+        pass_assets_done: data.pass_assets_done as number,
+        pass_assets_total: data.pass_assets_total as number,
+      });
+    },
+    job_started: (data) => {
+      if (typeof data.job_id === 'string') startedJobIdRef.current = data.job_id;
+      loadQueue();
+    },
+    job_complete: (data) => { finishJob(data); },
+    job_failed: (data) => { finishJob(data); },
     output_cleared: () => { clearScanLines(); },
   }, () => { loadQueue(); });
-
-  const runningJob = queue.find((j) => j.status === 'running');
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -51,6 +99,7 @@ export default function Data() {
           lines={scanLines}
           lineOffset={scanLineOffset}
           activeJob={runningJob ? { scan_type: runningJob.scan_type, id: runningJob.id } : null}
+          progress={scanProgress}
         />
       </div>
 

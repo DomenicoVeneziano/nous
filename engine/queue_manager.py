@@ -23,6 +23,11 @@ SOURCE_PERMUTATIONS = "Permutations"
 SOURCE_CRAWLING = "Crawling"
 SOURCE_REDIRECT = "Redirect"
 
+# Vantage-point tag, not a discovery source: it marks assets whose STORED scan
+# result came from a proxied pass. It is the one tag the engine removes
+# automatically — a later direct pass that succeeds detaches it.
+SYSTEM_TAG_PROXIED = "Proxied"
+
 # SQLite caps bound parameters per statement; chunk long id lists well under it.
 _ID_CHUNK = 500
 
@@ -174,6 +179,19 @@ def get_job_status(session: Session, job_id: str) -> str | None:
     return row[0] if row else None
 
 
+def job_is_cancelled(session: Session, job_id: str) -> bool:
+    """True once the job is no longer running — the pass-boundary checkpoint.
+
+    The worker only polls for cancellation every POLL_INTERVAL seconds, so
+    without a check here an expensive later pass could start after a cancel was
+    already requested. The commit ends any open read snapshot first: a
+    long-lived session would otherwise keep reading the status it saw when its
+    transaction began.
+    """
+    session.commit()
+    return get_job_status(session, job_id) != "running"
+
+
 def get_project_asset_hostnames(session: Session, project_id: str) -> list[str]:
     """Retrieve all asset hostnames for a project."""
     rows = session.execute(text(
@@ -301,17 +319,8 @@ def sync_tags_text(session: Session, asset_ids: list[str]) -> None:
         ), params)
 
 
-def attach_source_tag(session: Session, project_id: str, hostnames: list[str], source: str) -> None:
-    """Tag every named asset with a discovery source.
-
-    Applied to hostnames that already existed as well as newly inserted ones:
-    an asset independently re-found by bruteforce genuinely has two sources, and
-    that accumulation is the signal. Source tags are never removed automatically.
-    """
-    names = [h.strip().lower() for h in hostnames if h and h.strip()]
-    if not names:
-        return
-    tag_id = ensure_tag(session, project_id, source)
+def _resolve_asset_ids(session: Session, project_id: str, names: list[str]) -> list[str]:
+    """Asset ids for the given normalized hostnames, resolved in _ID_CHUNK batches."""
     asset_ids: list[str] = []
     for start in range(0, len(names), _ID_CHUNK):
         chunk = names[start:start + _ID_CHUNK]
@@ -321,12 +330,70 @@ def attach_source_tag(session: Session, project_id: str, hostnames: list[str], s
             f"SELECT id FROM assets WHERE project_id = :pid AND asset IN ({placeholders})"
         ), params).fetchall()
         asset_ids.extend(r[0] for r in rows)
-    for asset_id in asset_ids:
+    return asset_ids
+
+
+def attach_tag(session: Session, project_id: str, hostnames: list[str], name: str) -> None:
+    """Attach one system tag to every named asset, creating the tag if needed."""
+    names = [h.strip().lower() for h in hostnames if h and h.strip()]
+    if not names:
+        return
+    tag_id = ensure_tag(session, project_id, name)
+    asset_ids = _resolve_asset_ids(session, project_id, names)
+    for start in range(0, len(asset_ids), _ID_CHUNK):
+        chunk = asset_ids[start:start + _ID_CHUNK]
+        values_sql = ", ".join(f"(:a{i}, :t)" for i in range(len(chunk)))
+        params = {f"a{i}": asset_id for i, asset_id in enumerate(chunk)}
+        params["t"] = tag_id
         session.execute(text(
-            "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES (:a, :t)"
-        ), {"a": asset_id, "t": tag_id})
+            f"INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) VALUES {values_sql}"
+        ), params)
     sync_tags_text(session, asset_ids)
     session.commit()
+
+
+def detach_tag(session: Session, project_id: str, hostnames: list[str], name: str) -> None:
+    """Remove one tag from every named asset. No-op if the project never used it.
+
+    Deliberately does NOT go through ensure_tag: resolving the tag with a
+    read-only SELECT is what stops a detach-only call from materializing a tag
+    row in every project that has never once taken this path. A missing tag row
+    means nothing to detach, so the whole call costs a single SELECT.
+
+    The tag row itself is left in place even once no asset carries it — it is
+    cheap, and dropping it would race concurrent attaches.
+    """
+    names = [h.strip().lower() for h in hostnames if h and h.strip()]
+    if not names:
+        return
+    row = session.execute(text(
+        "SELECT id FROM tags WHERE project_id = :pid AND name = :n"
+    ), {"pid": project_id, "n": name}).fetchone()
+    if not row:
+        return
+    tag_id = row[0]
+    asset_ids = _resolve_asset_ids(session, project_id, names)
+    if not asset_ids:
+        return
+    for start in range(0, len(asset_ids), _ID_CHUNK):
+        chunk = asset_ids[start:start + _ID_CHUNK]
+        placeholders, params = _in_params(chunk)
+        params["t"] = tag_id
+        session.execute(text(
+            f"DELETE FROM asset_tags WHERE tag_id = :t AND asset_id IN ({placeholders})"
+        ), params)
+    sync_tags_text(session, asset_ids)
+    session.commit()
+
+
+def attach_source_tag(session: Session, project_id: str, hostnames: list[str], source: str) -> None:
+    """Tag every named asset with a discovery source.
+
+    Applied to hostnames that already existed as well as newly inserted ones:
+    an asset independently re-found by bruteforce genuinely has two sources, and
+    that accumulation is the signal. Source tags are never removed automatically.
+    """
+    attach_tag(session, project_id, hostnames, source)
 
 
 def set_last_crawl_at(session: Session, project_id: str, hostnames: list[str]) -> None:

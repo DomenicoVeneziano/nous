@@ -209,12 +209,45 @@ async def run_crawler(start_url: str, max_pages: int, output_file: str, delay: f
         concurrency_settings=ConcurrencySettings(max_concurrency=1) if delay > 0 else None,
     )
 
+    # HTTP status the crawler was actually served for the start URL. Persisted to
+    # the output file as a "#status <code>" marker line so a caller can tell a
+    # block (e.g. 403 from a WAF) apart from an empty page that returned 200 with
+    # no links. "final" flips once the end-of-run write owns the file.
+    start_status = {"code": None, "final": False}
+    # The first navigation and the first handled request belong to the start URL;
+    # comparing URLs alone is not enough because the crawler may normalise them.
+    seen_navigation = {"hook": False, "handler": False}
+
+    def persist_start_status() -> None:
+        """Write the marker as soon as the status is known.
+
+        The run can be cancelled or time out before the end-of-run write, so the
+        marker is checkpointed here instead of only at the end. The file is
+        (re)written with the marker alone; the end-of-run write rewrites the
+        marker followed by the discovered paths.
+        """
+        if start_status["final"] or start_status["code"] is None or not output_file:
+            return
+        try:
+            with open(output_file, 'w') as f:
+                f.write(f"#status {start_status['code']}\n")
+        except OSError:
+            pass
+
     @crawler.pre_navigation_hook
     async def setup_network_interceptor(context: PlaywrightPreNavCrawlingContext) -> None:
         current_url = context.request.url
         page_network_paths[current_url] = set()
+        is_start_navigation = not seen_navigation["hook"] or current_url == start_url
+        seen_navigation["hook"] = True
 
         async def handle_response(response):
+            if is_start_navigation and response.request.resource_type == 'document':
+                # On a redirect chain every hop is a document response; the LAST
+                # one is the status the crawler was actually served, which is
+                # what the block/throttle decision is about, so keep overwriting.
+                start_status["code"] = response.status
+                persist_start_status()
             if response.request.resource_type in ['document', 'script', 'fetch', 'xhr']:
                 try:
                     text = await response.text()
@@ -235,6 +268,19 @@ async def run_crawler(start_url: str, max_pages: int, output_file: str, delay: f
         first_request = False
 
         current_url = context.request.url
+
+        # Fallback: if no document response was observed for the start URL, take
+        # the status from the navigation response the handler was given.
+        is_start_request = not seen_navigation["handler"] or current_url == start_url
+        seen_navigation["handler"] = True
+        if start_status["code"] is None and is_start_request:
+            response = getattr(context, "response", None)
+            if response is not None:
+                try:
+                    start_status["code"] = response.status
+                    persist_start_status()
+                except Exception:
+                    pass
 
         try:
             network_paths = page_network_paths.pop(current_url, set())
@@ -268,12 +314,17 @@ async def run_crawler(start_url: str, max_pages: int, output_file: str, delay: f
 
     # --- FINAL CLEAN OUTPUT LOGIC ---
     sorted_paths = sorted(list(GLOBAL_DISCOVERED_PATHS))
+    start_status["final"] = True
+    code = start_status["code"]
+    status_line = f"#status {code if code is not None else 'none'}"
 
     if output_file:
         with open(output_file, 'w') as f:
+            f.write(f"{status_line}\n")
             for path in sorted_paths:
                 f.write(f"{path}\n")
     else:
+        print(status_line)
         for path in sorted_paths:
             print(path)
 

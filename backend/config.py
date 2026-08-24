@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     PROXY_RECON: bool = False           # route recon traffic through the proxy
     PROXY_TECH: bool = False            # route tech-analysis traffic through the proxy
     PROXY_CRAWL: bool = False           # route crawler traffic through the proxy
+    PROXY_RETRIES: bool = False         # retry blocked/throttled hosts through the proxy
 
     # Anchor the .env lookup to the project root rather than the process's
     # working directory: running `uvicorn main:app` from backend/ would

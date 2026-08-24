@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 
 # Source tags written by the engine, one per discovery path. They are created
 # with is_system=True, which makes them read-only over the API: provenance is an
-# observation, not a label the operator curates.
+# observation, not a label the operator curates. Source tags accumulate and are
+# never removed automatically.
 SOURCE_PASSIVE = "Passive"
 SOURCE_BRUTEFORCE = "Bruteforce"
 SOURCE_PERMUTATIONS = "Permutations"
@@ -17,9 +18,18 @@ SOURCE_REDIRECT = "Redirect"
 SOURCE_MANUAL = "Manual"
 SOURCE_SEED = "Seed"
 
+# Vantage-point tag, not a discovery source: it records that the STORED scan
+# result for an asset came from a proxied pass. Unlike the SOURCE_* tags it is
+# removed automatically when a later direct pass succeeds for that asset.
+SYSTEM_TAG_PROXIED = "Proxied"
+
+# Every name the API refuses to let an operator create, rename, delete, or
+# hand-attach. Membership buys exactly that; discovery-source attribution is
+# driven by the individual SOURCE_* constants, not by this tuple.
 SYSTEM_TAG_NAMES = (
     SOURCE_PASSIVE, SOURCE_BRUTEFORCE, SOURCE_PERMUTATIONS, SOURCE_CRAWLING,
     SOURCE_REDIRECT, SOURCE_MANUAL, SOURCE_SEED,
+    SYSTEM_TAG_PROXIED,
 )
 
 # "New!" is never stored. It is derived per request by comparing an asset's

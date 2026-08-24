@@ -670,11 +670,16 @@ is also `true`.
   "password_set": false,
   "recon": false,
   "tech": false,
-  "crawl": false
+  "crawl": false,
+  "retries": false
 }
 ```
 `scheme`: `http` | `https` | `socks5`. The `recon` / `tech` / `crawl` flags select
 which scan types route through the proxy (the rest connect directly).
+`retries` is independent of `recon` / `tech` / `crawl`: those three select which
+scan types route their MAIN traffic through the proxy, while `retries` controls
+whether blocked or throttled hosts are re-attempted through the proxy regardless
+of that selection.
 
 ---
 
@@ -683,7 +688,7 @@ which scan types route through the proxy (the rest connect directly).
 and applied to subsequently queued scans. Omit `password` to keep the stored one;
 send `"password": ""` to clear it.
 
-**Body** `{ "enabled", "scheme", "host", "port", "username", "password", "recon", "tech", "crawl" }`
+**Body** `{ "enabled", "scheme", "host", "port", "username", "password", "recon", "tech", "crawl", "retries" }`
 **Response** `200` proxy config (same shape as GET)
 **Errors:** `400` host required when enabling · `422` invalid scheme/port/host
 

@@ -16,6 +16,8 @@ _consumers: set[WebSocket] = set()
 # Ring buffer: replayed to new consumers so they catch up on lines sent before they connected
 _message_buffer: deque[str] = deque(maxlen=1000)
 
+_NON_BUFFERED = {"asset_update", "scan_progress"}
+
 
 def expected_engine_token() -> str:
     """The token the engine must present to connect as a producer.
@@ -93,7 +95,12 @@ async def websocket_endpoint(
                     # asset_update events are transient push-hints — replaying them
                     # on reconnect causes a burst of /assets requests (one per buffered
                     # event) because the frontend refetches the full asset list on each.
-                    if parsed.get("type") != "asset_update":
+                    # scan_progress events are transient state hints superseded by the
+                    # very next progress event; buffering them would let up to 1000
+                    # lines of real scan output get evicted from the replay deque
+                    # during a large scan, so a reconnecting client would see a wall
+                    # of stale progress instead of the log.
+                    if parsed.get("type") not in _NON_BUFFERED:
                         _message_buffer.append(message)
 
                     dead = set()

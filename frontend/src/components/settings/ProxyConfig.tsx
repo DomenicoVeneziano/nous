@@ -6,7 +6,7 @@ import { Save, Plug } from 'lucide-react';
 
 const EMPTY: ProxyConfigData = {
   enabled: false, scheme: 'http', host: '', port: 8080,
-  username: '', password_set: false, recon: false, tech: false, crawl: false,
+  username: '', password_set: false, recon: false, tech: false, crawl: false, retries: false,
 };
 
 const SCAN_TYPES: { key: 'recon' | 'tech' | 'crawl'; label: string; hint: string }[] = [
@@ -48,6 +48,7 @@ export default function ProxyConfig() {
       const payload: Parameters<typeof updateProxyConfig>[0] = {
         enabled: cfg.enabled, scheme: cfg.scheme, host: cfg.host.trim(), port: Number(cfg.port),
         username: cfg.username, recon: cfg.recon, tech: cfg.tech, crawl: cfg.crawl,
+        retries: cfg.retries,
       };
       if (password) payload.password = password;
       const saved = await updateProxyConfig(payload);
@@ -224,6 +225,21 @@ export default function ProxyConfig() {
             style={disabledInput()}
           />
         </div>
+      </div>
+
+      {/* Retry routing */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        marginTop: 20, paddingTop: 20, borderTop: '1px solid var(--border-subtle)',
+        opacity: cfg.enabled ? 1 : 0.5,
+      }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)' }}>Use proxy for retries</div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, fontFamily: 'var(--font-mono)' }}>
+            Hosts that come back blocked or throttled are re-attempted through the proxy, independently of the per-type selection below
+          </div>
+        </div>
+        <Toggle on={cfg.retries} onClick={() => { if (cfg.enabled) set('retries', !cfg.retries); }} />
       </div>
 
       {/* Per-scan-type selection */}

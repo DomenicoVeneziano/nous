@@ -23,6 +23,7 @@ PROXY_FIELDS: dict[str, type] = {
     "PROXY_RECON": bool,
     "PROXY_TECH": bool,
     "PROXY_CRAWL": bool,
+    "PROXY_RETRIES": bool,
 }
 
 ALLOWED_SCHEMES = ("http", "https", "socks5")
@@ -91,6 +92,7 @@ def get_proxy_settings() -> dict:
         "recon": cfg.PROXY_RECON,
         "tech": cfg.PROXY_TECH,
         "crawl": cfg.PROXY_CRAWL,
+        "retries": cfg.PROXY_RETRIES,
     }
 
 
@@ -119,5 +121,30 @@ def proxy_url_for_scan_type(scan_type: str) -> str | None:
         return None
     flag = _SCAN_TYPE_FLAG.get(scan_type)
     if not flag or not getattr(cfg, flag, False):
+        return None
+    return build_proxy_url(include_auth=True)
+
+
+def retry_proxy_url_for_scan_type(scan_type: str) -> str | None:
+    """Return the proxy URL to use for RETRY passes of a scan_type, or None.
+
+    Retries only apply to "tech" and "crawl"; recon always returns None.
+
+    This is deliberately NOT gated by PROXY_TECH / PROXY_CRAWL: the retries
+    toggle is independent of the per-phase "Apply Proxy To" flags. Those flags
+    decide whether MAIN traffic is proxied; PROXY_RETRIES decides whether a
+    blocked or throttled host is re-attempted through the proxy.
+
+    Truth table (with PROXY_ENABLED on), for tech/crawl:
+      phase off + retries off -> direct main,   direct retry
+      phase off + retries on  -> direct main,   PROXIED retry
+      phase on  + retries off -> PROXIED main,  direct retry
+      phase on  + retries on  -> PROXIED main,  PROXIED retry
+    """
+    if scan_type not in ("tech", "crawl"):
+        return None
+    if not cfg.PROXY_ENABLED:
+        return None
+    if not cfg.PROXY_RETRIES:
         return None
     return build_proxy_url(include_auth=True)

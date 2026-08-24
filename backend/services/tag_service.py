@@ -3,10 +3,12 @@
 
 Two kinds of tag share one table, separated by `is_system`:
 
-  * system tags  — written by the engine to record how an asset was discovered
-    (Passive, Bruteforce, Permutations, Crawling, Redirect, Manual, Seed). They
-    accumulate, are never auto-removed, and the API rejects operator edits to
-    them: provenance is an observation, not a curated label.
+  * system tags  — written by the engine, not by the operator. Most record how
+    an asset was discovered (Passive, Bruteforce, Permutations, Crawling,
+    Redirect, Manual, Seed); those accumulate and are never auto-removed, since
+    provenance is an observation, not a curated label. "Proxied" instead records
+    the vantage point of the stored result and is removed automatically when a
+    later direct pass succeeds. The API rejects operator edits to all of them.
   * user tags    — free-form triage labels under full operator CRUD.
 
 "New!" is in neither group. It is derived per request from
@@ -82,7 +84,7 @@ def _collapse(raw: str) -> str:
 
 
 def system_tag_name(raw: str) -> str | None:
-    """The canonical discovery-source name matching `raw`, or None.
+    """The canonical system tag name matching `raw`, or None.
 
     The single source of truth for "is this a system tag name". normalize_name
     rejects these as a 422, and the attach route consults it first to answer the
@@ -106,7 +108,7 @@ def normalize_name(raw: str) -> str:
     if name.casefold() == DERIVED_NEW_TAG.casefold():
         raise TagError(f"'{DERIVED_NEW_TAG}' is reserved and applied automatically")
     if system_tag_name(name):
-        raise TagError(f"'{name}' is reserved for discovery-source tags")
+        raise TagError(f"'{name}' is reserved for system tags")
     return name
 
 
@@ -289,7 +291,7 @@ def unassign_tag(db: Session, asset_id: str, tag_id: str) -> None:
 
 
 def apply_system_tag(db: Session, project_id: str, asset_id: str, name: str) -> None:
-    """Attach a discovery-source tag, creating it for the project if needed."""
+    """Attach a system tag, creating it for the project if needed."""
     tag = ensure_system_tag(db, project_id, name)
     assign_tag(db, asset_id, tag.id)
 

@@ -1,12 +1,15 @@
 import React, { useRef, useLayoutEffect, useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import { clearScanOutput } from '../../api/scans';
+import type { ScanProgress } from '../../types/scan';
 
 interface Props {
   lines: string[];
   // Absolute index of lines[0] within the full stream, for stable keys/numbers.
   lineOffset?: number;
   activeJob?: { scan_type: string; id: string } | null;
+  // Latest snapshot for the watched job, or null for single-pass scans and idle.
+  progress?: ScanProgress | null;
 }
 
 // Semantic colours for scan output
@@ -17,7 +20,7 @@ function lineColor(line: string): string {
   return 'var(--text-code)';
 }
 
-export default function ScanMonitor({ lines, lineOffset = 0, activeJob }: Props) {
+export default function ScanMonitor({ lines, lineOffset = 0, activeJob, progress }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -102,6 +105,34 @@ export default function ScanMonitor({ lines, lineOffset = 0, activeJob }: Props)
           )}
         </div>
       </div>
+      {/* One bar across the whole job, not per pass. `assets_total` grows at
+          pass boundaries as each retry candidate set becomes known, so the fill
+          can tick backwards; that is the true state and is left visible. */}
+      {progress && (
+        <div style={{
+          padding: '10px 18px', borderBottom: '1px solid var(--border-subtle)',
+          display: 'flex', flexDirection: 'column', gap: 6,
+        }}>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+            Pass {progress.pass_index}/{progress.pass_total} - {progress.pass_label}
+            {'  '}({progress.assets_done} of {progress.assets_total} assets)
+          </span>
+          <div style={{
+            height: 4, borderRadius: 2, width: '100%',
+            background: 'var(--bg-void)', border: '1px solid var(--border-subtle)',
+            overflow: 'hidden',
+          }}>
+            <div style={{
+              height: '100%',
+              width: `${progress.assets_total > 0
+                ? Math.max(0, Math.min(1, progress.assets_done / progress.assets_total)) * 100
+                : 0}%`,
+              background: 'var(--status-success)',
+              transition: 'width var(--transition-fast)',
+            }} />
+          </div>
+        </div>
+      )}
       {/* Fills the card: the /data grid row has a bounded height, so this pane
           takes whatever the card leaves after the header. Long output scrolls
           inside the pane rather than growing the page. */}
