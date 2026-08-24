@@ -32,6 +32,9 @@ async def run_recon_job(job: dict, ws_broadcast=None):
     project_id = job["project_id"]
     project_dir = DATA_DIR / "projects" / project_id
     log_dir = project_dir / "logs"
+    # Bound before the try so the finally block can always test it — the
+    # "no root domains" guard returns before the temp file is ever created.
+    known_subs_path = None
 
     try:
         # Mark running
@@ -51,7 +54,6 @@ async def run_recon_job(job: dict, ws_broadcast=None):
                 await ws_broadcast("job_failed", {"job_id": job_id, "error": "No root domains"})
             return
 
-        known_subs_path = None
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", prefix="nous_known_", delete=False
         ) as tmp:
