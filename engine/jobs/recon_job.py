@@ -64,6 +64,7 @@ async def run_recon_job(job: dict, ws_broadcast=None):
         wordlist_path = cfg.get("wordlist_path", WORDLIST_PATH)
         resolvers_path = cfg.get("resolvers_path", RESOLVERS_PATH)
         dns_bruteforce_enabled = cfg.get("dns_bruteforce_enabled", False)
+        wordlist_expansion_enabled = cfg.get("dns_wordlist_expansion_enabled", False)
         # Proxy env for HTTP-based recon tools (subfinder, gau, waymore, crt).
         # DNS tooling (puredns) is unaffected — DNS does not traverse an HTTP proxy.
         recon_env = proxy_env(cfg.get("proxy_url"))
@@ -161,6 +162,8 @@ async def run_recon_job(job: dict, ws_broadcast=None):
                                "-r", resolvers_path, "-s", known_subs_path]
                 if not dns_bruteforce_enabled:
                     script_args.append("-n")
+                elif wordlist_expansion_enabled:
+                    script_args.append("-x")
                 result = await run_script(
                     script_path=str(SCRIPTS_DIR / "recon.sh"),
                     args=script_args,

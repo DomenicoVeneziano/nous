@@ -23,6 +23,7 @@ export default function ScanConfig() {
 
   const bruteforceEnabled = config['dns_bruteforce_enabled'] !== 'false';
   const screenshotsEnabled = config['tech_screenshots_enabled'] === 'true';
+  const expansionEnabled = config['dns_wordlist_expansion_enabled'] === 'true';
 
   const handleChange = (key: string, value: string) => {
     setConfig((prev) => ({ ...prev, [key]: value }));
@@ -42,6 +43,7 @@ export default function ScanConfig() {
         }
       }
       payload.dns_bruteforce_enabled = bruteforceEnabled;
+      payload.dns_wordlist_expansion_enabled = expansionEnabled;
       payload.tech_screenshots_enabled = screenshotsEnabled;
       await updateScanConfig(payload);
       setDirty(false);
@@ -158,6 +160,42 @@ export default function ScanConfig() {
             left: bruteforceEnabled ? 20 : 2,
             width: 16, height: 16, borderRadius: '50%',
             background: bruteforceEnabled ? 'var(--bg-base)' : '#fff',
+            transition: 'left var(--transition-fast), background var(--transition-fast)',
+          }} />
+        </div>
+      </div>
+      <div style={{
+        marginTop: 18, paddingTop: 18, borderTop: '1px solid var(--border-subtle)',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        opacity: bruteforceEnabled ? 1 : 0.5,
+      }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)' }}>Dynamic Wordlist Expansion</div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, fontFamily: 'var(--font-mono)' }}>
+            Split subdomains found by passive recon into word tokens and add them to the
+            bruteforce wordlist &middot; requires DNS bruteforce
+          </div>
+        </div>
+        <div
+          onClick={() => {
+            if (isAdmin && bruteforceEnabled) {
+              handleChange('dns_wordlist_expansion_enabled', expansionEnabled ? 'false' : 'true');
+            }
+          }}
+          style={{
+            width: 40, height: 22, borderRadius: 11, flexShrink: 0,
+            background: expansionEnabled ? 'var(--accent-primary)' : 'var(--bg-elevated)',
+            border: '1px solid var(--border-default)',
+            position: 'relative', cursor: isAdmin && bruteforceEnabled ? 'pointer' : 'default',
+            opacity: isAdmin ? 1 : 0.7,
+            transition: 'background var(--transition-fast)',
+          }}
+        >
+          <div style={{
+            position: 'absolute', top: 2,
+            left: expansionEnabled ? 20 : 2,
+            width: 16, height: 16, borderRadius: '50%',
+            background: expansionEnabled ? 'var(--bg-base)' : '#fff',
             transition: 'left var(--transition-fast), background var(--transition-fast)',
           }} />
         </div>

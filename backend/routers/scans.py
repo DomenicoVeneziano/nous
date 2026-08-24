@@ -38,6 +38,7 @@ def enqueue_scan(data: ScanCreate, db: Session = Depends(get_db), _: dict = Depe
     if data.scan_type == "recon":
         job_config = {
             "dns_bruteforce_enabled": settings.DNS_BRUTEFORCE_ENABLED,
+            "dns_wordlist_expansion_enabled": settings.DNS_WORDLIST_EXPANSION_ENABLED,
             "recon_timeout": settings.RECON_TIMEOUT,
             "wordlist_path": str(settings.WORDLIST_PATH),
             "resolvers_path": str(settings.RESOLVERS_PATH),

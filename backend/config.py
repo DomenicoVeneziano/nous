@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     CRAWL_TIMEOUT: int = 1200
     CRAWL_MAX_PAGES: int = 50
     DNS_BRUTEFORCE_ENABLED: bool = False
+    # Append word tokens parsed from subdomains found in the non-bruteforce
+    # recon phase to the DNS bruteforce wordlist. Opt-in: it enlarges the
+    # wordlist and therefore the bruteforce phase.
+    DNS_WORDLIST_EXPANSION_ENABLED: bool = False
     TECH_RATE_LIMIT_DELAY: float = 0
     DNS_RATE_LIMIT_DELAY: float = 0
     CRAWL_RATE_LIMIT_DELAY: float = 0

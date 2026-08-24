@@ -40,6 +40,7 @@ class ScanConfigUpdate(BaseModel):
     wordlist_path: str | None = None
     resolvers_path: str | None = None
     dns_bruteforce_enabled: bool | None = None
+    dns_wordlist_expansion_enabled: bool | None = None
     tech_screenshots_enabled: bool | None = None
     tech_rate_limit_delay: float | None = None
     dns_rate_limit_delay: float | None = None
@@ -105,6 +106,7 @@ def get_scan_config(_: dict = Depends(require_viewer)):
         "wordlist_path": str(settings.WORDLIST_PATH),
         "resolvers_path": str(settings.RESOLVERS_PATH),
         "dns_bruteforce_enabled": settings.DNS_BRUTEFORCE_ENABLED,
+        "dns_wordlist_expansion_enabled": settings.DNS_WORDLIST_EXPANSION_ENABLED,
         "tech_screenshots_enabled": settings.TECH_SCREENSHOTS_ENABLED,
         "tech_rate_limit_delay": settings.TECH_RATE_LIMIT_DELAY,
         "dns_rate_limit_delay": settings.DNS_RATE_LIMIT_DELAY,
@@ -138,6 +140,9 @@ def update_scan_config(data: ScanConfigUpdate, _: dict = Depends(require_admin))
     if data.dns_bruteforce_enabled is not None:
         cfg.DNS_BRUTEFORCE_ENABLED = data.dns_bruteforce_enabled
         updated["dns_bruteforce_enabled"] = data.dns_bruteforce_enabled
+    if data.dns_wordlist_expansion_enabled is not None:
+        cfg.DNS_WORDLIST_EXPANSION_ENABLED = data.dns_wordlist_expansion_enabled
+        updated["dns_wordlist_expansion_enabled"] = data.dns_wordlist_expansion_enabled
     if data.tech_screenshots_enabled is not None:
         cfg.TECH_SCREENSHOTS_ENABLED = data.tech_screenshots_enabled
         updated["tech_screenshots_enabled"] = data.tech_screenshots_enabled

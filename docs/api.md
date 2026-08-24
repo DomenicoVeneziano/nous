@@ -632,6 +632,7 @@ carry the same columns: `asset`, `status_code`, `title`, `content_length`,
   "wordlist_path": "<str>",
   "resolvers_path": "<str>",
   "dns_bruteforce_enabled": false,
+  "dns_wordlist_expansion_enabled": false,
   "tech_screenshots_enabled": false,
   "tech_rate_limit_delay": 3.0,
   "dns_rate_limit_delay": 0.0,
@@ -646,6 +647,10 @@ carry the same columns: `asset`, `status_code`, `title`, `content_length`,
 
 **Body** same shape as above, all optional. When `tech_screenshots_enabled` is
 `true`, a tech-analysis scan captures a screenshot of each asset after page load.
+When `dns_wordlist_expansion_enabled` is `true`, recon splits the subdomains found
+by its non-bruteforce phase into word tokens and appends the novel ones to the DNS
+bruteforce wordlist for that run; it has no effect unless `dns_bruteforce_enabled`
+is also `true`.
 **Response** `200` `{ "updated": { <changed_fields> } }`
 
 ---

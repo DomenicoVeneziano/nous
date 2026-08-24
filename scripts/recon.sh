@@ -22,7 +22,7 @@ wildcard_batch=20
 # ------------------------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: $0 -d <domain> -o <output_file> [-s <known_subs>] [-w <wordlist>] [-r <resolvers>] [-n]
+Usage: $0 -d <domain> -o <output_file> [-s <known_subs>] [-w <wordlist>] [-r <resolvers>] [-n] [-x]
 
   -d  Target domain (required)
   -o  Output file for final results (required)
@@ -30,6 +30,7 @@ Usage: $0 -d <domain> -o <output_file> [-s <known_subs>] [-w <wordlist>] [-r <re
   -w  Wordlist for DNS bruteforce (default: $wordlist)
   -r  Resolvers file (default: $resolvers)
   -n  Skip DNS bruteforce and permutation steps
+  -x  Expand the bruteforce wordlist with tokens from discovered subdomains
   -h  Show this help
 EOF
     exit 1
@@ -48,7 +49,7 @@ check_dependencies() {
 # ------------------------------------------------------------------------------
 # Parse arguments
 # ------------------------------------------------------------------------------
-while getopts "d:o:s:w:r:nh" opt; do
+while getopts "d:o:s:w:r:nxh" opt; do
     case $opt in
         d) domain="$OPTARG" ;;
         o) output_file="$OPTARG" ;;
@@ -56,6 +57,7 @@ while getopts "d:o:s:w:r:nh" opt; do
         w) wordlist="$OPTARG" ;;
         r) resolvers="$OPTARG" ;;
         n) skip_bruteforce=1 ;;
+        x) expand_wordlist=1 ;;
         h) usage ;;
         ?) usage ;;
     esac
@@ -242,6 +244,9 @@ echo ""
 # entries to the bruteforce wordlist. This makes the subsequent bruteforce
 # phase aware of naming patterns specific to the target.
 #
+# Opt-in via -x: expansion grows the wordlist with target-specific tokens, which
+# lengthens the bruteforce phase, so it stays off unless the operator asks.
+#
 # Logic:
 #   sub.test.api.example.com  →  tokens: sub, test, api
 #   (root domain "example" and TLD "com" are excluded)
@@ -253,14 +258,18 @@ echo "[+] ================================================================"
 if [[ -n "${skip_bruteforce:-}" ]]; then
     echo "[*] DNS bruteforce disabled. Skipping wordlist expansion."
 else
+    # Work from a per-run copy so the original wordlist file is never modified.
+    # This copy is what Step 4 filters and Step 5 bruteforces, so it is made
+    # whether or not expansion runs.
+    cp "$wordlist" "$expanded_wordlist"
+
     # Determine how many labels the root domain has (e.g., example.com → 2, example.co.uk → 3).
     # We strip that many trailing labels from every subdomain before tokenising.
     root_label_count=$(echo "$domain" | awk -F. '{print NF}')
 
-    # Work from a per-run copy so the original wordlist file is never modified.
-    cp "$wordlist" "$expanded_wordlist"
-
-    if [[ -s "$active_subs" ]]; then
+    if [[ -z "${expand_wordlist:-}" ]]; then
+        echo "[*] Dynamic wordlist expansion disabled. Using the wordlist as supplied."
+    elif [[ -s "$active_subs" ]]; then
         # For each subdomain, remove the trailing root_label_count labels, then
         # split the remaining labels into one word per line.
         awk -F. -v n="$root_label_count" '{
