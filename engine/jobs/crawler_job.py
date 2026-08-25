@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 from runner import run_script
@@ -10,8 +11,10 @@ from parsers.crawler_parser import parse_crawler_output
 from queue_manager import (
     get_session, transition_status, get_asset_hostnames,
     get_all_project_asset_details, insert_assets_bulk, merge_crawled_urls_bulk,
-    refresh_project_counts, set_last_crawl_at, SOURCE_CRAWLING,
+    refresh_project_counts, set_last_crawl_at, SOURCE_CRAWLING, SOURCE_REDIRECT,
     attach_tag, detach_tag, job_is_cancelled, SYSTEM_TAG_PROXIED,
+    get_project_domains, is_in_scope, insert_asset_if_absent, attach_source_tag,
+    enqueue_scan,
 )
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -36,6 +39,12 @@ RETRY_STATUSES = frozenset({403, 429, 503, 520, 521, 522, 523, 524})
 # near-zero recovery rate.
 PASS_LABELS = ("direct crawl", "proxy retry")
 
+# Re-validated at the DB boundary before a redirect destination is inserted.
+# The parser already enforces this shape, but the value crosses a process
+# boundary (an attacker-controlled Location header, via a file on disk) before
+# it reaches a write, so it is checked once more where it is used.
+HOSTNAME_RE = re.compile(r"^[a-zA-Z0-9._\-]+$")
+
 
 def _is_retry_candidate(parsed: dict | None) -> bool:
     """True when a host's direct crawl should be re-attempted through the proxy.
@@ -56,7 +65,27 @@ def _is_retry_candidate(parsed: dict | None) -> bool:
     `#status 200`, which correctly reads as "we were not blocked, we just ran
     long" — pushing that through a metered proxy is wasted traffic. A timeout
     whose marker shows 403 or 429 is still a candidate, because the status says so.
+
+    A cross-host redirect short-circuits all of that. Where the response body
+    lands is a property of the target's configuration, not of our exit IP, so a
+    proxied re-run is served the same `Location` — wasted traffic on a metered
+    proxy, and exactly the argument RETRY_STATUSES already makes for excluding
+    redirects. The check has to come first: when the destination itself fails to
+    load, the crawler never observes a final response and the marker stays
+    None, which the rule below would otherwise read as retry-worthy.
+
+    The key read here is `redirected`, not `redirect_to`. `redirected` is true
+    whenever the start navigation ended on a DIFFERENT host, including the case
+    where that host could not be safely represented as a hostname;
+    `redirect_to` is populated only when it could. Retry-worthiness is a
+    property of the redirect happening at all — a destination we cannot name is
+    still a destination our exit IP will not change — so keying this off
+    `redirect_to` would push exactly those hosts through the metered proxy for
+    an identical `Location`. `.get` carries a default so output parsed by an
+    older parser shape simply reads as "not redirected".
     """
+    if parsed is not None and parsed.get("redirected", False):
+        return False
     if parsed is None:
         return True
     status = parsed.get("status")
@@ -135,6 +164,15 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
 
         new_count = 0
         total_duration = 0.0
+        # Cross-host redirect destinations observed by either pass, followed up
+        # once at the end of the job. A set: several assets in one project
+        # commonly redirect to the same canonical host.
+        redirect_targets: set[str] = set()
+
+        # Hosts this job is already crawling on their own asset rows. A
+        # redirect that points at one of them needs no follow-up: it is being
+        # visited anyway, and it already exists as an asset.
+        crawled_hosts = {h.lower() for h in hostnames}
 
         total = len(hostnames)
         pass_total = 2 if retry_proxy_url else 1
@@ -174,13 +212,34 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
             created is the count of new assets from discovered subdomains and
             parsed is the parsed crawl output (None if no output file exists).
 
-            Tolerates output with or without a `#status` marker: nothing here
-            reads parsed["status"], so a file written by an older crawler still
-            persists exactly as before."""
+            The writes are suppressed on `redirected` — the start navigation
+            ended on a different host — and NOT on `redirect_to`, which names
+            that host only when it is a valid hostname. Whether we can name the
+            destination has no bearing on whose endpoints the crawler collected:
+            an unrepresentable destination still means the collected data is not
+            this asset's, so it must be suppressed just the same.
+
+            Tolerates output with or without a `#status` or `#redirect`
+            marker: nothing here reads parsed["status"], and an absent
+            `redirected` key simply takes the ordinary merge path, so a file
+            written by an older crawler still persists exactly as before."""
             if not output_file.is_file():
                 return 0, None
             content = output_file.read_text(encoding="utf-8", errors="replace")
             parsed = parse_crawler_output(content)
+            if parsed.get("redirected", False):
+                # The host answered by sending us somewhere else entirely.
+                # Whatever the crawler managed to collect describes the
+                # DESTINATION, so merging it would file another host's
+                # endpoints and subdomains under this asset. Skip both writes.
+                #
+                # The crawl timestamp is still stamped: this host was crawled
+                # and returned a definitive answer. Leaving last_crawl_at unset
+                # would make any least-recently-crawled selection pick it again
+                # on every subsequent run, forever.
+                set_last_crawl_at(session, project_id, [hostname])
+                refresh_project_counts(session, project_id)
+                return 0, parsed
             merge_crawled_urls_bulk(session, project_id, {hostname: parsed["endpoints"]}, source="crawling")
             set_last_crawl_at(session, project_id, [hostname])
             # Hosts the crawler turned up are attributed to Crawling; the host
@@ -259,6 +318,37 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
             if parsed is None:
                 await line_broadcast(f"[!] {hostname}: no output produced")
                 return None
+
+            # Collected here, in the one function BOTH passes call, rather than
+            # in the pass-1 loop. Pass 2 can genuinely contribute targets a
+            # direct crawl never saw: a host that answered 403 from the
+            # datacenter IP may be served a geo- or ASN-conditional cross-host
+            # redirect through the retry proxy.
+            #
+            # The follow-up set keys off `redirect_to`, not `redirected`: a
+            # destination the parser could not represent as a hostname cannot be
+            # scoped, inserted or crawled, so there is nothing to follow. It is
+            # still reported — distinctly, so the operator can tell "we skipped
+            # this host and know where it went" from "we skipped it and do not"
+            # — and it was already suppressed and excluded from the retry set by
+            # `redirected` alone.
+            if parsed.get("redirected", False):
+                dest = (parsed.get("redirect_to") or "").strip().lower()
+                if dest:
+                    redirect_targets.add(dest)
+                    await line_broadcast(
+                        f"[!] {hostname}: redirects to {dest} — crawl skipped, no endpoints stored"
+                    )
+                else:
+                    await line_broadcast(
+                        f"[!] {hostname}: redirects to another host — crawl skipped, "
+                        f"no endpoints stored"
+                    )
+                # No `[+] N endpoint(s)` summary and no asset_update broadcast:
+                # persist_host stored nothing for this asset, so nothing about
+                # it changed and a counts update would only report zeros over
+                # whatever an earlier pass legitimately left on record.
+                return parsed
 
             await line_broadcast(
                 f"[+] {hostname}: {len(parsed['endpoints'])} endpoint(s), "
@@ -346,6 +436,19 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
 
                 if proxied_stored:
                     attach_tag(session, project_id, proxied_stored, SYSTEM_TAG_PROXIED)
+
+            # Re-sampled AFTER pass 2, because the flag is the only cancel
+            # signal that reaches a running job: the worker writes it to the DB
+            # and does not deliver `asyncio.CancelledError`, so a cancel that
+            # lands while pass 2 is mid-host would otherwise never be observed —
+            # the sample above having been taken before that pass began. OR-ed
+            # in rather than assigned: a cancel seen earlier must never be
+            # un-seen by a later read. Without this the follow-up block below
+            # would run for a cancelled job, stamping first_seen_scan_id with it
+            # and queueing a fresh crawl worth up to CRAWL_MAX_PAGES navigations
+            # per host, and `transition_status(..., "done")` would then write
+            # over the status the canceller already recorded.
+            cancelled = cancelled or job_is_cancelled(session, job_id)
         except asyncio.CancelledError:
             # Manual cancellation — flush whatever the interrupted host produced
             # before propagating the cancel. The crawler checkpoints its
@@ -361,10 +464,118 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
 
         if cancelled:
             # The job already left "running" — leave its cancelled status and
-            # timestamps exactly as the canceller wrote them. Everything pass 1
-            # committed is already durable, host by host.
-            await line_broadcast("[*] Cancelled — stopping after the direct crawl pass")
+            # timestamps exactly as the canceller wrote them. Everything the
+            # passes committed is already durable, host by host.
+            #
+            # The message is deliberately vague about WHICH pass we stopped
+            # after, because this one return covers both samples: a cancel seen
+            # before pass 2 (which never ran) and one seen after it (which ran
+            # to completion). Naming the direct pass would be a false report in
+            # the second case.
+            await line_broadcast(
+                "[*] Cancelled — stopping before the redirect follow-up; "
+                "crawled hosts are saved"
+            )
             return
+
+        # ── Follow in-scope cross-host redirects ────────────────────
+        # Deliberately placed AFTER every cancel path, all THREE of which end
+        # the job before this point: the flag sampled before pass 2, the same
+        # flag re-sampled after pass 2 (both reaching the `cancelled` return
+        # above), and the `except asyncio.CancelledError` handler that re-raises
+        # once it has flushed. None of them can fall through to here, so no
+        # extra flag is needed. On cancel the WHOLE block is skipped — not just the
+        # queueing, but the insert too. An asset whose first_seen_scan_id points
+        # at a cancelled job would drive a "New!" badge for work that was
+        # abandoned. Nothing is lost: the `#redirect` marker is durable in the
+        # crawl output file, so the next crawl re-derives the same targets.
+        #
+        # This diverges from tech_job, which runs its follow-up BEFORE its
+        # cancelled return. There, following a redirect costs a single
+        # navigation. Here it costs up to CRAWL_MAX_PAGES navigations under a
+        # 1200s-per-host timeout — starting that after the user pressed cancel
+        # is the opposite of what they asked for.
+        if redirect_targets:
+            await line_broadcast(f"[*] Following {len(redirect_targets)} redirect target(s)")
+            # Fetched once, outside the loop: scope is a property of the
+            # project, not of the individual destination.
+            root_domains = get_project_domains(session, project_id)
+            new_asset_ids: list[str] = []
+            # Accumulated alongside the ids so the source tag is one bulk call
+            # after the loop instead of one call-plus-commit per destination,
+            # matching the "one bulk tag call per pass, never per host" rule
+            # pass 1 states above. Both lists are bounded by the host count, not
+            # the asset count, so this is a consistency fix and not a scale one.
+            inserted_hosts: list[str] = []
+
+            for dest in sorted(redirect_targets):
+                # 1. Already an asset of this job — being crawled on its own
+                #    row. Pure in-memory, no query.
+                if dest in crawled_hosts:
+                    await line_broadcast(
+                        f"[*] Redirect target already tracked, not re-queued: {dest}"
+                    )
+                    continue
+                # 2. Out of the project's declared scope: never added.
+                if not is_in_scope(dest, root_domains):
+                    await line_broadcast(f"[!] Redirect target out of scope, not added: {dest}")
+                    continue
+                # 3. Defence in depth at the DB boundary.
+                if not HOSTNAME_RE.match(dest):
+                    continue
+                # 4. `source` is deliberately NOT passed here. insert_asset_if_absent
+                #    runs `if source: attach_source_tag(...)` BEFORE it inspects
+                #    rowcount, so handing it a source would tag a host that already
+                #    existed — breaking the rule that an already-tracked
+                #    destination gets no change at all. The tag is attached below,
+                #    only on a genuine insert. Do not "simplify" this back.
+                #
+                #    This is also why there is no pre-read of the project's
+                #    hostnames: the INSERT OR IGNORE behind the uq_assets_project_asset
+                #    unique index is an atomic, indexed existence oracle, where a
+                #    full-table read would be both unbounded and racy.
+                new_id = insert_asset_if_absent(
+                    session, project_id, dest,
+                    source=None, scan_job_id=job_id,
+                )
+                if new_id is None:
+                    await line_broadcast(
+                        f"[*] Redirect target already tracked, not re-queued: {dest}"
+                    )
+                    continue
+                # Counted as a new asset: this job created the row, and
+                # `new_assets` on job_complete must agree with both the asset
+                # table and the "New!" badge derived from first_seen_scan_id.
+                new_count += 1
+                new_asset_ids.append(new_id)
+                inserted_hosts.append(dest)
+                await line_broadcast(f"[+] In-scope redirect target added: {dest}")
+
+            # Both guarded on an actual insert. Every destination can be skipped
+            # — already tracked, out of scope, or an unusable hostname — and in
+            # that case nothing was written, so there is no source tag to attach
+            # and no count that changed to refresh.
+            if inserted_hosts:
+                attach_source_tag(session, project_id, inserted_hosts, SOURCE_REDIRECT)
+                refresh_project_counts(session, project_id)
+
+            # Exactly ONE batched job for every new host, never one per host —
+            # a second divergence from tech_job, and for the same reason as the
+            # placement above: each crawl is up to CRAWL_MAX_PAGES navigations
+            # under a 1200s-per-host timeout, so per-target jobs would flood the
+            # queue with long-running work. `cfg` is inherited verbatim,
+            # retry_proxy_url included: it describes the project's proxy
+            # configuration, not this particular run.
+            #
+            # Termination is guarded by host identity, not recursion depth.
+            # Every hop must create a NEW asset to queue anything — `new_id is
+            # None` stops it — and a project's asset set is finite and only
+            # grows, so redirect chains terminate and A -> B -> A cannot loop.
+            if new_asset_ids:
+                enqueue_scan(session, project_id, "crawl", new_asset_ids, cfg)
+                await line_broadcast(
+                    f"[*] Queued 1 crawl job for {len(new_asset_ids)} new redirect target(s)"
+                )
 
         transition_status(session, job_id, "running", "done",
                           duration_s=total_duration,

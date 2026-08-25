@@ -15,24 +15,10 @@ from queue_manager import (
     get_session, transition_status, get_asset_details,
     get_all_project_asset_details, update_asset_record, refresh_project_counts,
     get_project_domains, get_project_asset_hostnames,
-    insert_asset_if_absent, enqueue_tech_scan, SOURCE_REDIRECT, utc_now_str,
+    insert_asset_if_absent, enqueue_scan, is_in_scope, SOURCE_REDIRECT, utc_now_str,
     attach_tag, detach_tag, job_is_cancelled, SYSTEM_TAG_PROXIED,
 )
 
-
-def _in_scope(host: str, root_domains: list[str]) -> bool:
-    """True if host equals or is a subdomain of any project root domain.
-    Root domains may carry a leading '*.' wildcard (e.g. '*.sisal.com'), which
-    is normalised to the apex before matching."""
-    host = (host or "").lower().strip(".")
-    for d in root_domains:
-        d = (d or "").lower().strip()
-        if d.startswith("*."):
-            d = d[2:]
-        d = d.strip(".")
-        if d and (host == d or host.endswith("." + d)):
-            return True
-    return False
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 SCRIPTS_DIR = Path(os.environ.get("SCRIPTS_DIR", "./scripts"))
@@ -725,7 +711,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
             existing = set(get_project_asset_hostnames(session, project_id))
             for dest in sorted(redirect_targets):
                 dest = (dest or "").strip().lower()
-                if not dest or dest in existing or not _in_scope(dest, root_domains):
+                if not dest or dest in existing or not is_in_scope(dest, root_domains):
                     continue
                 new_id = insert_asset_if_absent(
                     session, project_id, dest,
@@ -733,7 +719,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
                 )
                 if new_id:
                     existing.add(dest)
-                    enqueue_tech_scan(session, project_id, new_id, cfg)
+                    enqueue_scan(session, project_id, "tech", [new_id], cfg)
                     if ws_broadcast:
                         await line_broadcast(
                             f"[+] In-scope redirect target added and queued for tech scan: {dest}"

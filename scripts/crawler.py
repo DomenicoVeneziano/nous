@@ -40,6 +40,41 @@ STATIC_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Host a "#redirect" marker is allowed to name. Mirrors the project's domain
+# validator; a host that fails it cannot be named in the marker, and the run
+# falls back to the argument-less "#redirect-unknown" marker instead.
+_HOST_RE = re.compile(r'^[a-zA-Z0-9._\-]+$')
+
+
+def _norm_host(url: str | None) -> str | None:
+    """Normalise a URL's host so two URLs can be compared for "same host".
+
+    urlparse().hostname is already lowercased and port-free, so scheme and port
+    differences are ignored by construction. The single trailing root dot is
+    stripped ("example.com." == "example.com") and the result is IDNA-encoded so
+    a unicode host and its punycode form compare equal — both sides of every
+    comparison go through this one helper. Returns None when the URL has no host
+    at all (about:blank, data:, ...), which callers treat as "unknown", never as
+    "different".
+    """
+    if not url:
+        return None
+    try:
+        host = urlparse(url).hostname
+    except ValueError:
+        return None
+    if not host:
+        return None
+    if host.endswith("."):
+        host = host[:-1]
+    if not host:
+        return None
+    try:
+        return host.encode("idna").decode("ascii").lower()
+    except Exception:
+        return host.lower()
+
+
 class CamoufoxPlugin(PlaywrightBrowserPlugin):
     """Example browser plugin that uses Camoufox browser,
     but otherwise keeps the functionality of PlaywrightBrowserPlugin.
@@ -218,21 +253,94 @@ async def run_crawler(start_url: str, max_pages: int, output_file: str, delay: f
     # comparing URLs alone is not enough because the crawler may normalise them.
     seen_navigation = {"hook": False, "handler": False}
 
-    def persist_start_status() -> None:
-        """Write the marker as soon as the status is known.
+    # Host the crawl is scoped to. None (a start URL with no host) disables the
+    # redirect logic entirely, degrading to the previous behaviour rather than
+    # suppressing everything.
+    start_host = _norm_host(start_url)
+    # Redirect bookkeeping for the start navigation, deliberately split in two
+    # because the two decisions it drives have different requirements and MUST
+    # NOT be merged back into a single value:
+    #   * "redirected" — the start URL ended up on a host other than start_host.
+    #     True regardless of whether that host can be named, because it is what
+    #     suppresses the run's paths: a redirected start URL harvests the OTHER
+    #     host's paths, so they may never be attributed to this one.
+    #   * "redirect_to" — the destination host, set ONLY when _HOST_RE accepts
+    #     it, because it is what a caller follows up on and an unvalidated,
+    #     response-header-controlled value may not be handed onward.
+    # Deriving both from one value is exactly the bug this split fixes: an
+    # attacker-controlled Location naming an IPv6 literal (or any host outside
+    # the charset) suppressed every path while writing no marker at all, leaving
+    # the host recorded as "crawled, 0 endpoints" with nothing to retry or
+    # follow. Persisted as "#redirect <host>" / "#redirect-unknown" marker lines
+    # so a caller can tell "this host redirects elsewhere" apart from "this host
+    # has nothing to crawl".
+    redirect_state = {"redirected": False, "redirect_to": None}
+
+    def _marker_lines(final: bool = False) -> list[str]:
+        lines = []
+        code = start_status["code"]
+        if code is not None:
+            lines.append(f"#status {code}")
+        elif final:
+            # The end-of-run write has always emitted an explicit "#status none"
+            # so a complete file is never ambiguous; checkpoint writes omit the
+            # line instead, because the status may still arrive.
+            lines.append("#status none")
+        if redirect_state["redirect_to"]:
+            lines.append(f"#redirect {redirect_state['redirect_to']}")
+        elif redirect_state["redirected"]:
+            # Redirected, but the destination is not representable as a host
+            # name. The marker carries no argument on purpose: any placeholder
+            # word would collide with a real host that could be named the same.
+            lines.append("#redirect-unknown")
+        return lines
+
+    def persist_markers() -> None:
+        """Write the marker block as soon as any of it is known.
 
         The run can be cancelled or time out before the end-of-run write, so the
-        marker is checkpointed here instead of only at the end. The file is
-        (re)written with the marker alone; the end-of-run write rewrites the
-        marker followed by the discovered paths.
+        markers are checkpointed here instead of only at the end. The file is
+        (re)written with the markers alone; the end-of-run write rewrites them
+        followed by the discovered paths.
         """
-        if start_status["final"] or start_status["code"] is None or not output_file:
+        if start_status["final"] or not output_file:
+            return
+        lines = _marker_lines()
+        if not lines:
+            # Nothing is known yet, so there is nothing to checkpoint. Returning
+            # before open() matters: opening for write would truncate whatever
+            # was already checkpointed to zero bytes, and a run killed at that
+            # moment leaves a file that reads back as "no status" and triggers a
+            # full re-crawl the previous content would have suppressed.
             return
         try:
             with open(output_file, 'w') as f:
-                f.write(f"#status {start_status['code']}\n")
+                for line in lines:
+                    f.write(f"{line}\n")
         except OSError:
             pass
+
+    def record_redirect(host: str | None) -> None:
+        """Record the host the start navigation currently sits on.
+
+        Every hop OVERWRITES the destination instead of latching the first
+        offsite one: a chain that leaves the start host and comes back
+        (a -> b -> a) has to end up as "not a redirect", so only the last hop
+        counts. A host equal to the start host clears BOTH pieces of state
+        again.
+
+        A host that _HOST_RE rejects still counts as redirected; it just cannot
+        be named, so redirect_to stays None while redirected goes True.
+        """
+        if start_host is None:
+            return
+        offsite = host is not None and host != start_host
+        dest = host if (offsite and _HOST_RE.match(host)) else None
+        if offsite == redirect_state["redirected"] and dest == redirect_state["redirect_to"]:
+            return
+        redirect_state["redirected"] = offsite
+        redirect_state["redirect_to"] = dest
+        persist_markers()
 
     @crawler.pre_navigation_hook
     async def setup_network_interceptor(context: PlaywrightPreNavCrawlingContext) -> None:
@@ -247,7 +355,35 @@ async def run_crawler(start_url: str, max_pages: int, output_file: str, delay: f
                 # one is the status the crawler was actually served, which is
                 # what the block/throttle decision is about, so keep overwriting.
                 start_status["code"] = response.status
-                persist_start_status()
+                persist_markers()
+            if is_start_navigation and start_host is not None:
+                # Fallback source for the redirect destination, so a redirect
+                # whose destination fails to load is still recorded even though
+                # page.url never commits to it.
+                #
+                # Gated on is_start_navigation, exactly like the status capture
+                # above: the marker means "the START URL landed on a different
+                # host". A page reached mid-crawl that redirects offsite is
+                # suppressed by the handler without ever being recorded here.
+                #
+                # A resource_type == 'document' test alone is NOT enough here: a
+                # third-party <iframe> also produces document responses, and its
+                # host would then be reported as a redirect for any page that
+                # embeds one. Only the main frame's own navigations may decide.
+                try:
+                    request = response.request
+                    if (request.is_navigation_request()
+                            and response.frame is context.page.main_frame):
+                        location = response.headers.get("location")
+                        if 300 <= response.status < 400 and location:
+                            hop_host = _norm_host(urljoin(response.url, location))
+                        else:
+                            hop_host = _norm_host(response.url)
+                        record_redirect(hop_host)
+                except Exception:
+                    # Never let the redirect bookkeeping break status capture or
+                    # path extraction below.
+                    pass
             if response.request.resource_type in ['document', 'script', 'fetch', 'xhr']:
                 try:
                     text = await response.text()
@@ -278,9 +414,33 @@ async def run_crawler(start_url: str, max_pages: int, output_file: str, delay: f
             if response is not None:
                 try:
                     start_status["code"] = response.status
-                    persist_start_status()
+                    persist_markers()
                 except Exception:
                     pass
+
+        # Offsite check, deliberately placed AFTER the status capture above so
+        # "#status" keeps reporting what the start URL was actually served (the
+        # final code of the redirect chain); only the harvesting below is
+        # skipped. page.url is the committed main-frame URL after the whole
+        # chain, so this also catches JS and meta-refresh redirects. It applies
+        # to every page, not just the start URL, keeping the crawl scoped to the
+        # start host for the entire run.
+        if start_host is not None:
+            page_host = _norm_host(context.page.url)
+            request_host = _norm_host(current_url)
+            # ONLY the start navigation may set the "#redirect" marker: it means
+            # "the START URL landed on a different host", and record_redirect
+            # overwrites shared state that decides whether the run's paths are
+            # written at all. A page reached mid-crawl that redirects offsite is
+            # suppressed below without being recorded — never make this
+            # unconditional, or one such page late in the queue discards the
+            # entire legitimate crawl.
+            if is_start_request and page_host is not None:
+                record_redirect(page_host)
+            if ((page_host is not None and page_host != start_host)
+                    or (request_host is not None and request_host != start_host)):
+                page_network_paths.pop(current_url, None)
+                return
 
         try:
             network_paths = page_network_paths.pop(current_url, set())
@@ -300,7 +460,10 @@ async def run_crawler(start_url: str, max_pages: int, output_file: str, delay: f
                         parsed = urlparse(absolute_url)
                         if parsed.scheme in ('http', 'https') and parsed.hostname:
                             _ = parsed.port  # raises ValueError on invalid port like :blank
-                            urls_to_queue.append(absolute_url)
+                            # Never queue another host: the crawl stays scoped to
+                            # the start host for its whole lifetime.
+                            if start_host is None or _norm_host(absolute_url) == start_host:
+                                urls_to_queue.append(absolute_url)
                     except (ValueError, TypeError):
                         pass
 
@@ -308,25 +471,38 @@ async def run_crawler(start_url: str, max_pages: int, output_file: str, delay: f
                 await context.add_requests(urls_to_queue)
         except Exception:
             pass
+        finally:
+            # Every exit path drops the per-page entry; an exception raised
+            # before the pop above would otherwise leak it for the life of the
+            # process.
+            page_network_paths.pop(current_url, None)
 
     # Run the crawler silently
     await crawler.run([start_url])
 
     # --- FINAL CLEAN OUTPUT LOGIC ---
     sorted_paths = sorted(list(GLOBAL_DISCOVERED_PATHS))
+    marker_lines = _marker_lines(final=True)
+    # A redirected start URL contributes no paths by construction; writing none
+    # explicitly keeps that guarantee independent of the harvesting code.
+    # Suppression follows "redirected" alone, never the destination host: a
+    # destination that could not be named is still a redirect.
+    redirected = redirect_state["redirected"]
     start_status["final"] = True
-    code = start_status["code"]
-    status_line = f"#status {code if code is not None else 'none'}"
 
     if output_file:
         with open(output_file, 'w') as f:
-            f.write(f"{status_line}\n")
-            for path in sorted_paths:
-                f.write(f"{path}\n")
+            for line in marker_lines:
+                f.write(f"{line}\n")
+            if not redirected:
+                for path in sorted_paths:
+                    f.write(f"{path}\n")
     else:
-        print(status_line)
-        for path in sorted_paths:
-            print(path)
+        for line in marker_lines:
+            print(line)
+        if not redirected:
+            for path in sorted_paths:
+                print(path)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Silent Network-Intercepting Crawler")

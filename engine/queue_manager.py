@@ -235,6 +235,21 @@ def get_project_domains(session: Session, project_id: str) -> list[str]:
     return json.loads(row[0]) if isinstance(row[0], str) else row[0]
 
 
+def is_in_scope(host: str, root_domains: list[str]) -> bool:
+    """True if host equals or is a subdomain of any project root domain.
+    Root domains may carry a leading '*.' wildcard (e.g. '*.sisal.com'), which
+    is normalised to the apex before matching."""
+    host = (host or "").lower().strip(".")
+    for d in root_domains:
+        d = (d or "").lower().strip()
+        if d.startswith("*."):
+            d = d[2:]
+        d = d.strip(".")
+        if d and (host == d or host.endswith("." + d)):
+            return True
+    return False
+
+
 def update_asset_record(session: Session, hostname: str, project_id: str, **fields):
     """Update asset fields by hostname and project_id."""
     if not fields:
@@ -473,9 +488,28 @@ def insert_asset_if_absent(
     return new_id if result.rowcount else None
 
 
-def enqueue_tech_scan(session: Session, project_id: str, asset_id: str, config: dict | None) -> str:
-    """Queue a tech scan for a single asset (used to follow in-scope cross-host
-    redirects). Mirrors the backend enqueue: appends to the end of the queue."""
+def enqueue_scan(
+    session: Session,
+    project_id: str,
+    scan_type: str,
+    asset_ids: list[str],
+    config: dict | None,
+) -> str:
+    """Queue a follow-up scan over the given assets. Used by the tech job to
+    follow in-scope cross-host redirects and by the crawl job for the hosts it
+    discovers. Mirrors the backend enqueue: appends to the end of the queue.
+
+    Returns the new job id, or "" when `asset_ids` is empty — an empty set has
+    nothing to scan, so no row is written rather than queueing a no-op job.
+
+    The queue position is MAX(queue_pos) + 1 across ALL queued jobs regardless
+    of scan_type: one queue, one ordering. Never scope this count by scan_type.
+    """
+    if scan_type not in ("recon", "tech", "crawl"):
+        raise ValueError(f"invalid scan_type: {scan_type}")
+    if not asset_ids:
+        return ""
+
     row = session.execute(text(
         "SELECT MAX(queue_pos) FROM scan_jobs WHERE status = 'queued'"
     )).fetchone()
@@ -483,12 +517,13 @@ def enqueue_tech_scan(session: Session, project_id: str, asset_id: str, config: 
     job_id = str(uuid.uuid4())
     session.execute(text(
         "INSERT INTO scan_jobs (id, project_id, scan_type, status, queue_pos, asset_ids, created_at, config) "
-        "VALUES (:id, :pid, 'tech', 'queued', :pos, :aids, :created, :cfg)"
+        "VALUES (:id, :pid, :stype, 'queued', :pos, :aids, :created, :cfg)"
     ), {
         "id": job_id,
         "pid": project_id,
+        "stype": scan_type,
         "pos": next_pos,
-        "aids": json.dumps([asset_id]),
+        "aids": json.dumps(asset_ids),
         "created": utc_now_str(),
         "cfg": json.dumps(config) if config is not None else None,
     })
