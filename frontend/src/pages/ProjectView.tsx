@@ -311,8 +311,14 @@ export default function ProjectView() {
   return (
     <div style={{ display: 'flex', height: '100%' }}>
       {/* minWidth 0 lets this flex item shrink below its content's min-content
-          width; without it the asset table widens the page instead. */}
-      <div style={{ flex: 1, minWidth: 0, overflow: 'auto' }}>
+          width; without it the asset table widens the page instead.
+          PageShell's padding sits outside this scroll container, so without a
+          right gutter of its own the scrollbar lands straight against the
+          content — most visibly the header's right-aligned Run Recon button.
+          scrollbarGutter reserves that track even on the tabs that are short
+          enough not to scroll, so switching tabs cannot shift the column
+          sideways. */}
+      <div style={{ flex: 1, minWidth: 0, overflow: 'auto', paddingRight: 16, scrollbarGutter: 'stable' }}>
         <ProjectHeader project={current} onRunRecon={() => setShowReconModal(true)} onEdit={() => setShowEdit(true)} />
 
         {/* Tab bar */}
