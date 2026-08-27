@@ -6,10 +6,8 @@ from auth.middleware import require_admin, require_viewer
 from schemas.scan import ScanCreate, ScanPositionUpdate, ScanOut
 from models.scan import ScanJob
 from services.project_service import get_project
+from services import scan_service
 from ws.scan_stream import clear_buffer_and_broadcast
-from services.settings_store import proxy_url_for_scan_type, retry_proxy_url_for_scan_type
-from config import settings
-import uuid
 from datetime import datetime, timezone
 
 router = APIRouter(prefix="/scans", tags=["scans"])
@@ -27,73 +25,15 @@ def enqueue_scan(data: ScanCreate, db: Session = Depends(get_db), _: dict = Depe
         if invalid:
             raise HTTPException(422, f"Domains not in project scope: {invalid}")
 
-    # Get next queue position
-    max_pos = db.query(ScanJob.queue_pos).filter(
-        ScanJob.status == "queued"
-    ).order_by(ScanJob.queue_pos.desc()).first()
-    next_pos = (max_pos[0] + 1) if max_pos and max_pos[0] is not None else 1
-
-    # Snapshot all scan-relevant settings into the job config so the engine
-    # (a separate process) uses the values active at enqueue time.
-    if data.scan_type == "recon":
-        job_config = {
-            "dns_bruteforce_enabled": settings.DNS_BRUTEFORCE_ENABLED,
-            "dns_wordlist_expansion_enabled": settings.DNS_WORDLIST_EXPANSION_ENABLED,
-            "recon_timeout": settings.RECON_TIMEOUT,
-            "wordlist_path": str(settings.WORDLIST_PATH),
-            "resolvers_path": str(settings.RESOLVERS_PATH),
-            "dns_rate_limit_delay": settings.DNS_RATE_LIMIT_DELAY,
-        }
-    elif data.scan_type == "tech":
-        job_config = {
-            "per_domain_timeout": settings.TECH_TIMEOUT,
-            "tech_rate_limit_delay": settings.TECH_RATE_LIMIT_DELAY,
-            "dns_rate_limit_delay": settings.DNS_RATE_LIMIT_DELAY,
-            "resolvers_path": str(settings.RESOLVERS_PATH),
-            "screenshots_enabled": settings.TECH_SCREENSHOTS_ENABLED,
-        }
-    elif data.scan_type == "crawl":
-        job_config = {
-            "crawl_timeout": settings.CRAWL_TIMEOUT,
-            "crawl_max_pages": settings.CRAWL_MAX_PAGES,
-            "crawl_rate_limit_delay": settings.CRAWL_RATE_LIMIT_DELAY,
-        }
-    else:
-        job_config = None
-
-    # Snapshot the proxy URL for this scan type (None if proxy disabled or this
-    # type is not selected) so the engine routes — or bypasses — accordingly.
-    # The retry URL is snapshotted the same way: it is independent of the
-    # per-phase flags and lets the engine run a direct pass first and re-attempt
-    # blocked hosts through the proxy within the same job. Both are enqueue-time
-    # snapshots, so a later settings change never alters an already queued job.
-    proxy_url = proxy_url_for_scan_type(data.scan_type)
-    if proxy_url:
-        if job_config is None:
-            job_config = {}
-        job_config["proxy_url"] = proxy_url
-
-    retry_proxy_url = retry_proxy_url_for_scan_type(data.scan_type)
-    if retry_proxy_url:
-        if job_config is None:
-            job_config = {}
-        job_config["retry_proxy_url"] = retry_proxy_url
-
-    job = ScanJob(
-        id=str(uuid.uuid4()),
+    # Queueing lives in scan_service so this endpoint and the recurring
+    # scheduler cannot drift apart on settings snapshots or queue ordering.
+    return scan_service.create_scan_job(
+        db,
         project_id=data.project_id,
         scan_type=data.scan_type,
-        status="queued",
-        queue_pos=next_pos,
         asset_ids=data.asset_ids,
         scope_domains=data.scope_domains,
-        created_at=datetime.now(timezone.utc),
-        config=job_config,
     )
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-    return job
 
 
 @router.get("/queue", response_model=list[ScanOut])

@@ -1,8 +1,9 @@
 // frontend/src/components/projects/ProjectEditOverlay.tsx
 import React, { useState, useEffect, useRef } from 'react';
 import { updateProject, deleteProject, uploadProjectIcon, deleteProjectIcon, fetchProjectIconUrl } from '../../api/projects';
-import type { Project, ProjectUpdate } from '../../types/project';
+import type { Project, ProjectUpdate, ScanPhase, ScheduleUnit } from '../../types/project';
 import { Trash2, Upload, X } from 'lucide-react';
+import ScheduleFields, { isScheduleValid } from './ScheduleFields';
 
 interface Props {
   project: Project;
@@ -24,13 +25,25 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState('');
+  const [scheduleEnabled, setScheduleEnabled] = useState(project.schedule_enabled);
+  const [intervalValue, setIntervalValue] = useState(project.schedule_interval_value ?? 7);
+  const [intervalUnit, setIntervalUnit] = useState<ScheduleUnit>(project.schedule_interval_unit ?? 'days');
+  const [phases, setPhases] = useState<ScanPhase[]>(project.schedule_phases ?? ['recon']);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  const scheduleValid = isScheduleValid({ enabled: scheduleEnabled, intervalValue, intervalUnit, phases });
 
   useEffect(() => {
     if (!open) return;
     setTitle(project.title);
     setDescription(project.description || '');
     setDomains(project.root_domains.join('\n'));
+    // A disabled schedule carries nulls; fall back to the same defaults the
+    // create overlay offers so the fields are usable the moment it is enabled.
+    setScheduleEnabled(project.schedule_enabled);
+    setIntervalValue(project.schedule_interval_value ?? 7);
+    setIntervalUnit(project.schedule_interval_unit ?? 'days');
+    setPhases(project.schedule_phases ?? ['recon']);
     setIconFile(null);
     setRemoveIcon(false);
     setConfirmDelete(false);
@@ -73,6 +86,7 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
 
   const handleSave = async () => {
     if (!title.trim()) { setError('Title is required'); return; }
+    if (!scheduleValid) { setError('Select at least one phase'); return; }
     setSaving(true);
     setError('');
     try {
@@ -81,6 +95,25 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
       if ((description.trim() || '') !== (project.description || '')) payload.description = description.trim();
       const newDomains = domains.split('\n').map((d) => d.trim()).filter(Boolean);
       if (JSON.stringify(newDomains) !== JSON.stringify(project.root_domains)) payload.root_domains = newDomains;
+      // While the schedule is off the interval fields hold placeholder defaults
+      // rather than the project's nulls, so they only count as a change when it is on.
+      const scheduleChanged =
+        scheduleEnabled !== project.schedule_enabled ||
+        (scheduleEnabled && (
+          intervalValue !== project.schedule_interval_value ||
+          intervalUnit !== project.schedule_interval_unit ||
+          JSON.stringify(phases) !== JSON.stringify(project.schedule_phases)
+        ));
+      if (scheduleChanged) {
+        payload.schedule_enabled = scheduleEnabled;
+        // An enabled schedule is only ever accepted as a complete set, so the
+        // interval and phases ride along with every change that keeps it on.
+        if (scheduleEnabled) {
+          payload.schedule_interval_value = intervalValue;
+          payload.schedule_interval_unit = intervalUnit;
+          payload.schedule_phases = phases;
+        }
+      }
       if (Object.keys(payload).length > 0) {
         await updateProject(project.id, payload);
       }
@@ -260,6 +293,19 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
               Wildcard domains (*.example.com) define recon scope. Specific hostnames are added as assets automatically.
             </div>
           </div>
+
+          <ScheduleFields
+            enabled={scheduleEnabled}
+            intervalValue={intervalValue}
+            intervalUnit={intervalUnit}
+            phases={phases}
+            onChange={(s) => {
+              setScheduleEnabled(s.enabled);
+              setIntervalValue(s.intervalValue);
+              setIntervalUnit(s.intervalUnit);
+              setPhases(s.phases);
+            }}
+          />
         </div>
 
         <div style={{
@@ -267,7 +313,7 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
           display: 'flex', justifyContent: 'flex-end', gap: 8,
         }}>
           <button onClick={onClose} className="btn-secondary">Cancel</button>
-          <button onClick={handleSave} disabled={saving} className="btn-primary">
+          <button onClick={handleSave} disabled={saving || !scheduleValid} className="btn-primary">
             {saving ? 'Saving...' : 'Save Changes'}
           </button>
         </div>

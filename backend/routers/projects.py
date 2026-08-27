@@ -114,7 +114,10 @@ def update_project(project_id: str, data: ProjectUpdate, db: Session = Depends(g
     try:
         project = project_service.update_project(db, project_id, data)
     except asset_service.CidrError as exc:
-        # Raised before `project` is mutated, so the stored scope is untouched.
+        # update_project may already have applied part of the edit to the ORM
+        # object, but nothing is persisted: it never commits before the scope
+        # expansion, the session has autoflush off, and get_db rolls back on
+        # close. The stored project is left exactly as it was.
         raise HTTPException(422, str(exc))
     if not project:
         raise HTTPException(404, "Project not found")

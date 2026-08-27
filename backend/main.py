@@ -1,10 +1,31 @@
 # backend/main.py
+import asyncio
+import logging
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import init_db, SessionLocal
 from models.user import User
 from config import settings
+from scheduler import scheduler_loop
 from ws.scan_stream import websocket_endpoint
+
+# Same setup the engine worker uses, so both services' logs read alike. Without
+# it the backend's own loggers sit at the root default of WARNING with no
+# handler, and everything the scheduler reports — cycles queued, skipped, or
+# completed — is dropped before it reaches the container logs.
+#
+# uvicorn configures logging in Config.__init__, which runs before it imports
+# this module, so the root logger is still handler-free here and basicConfig is
+# not a no-op. uvicorn keeps its own lines out of this handler: "uvicorn" and
+# "uvicorn.access" carry their handlers with propagate=False, and "uvicorn.error"
+# propagates no further than "uvicorn", so nothing it emits is logged twice.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
 
 app = FastAPI(title="Nous", version="1.0.0")
 
@@ -49,8 +70,35 @@ app.include_router(vuln_patterns_router)
 app.websocket("/ws/scan")(websocket_endpoint)
 
 
+# The recurring-scan scheduler runs inside the API process. That is only correct
+# because uvicorn serves this app single-process (backend/Dockerfile's CMD has no
+# --workers): with several workers each would run its own loop and every cycle
+# would be queued once per worker.
+_shutdown_event = asyncio.Event()
+_scheduler_task: asyncio.Task | None = None
+
+log = logging.getLogger("backend.main")
+
+
+def _scheduler_task_done(task: asyncio.Task):
+    """Report a scheduler loop that ended on its own.
+
+    Nothing else would: the API keeps serving and /health keeps returning ok
+    while schedules quietly stop firing. Logged rather than restarted — a loop
+    that died did so for a reason a restart would hit again, and the operator
+    needs to see it in the container logs.
+    """
+    if _shutdown_event.is_set() or task.cancelled():
+        return  # Ordinary shutdown.
+    exc = task.exception()
+    if exc is not None:
+        log.error("Scheduler loop crashed; recurring scans have stopped", exc_info=exc)
+    else:
+        log.error("Scheduler loop exited early; recurring scans have stopped")
+
+
 @app.on_event("startup")
-def startup():
+async def startup():
     # Fail fast if setup.sh hasn't been run
     if "PLACEHOLDER" in settings.SECRET_KEY:
         raise RuntimeError(
@@ -74,6 +122,27 @@ def startup():
         load_proxy_settings(db)
     finally:
         db.close()
+
+    global _scheduler_task
+    _scheduler_task = asyncio.create_task(scheduler_loop(_shutdown_event))
+    _scheduler_task.add_done_callback(_scheduler_task_done)
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if _scheduler_task is None:
+        return
+    _shutdown_event.set()
+    try:
+        # A tick runs on a worker thread, so give the in-flight one a chance to
+        # finish and commit before the process goes away.
+        await asyncio.wait_for(_scheduler_task, timeout=10)
+    except asyncio.TimeoutError:
+        _scheduler_task.cancel()
+        try:
+            await _scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/health")

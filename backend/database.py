@@ -275,6 +275,52 @@ def init_db():
             except Exception:
                 pass  # Column already exists
 
+    # Recurring-schedule columns. next_scan_at is NULL for every pre-existing
+    # row, which is exactly "not due" — an upgrade must not make anything
+    # scannable that the operator never asked to schedule. The three indexes are
+    # what keep the scheduler's poll off a table scan: one covers the due-project
+    # lookup, one the in-flight cycles the finalizer walks (partial, so it holds
+    # only the handful of rows actually mid-cycle), and one the per-project
+    # active-job probe in scan_service.
+    for ddl in (
+        "ALTER TABLE projects ADD COLUMN schedule_enabled BOOLEAN NOT NULL DEFAULT 0",
+        "ALTER TABLE projects ADD COLUMN schedule_interval_value INTEGER",
+        "ALTER TABLE projects ADD COLUMN schedule_interval_unit TEXT",
+        "ALTER TABLE projects ADD COLUMN schedule_phases JSON",
+        "ALTER TABLE projects ADD COLUMN next_scan_at DATETIME",
+        "ALTER TABLE projects ADD COLUMN schedule_cycle_job_ids JSON",
+        "ALTER TABLE projects ADD COLUMN schedule_cycle_started_at DATETIME",
+        "ALTER TABLE projects ADD COLUMN schedule_last_run_at DATETIME",
+        "CREATE INDEX IF NOT EXISTS ix_projects_schedule_due ON projects (schedule_enabled, next_scan_at)",
+        "CREATE INDEX IF NOT EXISTS ix_projects_cycle_in_flight ON projects (schedule_cycle_started_at) "
+        "WHERE schedule_cycle_job_ids IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS ix_scan_jobs_project_status ON scan_jobs (project_id, status)",
+    ):
+        with engine.connect() as conn:
+            try:
+                conn.execute(text(ddl))
+                conn.commit()
+            except Exception:
+                pass  # Column or index already exists
+
+    # Repair rows written before the JSON columns were declared none_as_null.
+    # SQLAlchemy's JSON type stores a Python None as the JSON text 'null' by
+    # default, which the ORM reads back as None but SQL counts as a value: a
+    # project whose schedule_cycle_job_ids held 'null' looked to the scheduler
+    # like a cycle permanently in flight, so its due time was recomputed on
+    # every tick and no scheduled scan could ever come due. Idempotent, and a
+    # no-op on any database written by the current model.
+    for ddl in (
+        "UPDATE projects SET schedule_cycle_job_ids = NULL WHERE schedule_cycle_job_ids = 'null'",
+        "UPDATE projects SET schedule_phases = NULL WHERE schedule_phases = 'null'",
+    ):
+        with engine.connect() as conn:
+            try:
+                conn.execute(text(ddl))
+                conn.commit()
+            except Exception:
+                pass  # Column not present yet on a database mid-upgrade
+
     # Normalize timestamps the engine wrote as offset-aware ISO strings
     # ("2026-07-27T09:15:00.123456+00:00") to the naive, space-separated form
     # SQLAlchemy's SQLite DateTime reads and writes. Both processes write these
@@ -293,6 +339,9 @@ def init_db():
         ("scan_jobs", "started_at"),
         ("scan_jobs", "finished_at"),
         ("projects", "last_scan_date"),
+        ("projects", "next_scan_at"),
+        ("projects", "schedule_cycle_started_at"),
+        ("projects", "schedule_last_run_at"),
         ("tags", "created_at"),
     ):
         with engine.connect() as conn:

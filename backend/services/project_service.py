@@ -1,4 +1,5 @@
 # backend/services/project_service.py
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from models.project import Project
 from models.asset import Asset
@@ -6,7 +7,7 @@ from models.scan import ScanJob
 from models.finding import Finding
 from models.tag import SOURCE_SEED, Tag, asset_tags
 from schemas.project import ProjectCreate, ProjectUpdate
-from services import asset_service
+from services import asset_service, schedule_service
 from config import settings
 from pathlib import Path
 import json
@@ -97,6 +98,35 @@ def _create_assets_from_hostnames(db: Session, project_id: str, names: list[str]
     asset_service.create_assets_bulk(db, project_id, names, SOURCE_SEED)
 
 
+def _check_schedule_complete(project: Project, incoming: dict):
+    """Reject an edit that would leave the schedule on but unrunnable.
+
+    The schema can only enforce this when the payload itself turns the schedule
+    on; an update to an already-enabled project may clear the interval or the
+    phases without mentioning schedule_enabled at all, and only the stored row
+    reveals that. Raised as HTTPException because the projects router maps its
+    own CidrError and nothing else — this has to arrive as a 422 on its own.
+    """
+    enabled = incoming.get("schedule_enabled", project.schedule_enabled)
+    if not enabled:
+        return
+    value = incoming.get("schedule_interval_value", project.schedule_interval_value)
+    unit = incoming.get("schedule_interval_unit", project.schedule_interval_unit)
+    phases = incoming.get("schedule_phases", project.schedule_phases)
+    if value is None or unit is None:
+        raise HTTPException(
+            422,
+            "schedule_interval_value and schedule_interval_unit are required "
+            "while the schedule is enabled",
+        )
+    if not phases:
+        raise HTTPException(
+            422,
+            "schedule_phases must name at least one phase while the schedule is "
+            "enabled",
+        )
+
+
 def create_project(db: Session, data: ProjectCreate) -> Project:
     # Split input: wildcard domains stay as root_domains, others become assets
     wildcards, cidrs, asset_hostnames = _split_domains_and_assets(data.root_domains)
@@ -112,6 +142,14 @@ def create_project(db: Session, data: ProjectCreate) -> Project:
         description=data.description,
         root_domains=wildcards,
         subdomains=data.subdomains,
+    )
+    # Resolve the schedule before the first commit so a project created with one
+    # already carries its due time — otherwise it would sit enabled but never
+    # due until someone edited it.
+    schedule_service.apply_schedule_change(
+        project,
+        {f: getattr(data, f) for f in schedule_service.SCHEDULE_FIELDS},
+        schedule_service.utc_now(),
     )
     db.add(project)
     db.commit()
@@ -154,6 +192,21 @@ def update_project(db: Session, project_id: str, data: ProjectUpdate) -> Project
         return None
 
     update_data = data.model_dump(exclude_unset=True)
+
+    # The schedule fields are derived state, not plain columns: writing them
+    # changes next_scan_at and the in-flight cycle too, so they are taken out of
+    # the generic assignment below and routed through the one place those rules
+    # live.
+    schedule_incoming = {
+        field: update_data.pop(field)
+        for field in schedule_service.SCHEDULE_FIELDS
+        if field in update_data
+    }
+    if schedule_incoming:
+        _check_schedule_complete(project, schedule_incoming)
+        schedule_service.apply_schedule_change(
+            project, schedule_incoming, schedule_service.utc_now()
+        )
 
     # If root_domains is being updated, filter out non-wildcard entries and create assets
     if "root_domains" in update_data and update_data["root_domains"] is not None:

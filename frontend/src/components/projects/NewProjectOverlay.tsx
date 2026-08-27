@@ -1,13 +1,38 @@
 // frontend/src/components/projects/NewProjectOverlay.tsx
 import React, { useState, useRef } from 'react';
 import { createProject, uploadProjectIcon } from '../../api/projects';
-import type { ProjectCreate } from '../../types/project';
+import type { ProjectCreate, ScanPhase, ScheduleUnit } from '../../types/project';
 import { Upload, X } from 'lucide-react';
+import ScheduleFields, { isScheduleValid } from './ScheduleFields';
 
 interface Props {
   open: boolean;
   onClose: () => void;
   onCreated: () => void;
+}
+
+/** Pull FastAPI's `detail` off a failed request so the operator sees the
+ *  server's reason (a rejected domain, an interval out of range) instead of the
+ *  overlay sitting there as if nothing happened. `detail` is a string for an
+ *  explicit HTTPException and a list of error objects for a pydantic-level 422,
+ *  so both shapes are rendered; a transport-level failure falls back to the
+ *  error's own message. */
+function errorDetail(reason: unknown): string {
+  const detail = (reason as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail.flatMap((entry) => {
+      const { msg, loc } = (entry ?? {}) as { msg?: unknown; loc?: unknown };
+      if (typeof msg !== 'string') return [];
+      // `loc` reads like ['body', 'title']; only its tail names the field the
+      // operator can act on, so the envelope prefix is dropped.
+      const field = Array.isArray(loc) ? loc[loc.length - 1] : undefined;
+      return [typeof field === 'string' || typeof field === 'number' ? `${field}: ${msg}` : msg];
+    });
+    if (parts.length > 0) return parts.join('; ');
+  }
+  if (reason instanceof Error && reason.message) return reason.message;
+  return 'Request failed';
 }
 
 
@@ -18,7 +43,15 @@ export default function NewProjectOverlay({ open, onClose, onCreated }: Props) {
   const [iconFile, setIconFile] = useState<File | null>(null);
   const [iconPreview, setIconPreview] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [scheduleEnabled, setScheduleEnabled] = useState(false);
+  const [intervalValue, setIntervalValue] = useState(7);
+  const [intervalUnit, setIntervalUnit] = useState<ScheduleUnit>('days');
+  const [phases, setPhases] = useState<ScanPhase[]>(['recon']);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  const schedule = { enabled: scheduleEnabled, intervalValue, intervalUnit, phases };
+  const scheduleValid = isScheduleValid(schedule);
 
   if (!open) return null;
 
@@ -37,15 +70,33 @@ export default function NewProjectOverlay({ open, onClose, onCreated }: Props) {
     if (fileRef.current) fileRef.current.value = '';
   };
 
+  // The overlay stays mounted between openings, so a failed attempt would
+  // otherwise greet the operator with its old banner the next time around.
+  const handleClose = () => {
+    setError('');
+    onClose();
+  };
+
   const handleSubmit = async () => {
-    if (!title.trim() || !domains.trim()) return;
+    if (!title.trim()) { setError('Title is required'); return; }
+    if (!domains.trim()) { setError('At least one scope entry is required'); return; }
+    if (!scheduleValid) { setError('Check the rescan interval and phases'); return; }
     setLoading(true);
+    setError('');
     try {
       const payload: ProjectCreate = {
         title: title.trim(),
         description: description.trim() || undefined,
         root_domains: domains.split('\n').map((d) => d.trim()).filter(Boolean),
       };
+      // The interval and phases only mean anything alongside an enabled
+      // schedule, so they stay out of the payload otherwise.
+      if (scheduleEnabled) {
+        payload.schedule_enabled = true;
+        payload.schedule_interval_value = intervalValue;
+        payload.schedule_interval_unit = intervalUnit;
+        payload.schedule_phases = phases;
+      }
       const project = await createProject(payload);
       if (iconFile) {
         try { await uploadProjectIcon(project.id, iconFile); } catch { /* non-fatal */ }
@@ -53,9 +104,17 @@ export default function NewProjectOverlay({ open, onClose, onCreated }: Props) {
       setTitle('');
       setDescription('');
       setDomains('');
+      setScheduleEnabled(false);
+      setIntervalValue(7);
+      setIntervalUnit('days');
+      setPhases(['recon']);
       clearIcon();
       onCreated();
       onClose();
+    } catch (e) {
+      // The overlay keeps whatever was typed so the operator can correct the
+      // field the server named and submit again.
+      setError(errorDetail(e));
     } finally {
       setLoading(false);
     }
@@ -74,7 +133,7 @@ export default function NewProjectOverlay({ open, onClose, onCreated }: Props) {
       background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)',
       WebkitBackdropFilter: 'blur(6px)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    }} onClick={(e) => { if (e.target === e.currentTarget) handleClose(); }}>
       <div style={{
         background: 'var(--bg-surface)',
         border: '1px solid var(--border-default)', borderRadius: 'var(--radius-xl)',
@@ -91,6 +150,14 @@ export default function NewProjectOverlay({ open, onClose, onCreated }: Props) {
         </div>
 
         <div style={{ padding: '20px 22px', display: 'flex', flexDirection: 'column', gap: 18 }}>
+          {error && (
+            <div style={{
+              background: 'var(--status-error-bg)', border: '1px solid var(--status-error-border)',
+              borderRadius: 'var(--radius-md)', padding: '8px 12px', fontSize: 12, color: 'var(--status-error)',
+              fontFamily: 'var(--font-mono)',
+            }}>{error}</div>
+          )}
+
           {/* Icon upload */}
           <div>
             <label style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 6 }}>
@@ -174,14 +241,27 @@ export default function NewProjectOverlay({ open, onClose, onCreated }: Props) {
               Wildcard domains (*.example.com) define recon scope. Specific hostnames (sub.example.com) are added as assets directly.
             </div>
           </div>
+
+          <ScheduleFields
+            enabled={scheduleEnabled}
+            intervalValue={intervalValue}
+            intervalUnit={intervalUnit}
+            phases={phases}
+            onChange={(s) => {
+              setScheduleEnabled(s.enabled);
+              setIntervalValue(s.intervalValue);
+              setIntervalUnit(s.intervalUnit);
+              setPhases(s.phases);
+            }}
+          />
         </div>
 
         <div style={{
           padding: '14px 22px', borderTop: '1px solid var(--border-subtle)',
           display: 'flex', justifyContent: 'flex-end', gap: 8,
         }}>
-          <button onClick={onClose} className="btn-secondary">Cancel</button>
-          <button onClick={handleSubmit} disabled={loading} className="btn-primary">
+          <button onClick={handleClose} className="btn-secondary">Cancel</button>
+          <button onClick={handleSubmit} disabled={loading || !scheduleValid} className="btn-primary">
             {loading ? 'Creating...' : 'Create Project'}
           </button>
         </div>

@@ -17,3 +17,13 @@ const ZONELESS_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/;
 export function parseBackendDate(value: string): Date {
   return new Date(ZONELESS_RE.test(value) ? `${value.replace(' ', 'T')}Z` : value);
 }
+
+/**
+ * Render a Date in the viewer's locale and zone.
+ *
+ * The input must already have come through parseBackendDate — this half of the
+ * contract only formats, so no string ever reaches `new Date()` by another path.
+ */
+export function formatDateTime(d: Date): string {
+  return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}

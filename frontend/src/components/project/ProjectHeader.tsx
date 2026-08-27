@@ -1,7 +1,8 @@
 // frontend/src/components/project/ProjectHeader.tsx
 import React from 'react';
 import type { Project } from '../../types/project';
-import { Pencil } from 'lucide-react';
+import { CalendarClock, Pencil } from 'lucide-react';
+import { parseBackendDate, formatDateTime } from '../../lib/datetime';
 import { useAuth } from '../../hooks/useAuth';
 import ProjectIcon from '../projects/ProjectIcon';
 
@@ -56,6 +57,26 @@ export default function ProjectHeader({ project, onRunRecon, onEdit }: Props) {
           <span style={{ fontSize: 12, color: 'var(--text-secondary)', alignSelf: 'center' }}>
             <strong style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>{project.tech_count}</strong> tech
           </span>
+          {project.schedule_enabled && project.next_scan_at && (
+            <span style={{
+              fontSize: 12, color: 'var(--text-secondary)', alignSelf: 'center',
+              display: 'flex', alignItems: 'center', gap: 4,
+            }}>
+              <CalendarClock size={11} /> Next scan:{' '}
+              <strong style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>
+                {formatDateTime(parseBackendDate(project.next_scan_at))}
+              </strong>
+            </span>
+          )}
+          {/* next_scan_at is withheld while a cycle runs, so this state stands in for it. */}
+          {project.schedule_enabled && !project.next_scan_at && project.schedule_cycle_active && (
+            <span style={{
+              fontSize: 12, color: 'var(--accent-primary)', alignSelf: 'center',
+              display: 'flex', alignItems: 'center', gap: 4,
+            }}>
+              <CalendarClock size={11} /> Scheduled scan in progress
+            </span>
+          )}
         </div>
       </div>
       <button onClick={onRunRecon} className="btn-primary" style={{ padding: '9px 20px', fontSize: 13 }}>
