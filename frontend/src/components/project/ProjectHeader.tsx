@@ -57,24 +57,52 @@ export default function ProjectHeader({ project, onRunRecon, onEdit }: Props) {
           <span style={{ fontSize: 12, color: 'var(--text-secondary)', alignSelf: 'center' }}>
             <strong style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)' }}>{project.tech_count}</strong> tech
           </span>
-          {project.schedule_enabled && project.next_scan_at && (
+          {/* The schedule reads as one item here, so an unscheduled project says so
+              outright instead of leaving the row silent and the state hidden in Edit. */}
+          {project.schedule_enabled ? (
+            project.next_scan_at ? (
+              <span style={{
+                fontSize: 12, color: 'var(--text-secondary)', alignSelf: 'center',
+                display: 'flex', alignItems: 'center', gap: 4,
+              }}>
+                <CalendarClock size={11} /> Next scan:{' '}
+                <strong style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>
+                  {formatDateTime(parseBackendDate(project.next_scan_at))}
+                </strong>
+              </span>
+            ) : project.schedule_cycle_active ? (
+              /* next_scan_at is withheld while a cycle runs, so this state stands in for it. */
+              <span style={{
+                fontSize: 12, color: 'var(--accent-primary)', alignSelf: 'center',
+                display: 'flex', alignItems: 'center', gap: 4,
+              }}>
+                <CalendarClock size={11} /> Scheduled scan in progress
+              </span>
+            ) : null
+          ) : (
             <span style={{
-              fontSize: 12, color: 'var(--text-secondary)', alignSelf: 'center',
+              fontSize: 12, color: 'var(--text-muted)', alignSelf: 'center',
               display: 'flex', alignItems: 'center', gap: 4,
             }}>
-              <CalendarClock size={11} /> Next scan:{' '}
-              <strong style={{ color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontWeight: 600 }}>
-                {formatDateTime(parseBackendDate(project.next_scan_at))}
-              </strong>
-            </span>
-          )}
-          {/* next_scan_at is withheld while a cycle runs, so this state stands in for it. */}
-          {project.schedule_enabled && !project.next_scan_at && project.schedule_cycle_active && (
-            <span style={{
-              fontSize: 12, color: 'var(--accent-primary)', alignSelf: 'center',
-              display: 'flex', alignItems: 'center', gap: 4,
-            }}>
-              <CalendarClock size={11} /> Scheduled scan in progress
+              <CalendarClock size={11} /> No schedule
+              {/* Only an admin can open Edit, so a viewer gets the state without a dead control. */}
+              {isAdmin && onEdit && (
+                <>
+                  ·
+                  <button
+                    onClick={onEdit}
+                    style={{
+                      background: 'transparent', border: 'none', padding: 0, cursor: 'pointer',
+                      fontSize: 12, fontFamily: 'inherit', color: 'var(--text-secondary)',
+                      textDecoration: 'underline dotted',
+                    }}
+                    onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--accent-primary)'; }}
+                    onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; }}
+                  >
+                    set one
+                  </button>
+                </>
+              )}
             </span>
           )}
         </div>
