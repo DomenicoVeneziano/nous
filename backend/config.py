@@ -49,6 +49,26 @@ class Settings(BaseSettings):
     PROXY_CRAWL: bool = False           # route crawler traffic through the proxy
     PROXY_RETRIES: bool = False         # retry blocked/throttled hosts through the proxy
 
+    # --- Notification configuration ---
+    # Persisted in the app_settings table and loaded at startup; these defaults
+    # apply when no value has been saved yet.
+    NOTIFY_ENABLED: bool = False
+    NOTIFY_ON_SUCCESS: bool = True      # notify when a scan completes
+    NOTIFY_ON_FAILURE: bool = True      # notify when a scan fails
+    NOTIFY_SLACK_ENABLED: bool = False
+    NOTIFY_SLACK_WEBHOOK_URL: str = ""
+    NOTIFY_DISCORD_ENABLED: bool = False
+    NOTIFY_DISCORD_WEBHOOK_URL: str = ""
+    NOTIFY_WEBHOOK_ENABLED: bool = False
+    NOTIFY_WEBHOOK_URL: str = ""
+    NOTIFY_WEBHOOK_TOKEN: str = ""      # sent as a bearer token on the generic webhook
+    NOTIFY_TELEGRAM_ENABLED: bool = False
+    NOTIFY_TELEGRAM_BOT_TOKEN: str = ""
+    NOTIFY_TELEGRAM_CHAT_ID: str = ""
+    NOTIFY_SAMPLE_SIZE: int = 5         # sample findings listed in a message (0-20)
+    NOTIFY_TIMEOUT_SECONDS: int = 10    # per-delivery HTTP timeout (1-30)
+    NOTIFY_RETRIES: int = 2             # delivery retry attempts (0-5)
+
     # Anchor the .env lookup to the project root rather than the process's
     # working directory: running `uvicorn main:app` from backend/ would
     # otherwise find no .env and fall back to the placeholder credentials

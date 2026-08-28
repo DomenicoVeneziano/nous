@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import init_db, SessionLocal
 from models.user import User
 from config import settings
+from notifier import notifier_loop
 from scheduler import scheduler_loop
 from ws.scan_stream import websocket_endpoint
 
@@ -70,12 +71,14 @@ app.include_router(vuln_patterns_router)
 app.websocket("/ws/scan")(websocket_endpoint)
 
 
-# The recurring-scan scheduler runs inside the API process. That is only correct
-# because uvicorn serves this app single-process (backend/Dockerfile's CMD has no
-# --workers): with several workers each would run its own loop and every cycle
-# would be queued once per worker.
+# The recurring-scan scheduler and the notification dispatcher both run inside
+# the API process. That is only correct because uvicorn serves this app
+# single-process (backend/Dockerfile's CMD has no --workers): with several
+# workers each would run its own loops, and every cycle would be queued once per
+# worker and every notification sent once per worker.
 _shutdown_event = asyncio.Event()
 _scheduler_task: asyncio.Task | None = None
+_notifier_task: asyncio.Task | None = None
 
 log = logging.getLogger("backend.main")
 
@@ -97,6 +100,22 @@ def _scheduler_task_done(task: asyncio.Task):
         log.error("Scheduler loop exited early; recurring scans have stopped")
 
 
+def _notifier_task_done(task: asyncio.Task):
+    """Report a notifier loop that ended on its own.
+
+    Same reasoning as the scheduler's callback: the API keeps serving while
+    finished scans quietly stop producing notifications, so the exit is logged
+    rather than restarted and the operator sees it in the container logs.
+    """
+    if _shutdown_event.is_set() or task.cancelled():
+        return  # Ordinary shutdown.
+    exc = task.exception()
+    if exc is not None:
+        log.error("Notifier loop crashed; notifications have stopped", exc_info=exc)
+    else:
+        log.error("Notifier loop exited early; notifications have stopped")
+
+
 @app.on_event("startup")
 async def startup():
     # Fail fast if setup.sh hasn't been run
@@ -109,8 +128,9 @@ async def startup():
 
     init_db()
 
-    # Seed admin user if not exists; load persisted proxy settings into config
-    from services.settings_store import load_proxy_settings
+    # Seed admin user if not exists; load persisted proxy and notification
+    # settings into config
+    from services.settings_store import load_notification_settings, load_proxy_settings
     db = SessionLocal()
     try:
         existing = db.query(User).filter(User.username == settings.ADMIN_USERNAME).first()
@@ -120,29 +140,44 @@ async def startup():
             db.add(admin)
             db.commit()
         load_proxy_settings(db)
+        load_notification_settings(db)
     finally:
         db.close()
 
-    global _scheduler_task
+    global _scheduler_task, _notifier_task
     _scheduler_task = asyncio.create_task(scheduler_loop(_shutdown_event))
     _scheduler_task.add_done_callback(_scheduler_task_done)
+    _notifier_task = asyncio.create_task(notifier_loop(_shutdown_event))
+    _notifier_task.add_done_callback(_notifier_task_done)
+
+
+async def _stop(task: asyncio.Task | None):
+    """Wind one background loop down, cancelling it if it overruns."""
+    if task is None:
+        return
+    try:
+        # A tick runs on a worker thread or an in-flight HTTP send, so give the
+        # one in progress a chance to finish before the process goes away.
+        await asyncio.wait_for(task, timeout=10)
+    except asyncio.TimeoutError:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    except Exception:  # noqa: BLE001
+        # A loop that died on its own already reported itself through its
+        # done-callback; re-raising here would strand the other task pending.
+        pass
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    if _scheduler_task is None:
-        return
     _shutdown_event.set()
-    try:
-        # A tick runs on a worker thread, so give the in-flight one a chance to
-        # finish and commit before the process goes away.
-        await asyncio.wait_for(_scheduler_task, timeout=10)
-    except asyncio.TimeoutError:
-        _scheduler_task.cancel()
-        try:
-            await _scheduler_task
-        except asyncio.CancelledError:
-            pass
+    # Both loops are wound down unconditionally, and concurrently: an absent or
+    # already-finished one must not skip the other, and waiting on them in turn
+    # would double the worst-case shutdown to twice the 10s grace.
+    await asyncio.gather(_stop(_scheduler_task), _stop(_notifier_task))
 
 
 @app.get("/health")

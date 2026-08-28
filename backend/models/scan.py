@@ -22,3 +22,6 @@ class ScanJob(Base):
     log_path = Column(String, nullable=True)
     error_msg = Column(String, nullable=True)
     config = Column(JSON, nullable=True)
+    # Set once the terminal state of this job has been handed to the notifier.
+    # Internal bookkeeping only: never exposed through a schema or an endpoint.
+    notified_at = Column(DateTime, nullable=True)

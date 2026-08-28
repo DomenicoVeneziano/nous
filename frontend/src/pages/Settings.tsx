@@ -2,12 +2,13 @@
 import React, { useState } from 'react';
 import ScanConfig from '../components/settings/ScanConfig';
 import ProxyConfig from '../components/settings/ProxyConfig';
+import NotificationConfig from '../components/settings/NotificationConfig';
 import UserManagement from '../components/settings/UserManagement';
 import ApiKeyManagement from '../components/settings/ApiKeyManagement';
 import VulnPatternManagement from '../components/settings/VulnPatternManagement';
 import { useAuth } from '../hooks/useAuth';
 
-type Tab = 'config' | 'proxy' | 'users' | 'api-keys' | 'vuln-patterns';
+type Tab = 'config' | 'proxy' | 'notifications' | 'users' | 'api-keys' | 'vuln-patterns';
 
 export default function Settings() {
   const { isAdmin } = useAuth();
@@ -16,6 +17,7 @@ export default function Settings() {
   const tabs: { key: Tab; label: string }[] = [
     { key: 'config', label: 'Scan Config' },
     { key: 'proxy', label: 'Proxy' },
+    { key: 'notifications', label: 'Notifications' },
     { key: 'api-keys', label: 'API Keys' },
     { key: 'vuln-patterns', label: 'Vuln Patterns' },
     ...(isAdmin ? [{ key: 'users' as Tab, label: 'Users' }] : []),
@@ -45,6 +47,7 @@ export default function Settings() {
       </div>
       {tab === 'config' && <ScanConfig />}
       {tab === 'proxy' && <ProxyConfig />}
+      {tab === 'notifications' && <NotificationConfig />}
       {tab === 'api-keys' && <ApiKeyManagement />}
       {tab === 'vuln-patterns' && <VulnPatternManagement />}
       {tab === 'users' && isAdmin && <UserManagement />}

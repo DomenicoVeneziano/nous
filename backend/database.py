@@ -44,6 +44,10 @@ def get_db():
 # assets.rowid. Lives in the app_settings key/value table.
 _FTS_SENTINEL = "FTS_ROWID_REBUILD"
 
+# Marks a database whose pre-existing terminal scan jobs have been stamped as
+# already notified. Also lives in app_settings.
+_NOTIFY_BACKFILL_SENTINEL = "NOTIFY_BACKFILL_DONE"
+
 # How SQLAlchemy renders a DateTime for SQLite: naive, no offset. Raw SQL writes
 # to those columns have to match it or the two forms sort against each other.
 _TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
@@ -309,6 +313,17 @@ def init_db():
         " changed_at DATETIME NOT NULL)",
         "CREATE INDEX IF NOT EXISTS ix_asset_changes_asset_time ON asset_changes (asset_id, changed_at)",
         "CREATE INDEX IF NOT EXISTS ix_asset_changes_project_scan ON asset_changes (project_id, scan_id)",
+        # Notification bookkeeping. notified_at records that a finished job's
+        # outcome has already been handed off, so a restart mid-delivery cannot
+        # send it twice. Its index is partial — keyed on the unsent backlog only —
+        # so the poll that looks for unclaimed terminal jobs reads an index that
+        # is empty in steady state instead of scanning every job ever run. The
+        # assets index backs the per-scan "new assets" summary, which would
+        # otherwise scan the project's whole asset set on every finished job.
+        "ALTER TABLE scan_jobs ADD COLUMN notified_at DATETIME",
+        "CREATE INDEX IF NOT EXISTS ix_scan_jobs_unnotified ON scan_jobs (finished_at) "
+        "WHERE notified_at IS NULL AND status IN ('done','failed','timed_out','cancelled')",
+        "CREATE INDEX IF NOT EXISTS ix_assets_first_seen_scan ON assets (project_id, first_seen_scan_id)",
     ):
         with engine.connect() as conn:
             try:
@@ -316,6 +331,36 @@ def init_db():
                 conn.commit()
             except Exception:
                 pass  # Column or index already exists
+
+    # One-shot claim of the historical backlog. Every job that had already
+    # reached a terminal state before notifications existed is stamped as sent,
+    # so switching the feature on later announces only what happens from then on
+    # rather than replaying years of completions into a channel. Gated on a
+    # sentinel rather than on the rows themselves: once the backlog is stamped,
+    # "no unnotified terminal rows" is also the normal steady state, so a
+    # row-based test would re-run the sweep on every boot and silently swallow
+    # any genuinely pending job that the notifier had not picked up yet.
+    # COALESCE keeps the stamp meaningful on a row whose finished_at was never
+    # written. Runs after the ALTER above, so the column exists by now.
+    with engine.connect() as conn:
+        try:
+            row = conn.execute(
+                text("SELECT 1 FROM app_settings WHERE key = :k"),
+                {"k": _NOTIFY_BACKFILL_SENTINEL},
+            ).fetchone()
+            if row is None:
+                conn.execute(text(
+                    "UPDATE scan_jobs SET notified_at = COALESCE(finished_at, CURRENT_TIMESTAMP) "
+                    "WHERE notified_at IS NULL "
+                    "AND status IN ('done','failed','timed_out','cancelled')"
+                ))
+                conn.execute(
+                    text("INSERT OR REPLACE INTO app_settings (key, value) VALUES (:k, '1')"),
+                    {"k": _NOTIFY_BACKFILL_SENTINEL},
+                )
+                conn.commit()
+        except Exception:
+            pass  # Column or table missing on a database mid-upgrade
 
     # Repair rows written before the JSON columns were declared none_as_null.
     # SQLAlchemy's JSON type stores a Python None as the JSON text 'null' by

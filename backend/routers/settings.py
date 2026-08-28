@@ -1,5 +1,7 @@
 # backend/routers/settings.py
+import re
 import socket
+from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
@@ -11,7 +13,14 @@ from models.user import User
 from config import settings as _cfg
 from services.settings_store import (
     ALLOWED_SCHEMES, get_proxy_settings, save_proxy_settings,
+    get_notification_settings, save_notification_settings, validate_webhook_url,
+    NOTIFY_SECRET_API_FIELDS,
 )
+from services.notifications import send_test
+# The Telegram bot token is placed in a URL path by the sender, which owns the
+# canonical shape check. It is imported rather than restated so the router can
+# never accept a token the sender would refuse.
+from services.notifications.sender import TELEGRAM_TOKEN_RE
 import uuid
 
 _ALLOWED_PATH_BASES = tuple(
@@ -89,6 +98,66 @@ class ProxyConfigUpdate(BaseModel):
 class ProxyTestRequest(BaseModel):
     host: str
     port: int
+
+
+# A chat id is either a numeric id (possibly negative, for groups) or an @name.
+_TELEGRAM_CHAT_ID_RE = re.compile(r"^(-?[0-9]{1,32}|@[A-Za-z0-9_]{5,32})$")
+
+
+class NotificationConfigUpdate(BaseModel):
+    """Update payload for the notification config.
+
+    The credential-bearing fields are typed `Any` on purpose. A Pydantic
+    validation error carries the offending value in its `input` key, and that
+    error list becomes the 422 response body, so a field validator rejecting a
+    malformed webhook URL or bot token would echo the submitted secret straight
+    back into the response and into any log that records it. Their shape is
+    checked instead by `_validated_notification_strings`, which raises an
+    HTTPException naming the field and the fault without the value.
+    """
+    enabled: bool | None = None
+    on_success: bool | None = None
+    on_failure: bool | None = None
+    slack_enabled: bool | None = None
+    slack_webhook_url: Any = None
+    discord_enabled: bool | None = None
+    discord_webhook_url: Any = None
+    webhook_enabled: bool | None = None
+    webhook_url: Any = None
+    webhook_token: Any = None
+    telegram_enabled: bool | None = None
+    telegram_bot_token: Any = None
+    telegram_chat_id: Any = None
+    sample_size: int | None = None
+    timeout_seconds: int | None = None
+    retries: int | None = None
+    clear_secrets: list[str] | None = None
+
+    @field_validator("sample_size")
+    @classmethod
+    def validate_sample_size(cls, v):
+        if v is not None and not (0 <= v <= 20):
+            raise ValueError("sample_size must be between 0 and 20")
+        return v
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def validate_timeout_seconds(cls, v):
+        if v is not None and not (1 <= v <= 30):
+            raise ValueError("timeout_seconds must be between 1 and 30")
+        return v
+
+    @field_validator("retries")
+    @classmethod
+    def validate_retries(cls, v):
+        if v is not None and not (0 <= v <= 5):
+            raise ValueError("retries must be between 0 and 5")
+        return v
+
+
+class NotificationTestRequest(BaseModel):
+    """Names a channel and nothing else: a secret here would land in an access log."""
+    channel: Literal["slack", "discord", "webhook", "telegram"]
 
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -191,6 +260,153 @@ def test_proxy_config(data: ProxyTestRequest, _: dict = Depends(require_admin)):
             return {"reachable": True, "message": f"Connected to {host}:{data.port}"}
     except OSError as e:
         return {"reachable": False, "message": f"Could not connect: {e}"}
+
+
+# --- Notification config ---
+
+# Channel -> (enable flag, credentials it cannot be enabled without). Each
+# credential is named by its API field. Whether a SECRET one is already stored
+# is read from its "<field>_set" boolean, never from the secret itself;
+# telegram_chat_id is not a secret and is read back directly.
+_NOTIFY_CHANNEL_REQUIREMENTS = {
+    "slack_enabled": ("Slack", ("slack_webhook_url",)),
+    "discord_enabled": ("Discord", ("discord_webhook_url",)),
+    "webhook_enabled": ("Webhook", ("webhook_url",)),
+    "telegram_enabled": ("Telegram", ("telegram_bot_token", "telegram_chat_id")),
+}
+
+
+def _check_webhook_url(value: str) -> None:
+    validate_webhook_url(value)
+
+
+def _check_bot_token(value: str) -> None:
+    if not TELEGRAM_TOKEN_RE.match(value):
+        raise ValueError("must look like 123456:AA... (digits, a colon, then the secret)")
+
+
+def _check_chat_id(value: str) -> None:
+    if not _TELEGRAM_CHAT_ID_RE.match(value):
+        raise ValueError("must be a numeric id or an @username")
+
+
+# Free-text notification fields, with the check each one's value must pass.
+# `None` means any non-empty string is acceptable (a bearer token has no shape).
+_NOTIFY_STRING_CHECKS = {
+    "slack_webhook_url": _check_webhook_url,
+    "discord_webhook_url": _check_webhook_url,
+    "webhook_url": _check_webhook_url,
+    "webhook_token": None,
+    "telegram_bot_token": _check_bot_token,
+    "telegram_chat_id": _check_chat_id,
+}
+
+
+def _validated_notification_strings(values: dict) -> None:
+    """Check the shape of every free-text notification field that was supplied.
+
+    Raises a 422 whose detail is a plain sentence naming the field and the
+    fault. The value itself is never included: these carry webhook URLs and bot
+    tokens, and a 422 body is echoed into access and error logs. This is why the
+    checks live here rather than in a Pydantic field validator, whose error dict
+    would carry the submitted value in its `input` key.
+
+    A blank string is left to the save layer, which reads it as "keep the stored
+    secret" for a secret field and as "erase this" for a plain one.
+    """
+    for field, check in _NOTIFY_STRING_CHECKS.items():
+        if field not in values:
+            continue
+        value = values[field]
+        if not isinstance(value, str):
+            raise HTTPException(422, f"{field} must be a string")
+        if not value.strip():
+            continue
+        if check is None:
+            continue
+        try:
+            check(value)
+        except ValueError as e:
+            raise HTTPException(422, f"{field}: {e}") from None
+
+
+def _notify_credential_present(field: str, values: dict, current: dict, cleared: set) -> bool:
+    """True if `field` will hold a value once this request is saved.
+
+    The two field families answer this differently, and the answer must match
+    what save_notification_settings actually does:
+
+    * a secret is write-only, so a blank or absent one keeps whatever is stored;
+      only `clear_secrets` erases it.
+    * a plain field (telegram_chat_id) is overwritten by whatever is supplied,
+      so a supplied blank erases it and this returns False -- otherwise a
+      request could enable a channel on the strength of a stored value it wipes
+      in the same save.
+    """
+    supplied = values.get(field)
+    if field not in NOTIFY_SECRET_API_FIELDS:
+        if field in values:
+            return bool(supplied) and bool(str(supplied).strip())
+        return bool((current.get(field) or "").strip())
+    if isinstance(supplied, str) and supplied.strip():
+        return True
+    if field in cleared:
+        return False
+    if f"{field}_set" in current:
+        return bool(current[f"{field}_set"])
+    return bool((current.get(field) or "").strip())
+
+
+@router.get("/notification-config")
+def get_notification_config(_: dict = Depends(require_viewer)):
+    return get_notification_settings()
+
+
+@router.put("/notification-config")
+def update_notification_config(
+    data: NotificationConfigUpdate,
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_admin),
+):
+    values = data.model_dump(exclude_none=True)
+    _validated_notification_strings(values)
+    current = get_notification_settings()
+    # Mirrors the save layer, which ignores names that are not secret fields.
+    cleared = {
+        name for name in (values.get("clear_secrets") or [])
+        if isinstance(name, str) and name.lower() in NOTIFY_SECRET_API_FIELDS
+    }
+    # Mirrors the proxy's "host required when enabled": a channel cannot be
+    # turned on unless its credential arrives here or is already stored.
+    for flag, (label, required) in _NOTIFY_CHANNEL_REQUIREMENTS.items():
+        if not values.get(flag, current.get(flag)):
+            continue
+        missing = [
+            field for field in required
+            if not _notify_credential_present(field, values, current, cleared)
+        ]
+        if missing:
+            raise HTTPException(
+                400,
+                f"{label} notifications require {', '.join(missing)} to be configured"
+                " — set a value or turn the channel off",
+            )
+    save_notification_settings(db, values)
+    return get_notification_settings()
+
+
+@router.post("/notification-config/test")
+async def test_notification_config(
+    data: NotificationTestRequest,
+    _: dict = Depends(require_admin),
+):
+    """Send a synthetic event to one channel using the stored credentials.
+
+    A delivery failure is a result, not an error: it comes back as ok=false so
+    the caller can show the reason without a 500.
+    """
+    ok, message = await send_test(data.channel)
+    return {"ok": ok, "message": message}
 
 
 # --- User management ---

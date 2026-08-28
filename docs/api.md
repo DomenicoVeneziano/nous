@@ -703,6 +703,98 @@ send `"password": ""` to clear it.
 
 ---
 
+### `GET /settings/notification-config`
+`VIEWER` · Get the current notification configuration. The five secret fields
+(`slack_webhook_url`, `discord_webhook_url`, `webhook_url`, `webhook_token`,
+`telegram_bot_token`) are write-only and are never returned; each has a
+matching `<field>_set` boolean indicating whether a value is stored.
+
+**Response** `200`
+```json
+{
+  "enabled": false,
+  "on_success": true,
+  "on_failure": true,
+  "slack_enabled": false,
+  "slack_webhook_url_set": false,
+  "discord_enabled": false,
+  "discord_webhook_url_set": false,
+  "webhook_enabled": false,
+  "webhook_url_set": false,
+  "webhook_token_set": false,
+  "telegram_enabled": false,
+  "telegram_bot_token_set": false,
+  "telegram_chat_id": "",
+  "sample_size": 5,
+  "timeout_seconds": 10,
+  "retries": 2
+}
+```
+Every field is a boolean except `telegram_chat_id` (string) and `sample_size` /
+`timeout_seconds` / `retries` (integers).
+
+A notification fires once per finished scan job and carries a summary of what
+that scan changed. Delivery is at-most-once: the job is marked handled before
+the send is attempted, so a failed delivery is logged and never retried on a
+later tick.
+
+---
+
+### `PUT /settings/notification-config`
+`ADMIN` · Update notification configuration (all fields optional; any subset may
+be sent). Persisted to the DB and applied to subsequently finished scan jobs.
+
+**Body** `{ "enabled", "on_success", "on_failure", "slack_enabled", "slack_webhook_url", "discord_enabled", "discord_webhook_url", "webhook_enabled", "webhook_url", "webhook_token", "telegram_enabled", "telegram_bot_token", "telegram_chat_id", "sample_size", "timeout_seconds", "retries", "clear_secrets" }`
+**Response** `200` notification config (same shape as GET)
+**Errors:** `422` invalid field type, or a malformed webhook URL,
+`telegram_bot_token` or `telegram_chat_id` · `400` a channel is switched on
+without the credentials it needs
+
+The `422` detail is a single sentence naming the field and the fault; the
+rejected value is never echoed back, since these fields carry secrets.
+
+Secrets are write-only: omitting one, or sending it as an empty string, leaves
+the stored value unchanged. `clear_secrets` is the only way to erase a stored
+secret: it takes an array of secret field names to wipe (names that are not
+secret fields are ignored).
+
+`telegram_chat_id` is **not** a secret and follows the opposite rule: whatever
+is sent replaces what is stored, so sending it as an empty string erases the
+chat id.
+
+A channel cannot be left enabled without its credentials. Enabling — or leaving
+enabled — `slack_enabled`, `discord_enabled`, `webhook_enabled` or
+`telegram_enabled` while its credentials are absent returns `400` naming the
+missing fields (`slack_webhook_url`, `discord_webhook_url`, `webhook_url`, and
+`telegram_bot_token` + `telegram_chat_id` respectively). A credential counts as
+present if it is supplied in the request or already stored and not being erased
+in the same request; because an empty `telegram_chat_id` erases the stored one,
+`{"telegram_enabled": true, "telegram_chat_id": ""}` is rejected with `400`
+rather than saved as an enabled channel with no chat id.
+
+`slack_webhook_url`, `discord_webhook_url` and `webhook_url` must use the `http`
+or `https` scheme. `telegram_bot_token` must match `<digits>:<secret>` and
+`telegram_chat_id` must be a numeric id or an `@username`. Numeric fields are
+clamped to their supported ranges:
+`sample_size` `0`–`20` (sample of changed assets listed in a message),
+`timeout_seconds` `1`–`30` (per-delivery HTTP timeout), `retries` `0`–`5`
+(attempts within a single delivery).
+
+---
+
+### `POST /settings/notification-config/test`
+`ADMIN` · Send a test notification through one configured channel, using the
+stored credentials for it.
+
+**Body** `{ "channel": "slack" | "discord" | "webhook" | "telegram" }`
+**Response** `200` `{ "ok": <bool>, "message": "<str>" }`
+**Errors:** `422` unknown channel
+
+A delivery failure is reported as `"ok": false` with the reason in `message`; it
+is not returned as an HTTP error status.
+
+---
+
 ### `GET /settings/users`
 `ADMIN` · List all users.
 

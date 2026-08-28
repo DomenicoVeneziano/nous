@@ -44,6 +44,69 @@ export async function testProxyConfig(host: string, port: number): Promise<{ rea
   return data;
 }
 
+export interface NotificationConfig {
+  enabled: boolean;
+  on_success: boolean;
+  on_failure: boolean;
+  slack_enabled: boolean;
+  slack_webhook_url_set: boolean;
+  discord_enabled: boolean;
+  discord_webhook_url_set: boolean;
+  webhook_enabled: boolean;
+  webhook_url_set: boolean;
+  webhook_token_set: boolean;
+  telegram_enabled: boolean;
+  telegram_bot_token_set: boolean;
+  telegram_chat_id: string;
+  sample_size: number;
+  timeout_seconds: number;
+  retries: number;
+}
+
+export type NotificationSecretField =
+  | 'slack_webhook_url'
+  | 'discord_webhook_url'
+  | 'webhook_url'
+  | 'webhook_token'
+  | 'telegram_bot_token';
+
+export type NotificationChannel = 'slack' | 'discord' | 'webhook' | 'telegram';
+
+export interface NotificationConfigUpdate {
+  enabled?: boolean;
+  on_success?: boolean;
+  on_failure?: boolean;
+  slack_enabled?: boolean;
+  slack_webhook_url?: string;
+  discord_enabled?: boolean;
+  discord_webhook_url?: string;
+  webhook_enabled?: boolean;
+  webhook_url?: string;
+  webhook_token?: string;
+  telegram_enabled?: boolean;
+  telegram_bot_token?: string;
+  telegram_chat_id?: string;
+  sample_size?: number;
+  timeout_seconds?: number;
+  retries?: number;
+  clear_secrets?: NotificationSecretField[];
+}
+
+export async function fetchNotificationConfig(): Promise<NotificationConfig> {
+  const { data } = await client.get<NotificationConfig>('/settings/notification-config');
+  return data;
+}
+
+export async function updateNotificationConfig(payload: NotificationConfigUpdate): Promise<NotificationConfig> {
+  const { data } = await client.put<NotificationConfig>('/settings/notification-config', payload);
+  return data;
+}
+
+export async function testNotificationConfig(channel: NotificationChannel): Promise<{ ok: boolean; message: string }> {
+  const { data } = await client.post<{ ok: boolean; message: string }>('/settings/notification-config/test', { channel });
+  return data;
+}
+
 export async function fetchUsers(): Promise<User[]> {
   const { data } = await client.get<User[]>('/settings/users');
   return data;
