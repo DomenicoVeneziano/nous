@@ -162,12 +162,18 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
         maxWidth: 540, width: '90%',
         boxShadow: 'var(--shadow-elevated)',
         animation: 'fadeIn 150ms ease',
+        // The backdrop is fixed and does not scroll, so a card taller than the
+        // viewport would put its footer buttons out of reach. Capping the height
+        // short of both edges keeps the card on screen; as a column it still
+        // sizes to its content, and stays centred, whenever that fits.
+        display: 'flex', flexDirection: 'column', maxHeight: 'calc(100vh - 48px)',
         overflow: 'hidden', position: 'relative',
       }}>
         <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 1, background: 'linear-gradient(90deg, transparent, rgba(124,107,255,0.3), transparent)' }} />
         <div style={{
           padding: '18px 22px', borderBottom: '1px solid var(--border-subtle)',
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          flexShrink: 0,
         }}>
           <h3 style={{ color: 'var(--text-primary)', fontSize: 15, fontWeight: 600, margin: 0 }}>Edit Project</h3>
           {!confirmDelete ? (
@@ -193,7 +199,16 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
           )}
         </div>
 
-        <div style={{ padding: '20px 22px', display: 'flex', flexDirection: 'column', gap: 18 }}>
+        {/* The body is the only scrolling region, so the header and the footer
+            stay pinned. minHeight 0 is what makes the card's cap bite: a flex
+            child refuses to shrink below its content height without it, and the
+            body would push the card past the viewport again. Its own right
+            padding plus a stable gutter keeps the scrollbar off the fields and
+            stops the schedule toggle from shifting them sideways. */}
+        <div style={{
+          padding: '20px 22px', display: 'flex', flexDirection: 'column', gap: 18,
+          overflowY: 'auto', minHeight: 0, scrollbarGutter: 'stable',
+        }}>
           {error && (
             <div style={{
               background: 'var(--status-error-bg)', border: '1px solid var(--status-error-border)',
@@ -311,6 +326,7 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
         <div style={{
           padding: '14px 22px', borderTop: '1px solid var(--border-subtle)',
           display: 'flex', justifyContent: 'flex-end', gap: 8,
+          flexShrink: 0,
         }}>
           <button onClick={onClose} className="btn-secondary">Cancel</button>
           <button onClick={handleSave} disabled={saving || !scheduleValid} className="btn-primary">
