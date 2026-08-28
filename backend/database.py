@@ -210,6 +210,7 @@ def init_db():
     from models.scan import ScanJob
     from models.api_key import ApiKey
     from models.finding import Finding
+    from models.asset_change import AssetChange
     from models.vuln_pattern import VulnPattern
     from models.app_setting import AppSetting
 
@@ -295,6 +296,19 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS ix_projects_cycle_in_flight ON projects (schedule_cycle_started_at) "
         "WHERE schedule_cycle_job_ids IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS ix_scan_jobs_project_status ON scan_jobs (project_id, status)",
+        # Asset change history. create_all covers a fresh database; these cover
+        # one whose asset_changes table predates an index.
+        "CREATE TABLE IF NOT EXISTS asset_changes ("
+        " id VARCHAR NOT NULL PRIMARY KEY,"
+        " project_id VARCHAR NOT NULL,"
+        " asset_id VARCHAR NOT NULL,"
+        " scan_id VARCHAR,"
+        " field VARCHAR NOT NULL,"
+        " old_value VARCHAR,"
+        " new_value VARCHAR,"
+        " changed_at DATETIME NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS ix_asset_changes_asset_time ON asset_changes (asset_id, changed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_asset_changes_project_scan ON asset_changes (project_id, scan_id)",
     ):
         with engine.connect() as conn:
             try:

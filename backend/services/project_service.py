@@ -5,6 +5,7 @@ from models.project import Project
 from models.asset import Asset
 from models.scan import ScanJob
 from models.finding import Finding
+from models.asset_change import AssetChange
 from models.tag import SOURCE_SEED, Tag, asset_tags
 from schemas.project import ProjectCreate, ProjectUpdate
 from services import asset_service, schedule_service
@@ -234,6 +235,7 @@ def delete_project(db: Session, project_id: str) -> bool:
     if not project:
         return False
     db.query(Finding).filter(Finding.project_id == project_id).delete()
+    db.query(AssetChange).filter(AssetChange.project_id == project_id).delete()
     db.query(ScanJob).filter(ScanJob.project_id == project_id).delete()
     # Drop tag links before the assets they belong to: these are bulk deletes,
     # which bypass ORM cascades, and tags.project_id carries no foreign key of

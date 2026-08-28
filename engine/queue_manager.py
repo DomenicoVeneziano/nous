@@ -250,17 +250,234 @@ def is_in_scope(host: str, root_domains: list[str]) -> bool:
     return False
 
 
-def update_asset_record(session: Session, hostname: str, project_id: str, **fields):
-    """Update asset fields by hostname and project_id."""
+# Asset columns whose per-write delta is logged into asset_changes. Everything
+# else an engine write touches (date_scanned, screenshot_path, response_file_path,
+# crawled_urls) is bookkeeping about the scan rather than about the surface.
+# The scalars compare exactly; the set-valued pair compares as sets. Order is the
+# SELECT order — the snapshot is zipped against it positionally.
+_TRACKED_SCALARS = ("status_code", "title", "redirects_to", "content_length")
+_TRACKED_SETS = ("technologies", "dns_records")
+_TRACKED_COLUMNS = _TRACKED_SCALARS + _TRACKED_SETS
+
+# A body-size swing under this fraction of the previous size is dynamic noise —
+# rotating CSRF tokens, timestamps, ad slots — not an edit to the page.
+_CONTENT_LENGTH_MIN_RATIO = 0.10
+
+# Latches only once the asset_changes probe has SEEN the table. A missing table
+# is never cached: the race that matters is the table APPEARING, not vanishing.
+# On the first deploy of change tracking onto an existing database, wait_for_db
+# clears on the migration sentinel the previous build already wrote, so the
+# engine can start a job before the backend reaches CREATE TABLE asset_changes.
+# Latching that no would kill change tracking for the life of the process.
+_ASSET_CHANGES_READY = False
+
+
+def _asset_changes_ready(session: Session) -> bool:
+    """Whether the change log exists. Probed per write until it does, then cached.
+
+    migrations_complete() keys on the tagging sentinel, which every already-
+    upgraded database carries, so it proves nothing about a table added after it.
+    An INSERT into a missing table raises OperationalError and poisons the
+    session, which would roll back an asset UPDATE that had nothing wrong with
+    it — so ask sqlite_master and, when the answer is no, write exactly as the
+    engine did before the log existed.
+
+    A no costs one sqlite_master lookup per write until the backend creates the
+    table, at which point the answer latches and the cost goes away. Same
+    self-healing the retention sweep already has, which just retries next tick.
+    """
+    global _ASSET_CHANGES_READY
+    if not _ASSET_CHANGES_READY:
+        row = session.execute(text(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'asset_changes'"
+        )).fetchone()
+        _ASSET_CHANGES_READY = row is not None
+    return _ASSET_CHANGES_READY
+
+
+def _tech_set(raw) -> set:
+    """Technologies as a set. Compared as a set and not as text on purpose: the
+    fingerprinter's output order is not stable, and a reordered list is not a
+    change to the surface."""
+    parsed = _parse_json(raw, default=[])
+    if not isinstance(parsed, list):
+        return set()
+    return {t for t in parsed if isinstance(t, str)}
+
+
+def _dns_key_set(raw) -> set:
+    """DNS records flattened to a comparable set of "TYPE value" strings.
+
+    Recon stores records flat, but rows written by older scans wrap them per
+    resolver as [{resolver, records: [...]}]. Both shapes have to collapse to the
+    same set, or the first rescan of a pre-flat row reads as a total replacement
+    of every record it holds. Counterpart of
+    backend/routers/assets.py::_flatten_dns_records — change one only by changing
+    the other.
+    """
+    records = _parse_dns(raw)
+    if not isinstance(records, list):
+        return set()
+    keys = set()
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        inner = rec.get("records") if isinstance(rec.get("records"), list) else [rec]
+        for r in inner:
+            if isinstance(r, dict):
+                keys.add(f"{r.get('type')} {r.get('value')}")
+    return keys
+
+
+def _scalar_text(value) -> str | None:
+    """Scalar change values are stored as text; an unset side stays SQL NULL."""
+    return None if value is None else str(value)
+
+
+def _diff_asset_fields(before: dict, fields: dict) -> list:
+    """The change rows one write leaves behind, as (field, old_value, new_value).
+
+    `fields` must be the caller's own write, read BEFORE update_asset_record
+    injects its hostname/pid bind params: those two are not columns, and code
+    iterating the dict after the injection sees them as phantom ones.
+    """
+    status_written = "status_code" in fields
+    old_status = before.get("status_code")
+    new_status = fields["status_code"] if status_written else old_status
+    # 0 is the tech job's dead sentinel, so a write that crosses it in either
+    # direction IS the liveness event: the host went dead, or came back alive.
+    crosses_dead = status_written and (old_status == 0) != (new_status == 0)
+    # A body size only means something when the host was live on both sides and
+    # stayed that way. Across a liveness flip the size change is that flip.
+    length_comparable = (not status_written or old_status == new_status) and new_status != 0
+
+    changes = []
+    for field in _TRACKED_SCALARS:
+        if field not in fields:
+            continue
+        old, new = before.get(field), fields[field]
+        if old == new:
+            continue
+        if field == "title" and crosses_dead:
+            # On a liveness flip the title is only the DNS/TCP failure reason
+            # (or the page title displacing one), which restates the status_code
+            # row instead of adding anything to the timeline.
+            continue
+        if field == "content_length" and not (
+            length_comparable
+            # NULL on either side is not a shrink: the redirect path writes the
+            # length as None, and an asset scanned for the first time has none.
+            and old is not None and new is not None
+            and abs(new - old) >= _CONTENT_LENGTH_MIN_RATIO * max(old, 1)
+        ):
+            continue
+        changes.append((field, _scalar_text(old), _scalar_text(new)))
+
+    for field in _TRACKED_SETS:
+        if field not in fields:
+            continue
+        to_set = _dns_key_set if field == "dns_records" else _tech_set
+        old_set, new_set = to_set(before.get(field)), to_set(fields[field])
+        removed, added = sorted(old_set - new_set), sorted(new_set - old_set)
+        if not removed and not added:
+            continue
+        # A delta, not a before/after: old on the left holds what went away and
+        # new on the right what arrived, keeping the column roles the scalars use.
+        changes.append((field, json.dumps(removed), json.dumps(added)))
+
+    return changes
+
+
+def update_asset_record(
+    session: Session,
+    hostname: str,
+    project_id: str,
+    *,
+    scan_id: str | None = None,
+    **fields,
+):
+    """Update asset fields by hostname and project_id, logging what changed.
+
+    The UPDATE and the change rows share one transaction and one commit at the
+    end, so the log can never assert a transition the asset row did not take:
+    split across commits, a crash between them would leave exactly that. Nothing
+    in the diff is wrapped in try/except for the same reason — a failure has to
+    take the UPDATE down with it rather than half-apply.
+
+    The snapshot SELECT is NOT inside that transaction: get_engine() leaves
+    pysqlite's stock isolation in place, which opens the transaction lazily on
+    the first DML, so the read runs in autocommit ahead of it. The window is
+    between the snapshot and the UPDATE, and a backend asset edit landing inside
+    it makes one recorded old_value stale — one wrong row, nothing corrupted.
+    Not worth a BEGIN IMMEDIATE that would serialize every asset write.
+
+    Deliberately not a trigger on `assets`, even though the FTS mirror is one:
+    both sync_tags_text implementations issue a bare `UPDATE assets SET
+    tags_text = ...`, and a trigger would bill every tag edit as a surface change.
+    Same split as the is_new badge, which is derived rather than trigger-fed.
+
+    `scan_id` is keyword-only so it can never collide with a column name in
+    **fields; `assets` has no such column, and no caller writes one.
+    """
     if not fields:
         return
+
+    asset_id = None
+    before = None
+    # A write that touches no tracked column can only produce an empty diff, so
+    # it skips the lookup entirely rather than paying for a foregone conclusion.
+    if _asset_changes_ready(session) and not fields.keys().isdisjoint(_TRACKED_COLUMNS):
+        # One unique-index lookup on uq_assets_project_asset per asset already
+        # being written — the whole cost of the feature. id rides along because
+        # the change rows need asset_id, and fetching it separately would double
+        # that cost for nothing.
+        row = session.execute(text(
+            f"SELECT id, date_scanned, {', '.join(_TRACKED_COLUMNS)} FROM assets "
+            "WHERE asset = :h AND project_id = :pid"
+        ), {"h": hostname, "pid": project_id}).fetchone()
+        # date_scanned is a first-observation marker here, not a tracked field:
+        # NULL means this asset has never been through a tech analysis, so every
+        # tracked column still holds its insert default (NULL, or '[]' for the
+        # sets) and the diff would describe nothing but the asset's own
+        # discovery. Appearance is already answered by first_seen /
+        # first_seen_scan_id, so the first scan of a new asset logs nothing.
+        if row and row[1] is not None:
+            asset_id = row[0]
+            before = dict(zip(_TRACKED_COLUMNS, row[2:]))
+
+    # Computed before the injection below, while `fields` still holds columns only.
+    changes = _diff_asset_fields(before, fields) if before is not None else []
+
     set_clause = ", ".join(f"{k} = :{k}" for k in fields)
     fields["hostname"] = hostname
     fields["pid"] = project_id
+    # Run unconditionally even when the diff came back empty: date_scanned and
+    # the FTS reindex the UPDATE fires are the point of a rescan. Only the change
+    # rows are conditional, so an unchanged rescan logs nothing.
     session.execute(
         text(f"UPDATE assets SET {set_clause} WHERE asset = :hostname AND project_id = :pid"),
         fields,
     )
+
+    if changes:
+        # One statement, at most len(_TRACKED_COLUMNS) rows — far under SQLite's
+        # bound-parameter cap, so this needs no _ID_CHUNK batching.
+        now = utc_now_str()
+        values_sql = ", ".join(
+            f"(:id{i}, :pid, :aid, :sid, :f{i}, :o{i}, :n{i}, :ts)" for i in range(len(changes))
+        )
+        params = {"pid": project_id, "aid": asset_id, "sid": scan_id, "ts": now}
+        for i, (field, old_value, new_value) in enumerate(changes):
+            params[f"id{i}"] = str(uuid.uuid4())
+            params[f"f{i}"] = field
+            params[f"o{i}"] = old_value
+            params[f"n{i}"] = new_value
+        session.execute(text(
+            "INSERT INTO asset_changes "
+            "(id, project_id, asset_id, scan_id, field, old_value, new_value, changed_at) "
+            f"VALUES {values_sql}"
+        ), params)
+
     session.commit()
 
 

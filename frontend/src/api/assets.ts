@@ -1,6 +1,7 @@
 // frontend/src/api/assets.ts
 import client from './client';
 import type { Asset, AssetCreate, AssetUpdate } from '../types/asset';
+import type { AssetChangePage } from '../types/assetChange';
 
 export async function fetchAssets(projectId: string, limit = 500, offset = 0): Promise<Asset[]> {
   const { data } = await client.get<Asset[]>(`/projects/${projectId}/assets/`, {
@@ -69,6 +70,26 @@ export async function exportAsset(projectId: string, assetId: string, assetName:
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+/**
+ * Fetch one page of an asset's change history, newest first. `cursor` comes from
+ * the previous page's `next_cursor`; omit it for the first page.
+ *
+ * There is deliberately no fetch-all counterpart — an asset rescanned on a
+ * schedule accumulates changes without bound, so the history is only ever read
+ * one page at a time behind a load-more control.
+ */
+export async function fetchAssetChanges(
+  projectId: string,
+  assetId: string,
+  cursor?: string,
+  limit = 50,
+): Promise<AssetChangePage> {
+  const { data } = await client.get<AssetChangePage>(`/projects/${projectId}/assets/${assetId}/changes`, {
+    params: { limit, ...(cursor ? { cursor } : {}) },
+  });
+  return data;
 }
 
 export async function countAssets(projectId: string): Promise<number> {

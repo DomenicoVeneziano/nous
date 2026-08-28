@@ -216,7 +216,7 @@ async def _scan_batch(
             # data/screenshot so the asset faithfully reflects "redirects away".
             dest = entry["redirects_to"]
             update_asset_record(
-                session, hostname, project_id,
+                session, hostname, project_id, scan_id=job_id,
                 status_code=entry["status_code"],
                 title=None,
                 content_length=None,
@@ -276,7 +276,7 @@ async def _scan_batch(
                     # one an earlier pass legitimately captured.
                     pass
             update_asset_record(
-                session, hostname, project_id,
+                session, hostname, project_id, scan_id=job_id,
                 status_code=entry["status_code"],
                 title=entry["title"],
                 content_length=entry["content_length"],
@@ -305,7 +305,7 @@ async def _scan_batch(
                 continue
             reason = "TIMEOUT" if result.timed_out else "SCAN_ERROR"
             update_asset_record(
-                session, hostname, project_id,
+                session, hostname, project_id, scan_id=job_id,
                 status_code=0,
                 title=reason,
                 # Detach, but do NOT delete: run_script's timeout covers the
@@ -406,7 +406,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
         for asset in dead_assets:
             reason = asset.get("dns_fail_reason", "NO_RECORDS")
             update_asset_record(
-                session, asset["hostname"], project_id,
+                session, asset["hostname"], project_id, scan_id=job_id,
                 status_code=0,
                 title=reason,
                 dns_records=json.dumps(asset.get("dns_records") or []),
@@ -428,7 +428,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
         # Persist DNS records for live assets before tech analysis
         for asset in live_assets:
             update_asset_record(
-                session, asset["hostname"], project_id,
+                session, asset["hostname"], project_id, scan_id=job_id,
                 dns_records=json.dumps(asset["dns_records"]),
             )
 
@@ -473,7 +473,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
             else:
                 unreachable_assets.append(asset)
                 update_asset_record(
-                    session, asset["hostname"], project_id,
+                    session, asset["hostname"], project_id, scan_id=job_id,
                     status_code=0,
                     title="TCP_UNREACHABLE",
                     screenshot_path=None,  # detach only; the file is left alone

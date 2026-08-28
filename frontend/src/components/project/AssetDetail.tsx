@@ -7,6 +7,7 @@ import { updateAsset, deleteAsset, fetchImageObjectUrl, exportAsset } from '../.
 import client from '../../api/client';
 import { parseBackendDate } from '../../lib/datetime';
 import { useAuth } from '../../hooks/useAuth';
+import AssetHistory from './AssetHistory';
 import FindingsPanel from './FindingsPanel';
 import AssetTags from './AssetTags';
 
@@ -850,6 +851,11 @@ export default function AssetDetail({ asset, highlights, onClose, onAssetUpdated
           <ResponseFileView content={fileContent} spans={fileSpans} />
         </div>
       )}
+
+      {/* History */}
+      <div style={sectionStyle}>
+        <AssetHistory projectId={asset.project_id} assetId={asset.id} />
+      </div>
 
       {/* Findings */}
       <div style={{ paddingBottom: 8 }}>

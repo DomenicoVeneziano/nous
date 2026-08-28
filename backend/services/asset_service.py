@@ -5,6 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from models.asset import Asset
+from models.asset_change import AssetChange
 from models.tag import SOURCE_MANUAL
 from schemas.asset import AssetCreate, AssetUpdate, normalize_crawled_urls
 from services import tag_service
@@ -293,6 +294,11 @@ def delete_asset(db: Session, asset_id: str) -> bool:
     asset = get_asset(db, asset_id)
     if not asset:
         return False
+    # Drop the change history first: asset_changes carries no foreign key and no
+    # relationship on Asset, so nothing would reclaim these rows otherwise, and
+    # the history endpoint 404s once the asset is gone. Mirrors the purge in
+    # project_service.delete_project.
+    db.query(AssetChange).filter(AssetChange.asset_id == asset_id).delete()
     db.delete(asset)
     db.commit()
     return True

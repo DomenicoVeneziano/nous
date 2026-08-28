@@ -4,13 +4,16 @@ import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from database import get_db
 from auth.middleware import require_admin, require_viewer
+from models.asset_change import AssetChange
 from models.finding import Finding
 from models.tag import SOURCE_MANUAL
 from schemas.asset import AssetCreate, AssetUpdate, AssetOut, normalize_crawled_urls
+from schemas.asset_change import AssetChangePage
 from services import asset_service, project_service, tag_service
 from config import settings
 
@@ -160,6 +163,82 @@ def export_asset(project_id: str, asset_id: str, db: Session = Depends(get_db), 
         media_type="application/json",
         headers={"Content-Disposition": f'attachment; filename="{safe_name}.json"'},
     )
+
+
+# asset_changes.changed_at is a naive UTC DateTime, stored by SQLAlchemy as
+# "%Y-%m-%d %H:%M:%S.%f"; see database._TS_FORMAT. The cursor round-trips
+# through that exact shape, and the value parsed back out of it stays naive —
+# an offset-aware datetime sorts before every stored row and would silently
+# return an empty page.
+_TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+
+
+def _parse_change_cursor(cursor: str) -> tuple[datetime, str]:
+    """Split an opaque "<changed_at>|<id>" cursor into its keyset pair.
+
+    Anything that does not parse is a 422 rather than a silent reset to page
+    one: a caller paging through history would otherwise loop over the first
+    page forever without ever being told its cursor was wrong.
+    """
+    ts, sep, change_id = cursor.partition("|")
+    if not sep or not change_id:
+        raise HTTPException(422, "Malformed cursor")
+    try:
+        changed_at = datetime.strptime(ts, _TS_FORMAT)
+    except ValueError:
+        raise HTTPException(422, "Malformed cursor")
+    return changed_at, change_id
+
+
+@router.get("/{asset_id}/changes", response_model=AssetChangePage)
+def list_asset_changes(
+    project_id: str,
+    asset_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    cursor: str | None = Query(None),
+    db: Session = Depends(get_db),
+    _: dict = Depends(require_viewer),
+):
+    """Page one asset's change history, newest first.
+
+    Keyset, not offset: an asset accumulates a row per changed field per scan,
+    so the tail of a long history is where the reads land and an OFFSET would
+    make each page cost more than the last. The (changed_at, id) pair walks
+    ix_asset_changes_asset_time instead, and id breaks the tie between rows a
+    single scan wrote in the same microsecond.
+    """
+    asset = asset_service.get_asset(db, asset_id)
+    if not asset or asset.project_id != project_id:
+        raise HTTPException(404, "Asset not found")
+
+    q = db.query(AssetChange).filter(AssetChange.asset_id == asset_id)
+    if cursor is not None:
+        changed_at, change_id = _parse_change_cursor(cursor)
+        # The redundant <= is what lets SQLite bound the index range. Given the
+        # bare OR it can only seek on asset_id and then walk the asset's whole
+        # history for every page; with the bound in front it seeks straight to
+        # the cursor, so a page costs the same at the tail as at the head.
+        q = q.filter(
+            AssetChange.changed_at <= changed_at,
+            or_(
+                AssetChange.changed_at < changed_at,
+                and_(AssetChange.changed_at == changed_at, AssetChange.id < change_id),
+            ),
+        )
+    # One row past the page: enough to know whether a next page exists without
+    # counting the history.
+    rows = (
+        q.order_by(AssetChange.changed_at.desc(), AssetChange.id.desc())
+        .limit(limit + 1)
+        .all()
+    )
+
+    next_cursor = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        last = rows[-1]
+        next_cursor = f"{last.changed_at.strftime(_TS_FORMAT)}|{last.id}"
+    return {"items": rows, "next_cursor": next_cursor}
 
 
 # Per-asset metadata has no meaning for a range: one title or status code
