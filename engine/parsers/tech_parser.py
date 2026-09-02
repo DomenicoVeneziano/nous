@@ -8,6 +8,12 @@ _LINE_RE = re.compile(
     r'^\[([^\]]*)\]\[([^\]]*)\]\[([^\]]*)\]\[([^\]]*)\]\[([^\]]*)\](?:\[([^\]]*)\])?$'
 )
 
+# Matches: [shot][domain][ok|blank|error]
+# Screenshot markers carry three bracket groups, so they never match _LINE_RE.
+_SHOT_RE = re.compile(r'^\[shot\]\[([^\]]*)\]\[([^\]]*)\]$')
+
+_SHOT_VERDICTS = ("ok", "blank", "error")
+
 
 def parse_tech_output(summary_log_content: str) -> list[dict]:
     """
@@ -60,3 +66,31 @@ def parse_tech_output(summary_log_content: str) -> list[dict]:
         })
 
     return results
+
+
+def parse_screenshot_markers(content: str) -> dict[str, str]:
+    """
+    Parse screenshot verdict markers out of the tech_analysis.py summary log.
+    Input:  content of summary.log file
+    Output: dict mapping domain -> "ok" | "blank" | "error"
+    Repeated domains keep the last verdict seen; unknown verdicts are dropped.
+    """
+    verdicts: dict[str, str] = {}
+
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        match = _SHOT_RE.match(line)
+        if not match:
+            continue
+
+        domain = match.group(1).strip()
+        verdict = match.group(2).strip().lower()
+        if not domain or verdict not in _SHOT_VERDICTS:
+            continue
+
+        verdicts[domain] = verdict
+
+    return verdicts

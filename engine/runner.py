@@ -12,6 +12,13 @@ import re
 
 # Strict domain validation — prevents command injection
 DOMAIN_RE = re.compile(r'^[a-zA-Z0-9._\-]+$')
+# Marker a script prefixes to lines meant for the job log only. Diagnostics are
+# per-host and high volume: streaming them would drown the live scan UI, and
+# accumulating them would grow the returned stdout for no consumer, so they are
+# written to the log file and dropped here. scripts/tech_analysis.py repeats the
+# same literal deliberately — scripts/ is not importable from the engine's import
+# root, so the two copies must be kept in sync by hand.
+DIAG_PREFIX = "[diag] "
 GRACEFUL_SHUTDOWN_TIMEOUT = int(os.environ.get("GRACEFUL_SHUTDOWN_TIMEOUT", "5"))
 # Grace given to processes that escaped the group kill before they are forced.
 ESCAPEE_SHUTDOWN_TIMEOUT = float(os.environ.get("ESCAPEE_SHUTDOWN_TIMEOUT", "2"))
@@ -191,6 +198,12 @@ async def run_script(
             assert proc.stdout is not None
             async for raw_line in proc.stdout:
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                if line.startswith(DIAG_PREFIX):
+                    # Log-only: never accumulated, never broadcast.
+                    if log_file:
+                        log_file.write(f"[DIAG] {line}\n")
+                        log_file.flush()
+                    continue
                 stdout_lines.append(line)
                 if log_file:
                     log_file.write(f"[STDOUT] {line}\n")

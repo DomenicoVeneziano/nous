@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from runner import run_script, validate_path_within
-from parsers.tech_parser import parse_tech_output
+from parsers.tech_parser import parse_tech_output, parse_screenshot_markers
 from dns_precheck import dns_precheck
 from sqlalchemy import text
 from queue_manager import (
@@ -196,12 +196,18 @@ async def _scan_batch(
         os.unlink(tmp_path)
 
     parsed = []
+    # Screenshot verdicts ride along in the SAME text as the result lines, so
+    # they cost no extra read and no second pass over disk. They exist only to
+    # explain a missing image to the user; nothing is written from them.
+    markers: dict[str, str] = {}
     if batch_summary.is_file():
         log_content = batch_summary.read_text(encoding="utf-8", errors="replace")
         parsed = parse_tech_output(log_content)
+        markers = parse_screenshot_markers(log_content)
         batch_summary.unlink(missing_ok=True)
     elif result.stdout:
         parsed = parse_tech_output(result.stdout)
+        markers = parse_screenshot_markers(result.stdout)
 
     parsed_by_domain = {entry["domain"]: entry for entry in parsed}
 
@@ -215,9 +221,17 @@ async def _scan_batch(
             # destination host), not the destination page. Clear any stale page
             # data/screenshot so the asset faithfully reflects "redirects away".
             dest = entry["redirects_to"]
+            # A row that names a redirect destination must carry a redirect
+            # status or none at all. The script has been seen reporting the
+            # DESTINATION page's 200 here, which reads as "this host serves a
+            # page" and hides the hop; drop anything outside 3xx rather than
+            # publish a status the row's own redirects_to contradicts.
+            redirect_status = entry["status_code"]
+            if not (isinstance(redirect_status, int) and 300 <= redirect_status < 400):
+                redirect_status = None
             update_asset_record(
                 session, hostname, project_id, scan_id=job_id,
-                status_code=entry["status_code"],
+                status_code=redirect_status,
                 title=None,
                 content_length=None,
                 technologies=json.dumps([]),
@@ -237,12 +251,12 @@ async def _scan_batch(
                 await ws_broadcast("asset_update", {
                     "job_id": job_id,
                     "domain": hostname,
-                    "status_code": entry["status_code"],
+                    "status_code": redirect_status,
                     "title": None,
                     "technologies": [],
                     "redirects_to": dest,
                 })
-            outcomes[hostname] = ("redirect", entry["status_code"])
+            outcomes[hostname] = ("redirect", redirect_status)
         elif entry:
             extra_fields = {}
             if screenshots_dir is not None:
@@ -267,7 +281,26 @@ async def _scan_batch(
                     _remove_screenshot(screenshots_dir, safe_domain)
                     extra_fields["screenshot_path"] = None
                     if line_broadcast:
-                        await line_broadcast(f"[!] Screenshot capture failed for {hostname} (continuing)")
+                        # A blank render, a capture error and a host the script
+                        # never reached are three different problems with three
+                        # different fixes; one shared sentence sent the user
+                        # looking in the wrong place. The "ok" case should be
+                        # unreachable — the script claims a capture the mtime
+                        # test denies — so it reports the disagreement instead
+                        # of asserting a cause nothing here can support.
+                        verdict = markers.get(hostname)
+                        if verdict == "blank":
+                            await line_broadcast(
+                                f"[!] Page rendered blank for {hostname} - screenshot discarded (continuing)")
+                        elif verdict == "error":
+                            await line_broadcast(
+                                f"[!] Screenshot capture error for {hostname} - see scan log (continuing)")
+                        elif verdict == "ok":
+                            await line_broadcast(
+                                f"[!] Screenshot for {hostname} could not be attributed to this run (continuing)")
+                        else:
+                            await line_broadcast(
+                                f"[!] No screenshot attempted for {hostname} (continuing)")
                 else:
                     # Retry pass, no fresh capture: screenshot handling here is
                     # additive-only. Omit screenshot_path from the update

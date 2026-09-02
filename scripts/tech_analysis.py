@@ -24,6 +24,11 @@ import warnings
 warnings.filterwarnings("ignore")
 sys.stderr = open(os.devnull, 'w')
 
+# Imported below the block above so its line numbering stays exactly as
+# documented. Both back _png_is_uniform: PNG chunk headers and raw inflate.
+import struct
+import zlib
+
 from camoufox import AsyncNewBrowser
 from typing_extensions import override
 from crawlee.browsers import (
@@ -33,6 +38,33 @@ from crawlee.browsers import (
 )
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 from crawlee.storage_clients import MemoryStorageClient
+
+
+# Marker prefixed to lines meant for the batch log only. engine/runner.py holds
+# the same literal and routes matching lines away from the live scan UI and out
+# of ScriptResult.stdout; scripts/ is not importable from the engine's import
+# root, so the two copies must be kept in sync by hand. The trailing space is
+# part of the prefix.
+DIAG_PREFIX = "[diag] "
+
+
+def diag(event: str, **kv) -> None:
+    """Emit one diagnostic line: `[diag] <event> key=value ...`.
+
+    stderr is /dev/null for the reasons documented at the top of this file, so
+    this is the only sanctioned channel for anything the operator needs to see.
+    Fields are never bracket-delimited, so a diagnostic can never be mistaken for
+    a result line by the parser's 5-6 group regex. Values are stripped of line
+    breaks and truncated so one runaway string cannot flood the log."""
+    try:
+        parts = [f"{DIAG_PREFIX}{event}"]
+        for k, v in kv.items():
+            text = str(v).replace('\r', ' ').replace('\n', ' ')
+            parts.append(f"{k}={text[:200]}")
+        sys.__stdout__.write(" ".join(parts) + "\n")
+        sys.__stdout__.flush()
+    except Exception:
+        pass
 
 
 class WappalyzerEngine:
@@ -223,6 +255,243 @@ def build_proxy_options(proxy_url: str | None) -> dict | None:
     return opts
 
 
+# Ceilings for _png_is_uniform, all fixed rather than derived from the frame
+# being examined. A viewport capture is far below them; anything larger is
+# abstained on rather than decoded.
+_PNG_MAX_DIMENSION = 20_000
+_PNG_MAX_PIXELS = 64_000_000
+_INFLATE_CHUNK_MAX = 1 << 20
+
+
+def _png_is_uniform(png: bytes) -> bool | None:
+    """True if every pixel of the frame is the same colour, False if any pixel
+    provably differs, None if the frame cannot be decoded confidently.
+
+    No image library exists in the engine image, so this reads the PNG directly.
+    It never unfilters pixel by pixel in Python — orders of magnitude too slow to
+    run per host. Instead it works forward by induction: filtering is a bijection
+    once the row above is known, so given a previous row that is uniformly `ref`,
+    a row encodes to exactly one byte sequence if it too is uniformly `ref`.
+    Each row is compared against that sequence, built from the filter's real
+    predictor (left / up / average / Paeth). Equality is a memcmp at C speed, and
+    the first row that differs returns False immediately — that early exit is
+    what keeps real content cheap.
+
+    Shortcuts that look equivalent are not, and a wrong True deletes a good
+    capture. A zero residual does not mean the pixel equals its neighbour under
+    Average or Paeth, so a one-pixel vertical stripe would pass a zero-residual
+    test; a solid row proves nothing about the rows around it, so bands of
+    differing solid colours would pass a row-local test; and the row above row 0
+    is the spec's virtual all-zero row, not `ref`, so a genuinely uniform frame
+    filtered with Up or Average carries non-zero residuals there.
+
+    Scanlines are pulled through the decompressor one at a time, and every bound
+    is fixed rather than derived from the IHDR: implausible dimensions are
+    rejected before any decoding, and a single inflate call is capped at
+    _INFLATE_CHUNK_MAX bytes. Peak working set is therefore about one row plus
+    that cap for ANY input, not just an honest one — a header claiming huge
+    dimensions could otherwise make the per-call ceiling enormous and balloon the
+    buffer to hundreds of MB before the raster-size limit tripped."""
+
+    def _paeth(a: int, b: int, c: int) -> int:
+        p = a + b - c
+        pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+        if pa <= pb and pa <= pc:
+            return a
+        return b if pb <= pc else c
+
+    def _filtered_uniform_row(ft: int, value: bytes, up: bytes) -> bytes:
+        """The one byte sequence a row uniformly `value` encodes to under filter
+        `ft`, above a row uniformly `up`. The leading pixel differs from the rest
+        because its left and upper-left neighbours are outside the image and read
+        as zero."""
+        lead = bytearray(bpp)
+        rest = bytearray(bpp)
+        for i in range(bpp):
+            v, u = value[i], up[i]
+            if ft == 0:
+                lead[i] = rest[i] = v
+            elif ft == 1:
+                lead[i] = v          # left neighbour is 0 at the edge
+                rest[i] = 0          # and `v` everywhere else
+            elif ft == 2:
+                lead[i] = rest[i] = (v - u) & 0xFF
+            elif ft == 3:
+                lead[i] = (v - ((0 + u) >> 1)) & 0xFF
+                rest[i] = (v - ((v + u) >> 1)) & 0xFF
+            else:
+                lead[i] = (v - _paeth(0, u, 0)) & 0xFF
+                rest[i] = (v - _paeth(v, u, u)) & 0xFF
+        return bytes(lead) + bytes(rest) * (width - 1)
+
+    def _iter_rows(views, row_size, limit):
+        """Yield exactly `row_size`-byte scanlines (filter byte included) from the
+        concatenated IDAT payloads, bounded output at every step."""
+        dec = zlib.decompressobj()
+        buf = bytearray()
+        produced = 0
+        # Enough to keep whole rows flowing, never more than a fixed ceiling: the
+        # per-call limit must not scale with anything the file itself declares.
+        chunk_max = min(row_size * 2, _INFLATE_CHUNK_MAX)
+        for view in views:
+            chunk = view
+            while True:
+                out = dec.decompress(chunk, chunk_max)
+                chunk = dec.unconsumed_tail
+                if out:
+                    produced += len(out)
+                    if produced > limit:
+                        raise ValueError("raster larger than its own header claims")
+                    buf += out
+                    while len(buf) >= row_size:
+                        yield bytes(buf[:row_size])
+                        del buf[:row_size]
+                if not chunk:
+                    break
+        out = dec.flush()
+        if out:
+            produced += len(out)
+            if produced > limit:
+                raise ValueError("raster larger than its own header claims")
+            buf += out
+            while len(buf) >= row_size:
+                yield bytes(buf[:row_size])
+                del buf[:row_size]
+
+    try:
+        if len(png) < 8 or png[:8] != b'\x89PNG\r\n\x1a\n':
+            return None
+        view = memoryview(png)
+        pos = 8
+        width = height = bit_depth = color_type = None
+        compression = filter_method = interlace = None
+        idat: list[memoryview] = []
+        while pos + 8 <= len(png):
+            (length,) = struct.unpack('>I', png[pos:pos + 4])
+            ctype = png[pos + 4:pos + 8]
+            data_end = pos + 8 + length
+            if data_end > len(png):
+                return None
+            if ctype == b'IHDR':
+                if length < 13:
+                    return None
+                (width, height, bit_depth, color_type,
+                 compression, filter_method, interlace) = struct.unpack(
+                    '>IIBBBBB', png[pos + 8:pos + 21])
+            elif ctype == b'IDAT':
+                # A frame is normally split across several IDATs; keep views, not
+                # copies, so nothing is duplicated in memory.
+                idat.append(view[pos + 8:data_end])
+            elif ctype == b'IEND':
+                break
+            pos = data_end + 4  # skip the chunk CRC
+
+        if not idat or width is None or not width or not height:
+            return None
+        # Guard the allocation before decoding anything: both dimensions are
+        # attacker-controlled, and every buffer below is sized from them. A real
+        # viewport capture is orders of magnitude under these ceilings, so an
+        # image that exceeds one is not a frame this decides on.
+        if (width > _PNG_MAX_DIMENSION or height > _PNG_MAX_DIMENSION
+                or width * height > _PNG_MAX_PIXELS):
+            return None
+        # Only the two truecolour forms camoufox actually produces are decoded.
+        # Palette, greyscale, 16-bit and Adam7 frames are left undecided rather
+        # than guessed at — a wrong True deletes a good screenshot.
+        if (bit_depth != 8 or color_type not in (2, 6)
+                or interlace != 0 or compression != 0 or filter_method != 0):
+            return None
+
+        bpp = 3 if color_type == 2 else 4
+        stride = width * bpp
+        row_size = stride + 1
+
+        ref = None              # the one colour the whole frame must be
+        prev_val = bytes(bpp)   # the PNG spec's virtual all-zero row above row 0
+        rows = 0
+        # Only two distinct previous-row values ever occur (the virtual zero row,
+        # then `ref`), so the expected encodings are built at most twice per
+        # filter type instead of once per row.
+        expected: dict[int, bytes] = {}
+        for line in _iter_rows(idat, row_size, row_size * height):
+            if rows >= height:
+                break
+            ft = line[0]
+            if ft > 4:
+                return None  # not a filter type this format defines
+            data = line[1:]
+            if ref is None:
+                # Every predictor reads zero at the top-left corner, so the first
+                # row's leading residual is the pixel value itself.
+                ref = data[:bpp]
+            if rows == 1:
+                expected.clear()  # the row above is `ref` from here on
+            exp = expected.get(ft)
+            if exp is None:
+                exp = _filtered_uniform_row(ft, ref, prev_val)
+                expected[ft] = exp
+            if data != exp:
+                return False
+            prev_val = ref
+            rows += 1
+
+        if rows != height:
+            return None  # truncated raster: no verdict
+        return True
+    except Exception:
+        # Malformed or unexpected input is undecided, never an exception: this
+        # runs on the screenshot path, which must never abort an asset.
+        return None
+
+
+def _png_dimensions(png: bytes) -> tuple[int, int] | None:
+    """Width and height straight from the PNG header, or None if it cannot be
+    read.
+
+    The captured frame is the authoritative source for these: camoufox drives a
+    real window rather than an explicitly set viewport, so
+    `page.viewport_size` is None in exactly the configuration production runs
+    in, and the frame is in any case the thing the blank verdict actually judged.
+    Frame dimensions are the calibration signal for anything viewport-related —
+    the discarded byte threshold failed precisely because nobody could see them
+    varying — so this reads IHDR and nothing else: no inflate, no scanlines, a
+    few bytes on the blank path only."""
+    try:
+        if len(png) < 8 or png[:8] != b'\x89PNG\r\n\x1a\n':
+            return None
+        pos = 8
+        while pos + 8 <= len(png):
+            (length,) = struct.unpack('>I', png[pos:pos + 4])
+            if png[pos + 4:pos + 8] == b'IHDR':
+                if length < 8 or pos + 16 > len(png):
+                    return None
+                width, height = struct.unpack('>II', png[pos + 8:pos + 16])
+                return (width, height) if width and height else None
+            pos += 12 + length  # length + type + data + crc
+        return None
+    except Exception:
+        return None
+
+
+def _redirect_from_records(records, requested_host) -> tuple[int, str] | None:
+    """First recorded 3xx whose Location resolves to a host other than
+    `requested_host`, as (status, destination host), or None.
+
+    The failed-request handler and the in-handler redirect branch need the same
+    verdict from the same recorded chain, so there is one implementation."""
+    for rec in records or []:
+        try:
+            if not (300 <= rec['status'] < 400) or not rec['location']:
+                continue
+            # Location may be relative; resolve it against the hop it came from.
+            dest_host = urlparse(urljoin(rec['url'], rec['location'])).hostname
+            if dest_host and requested_host and dest_host != requested_host:
+                return rec['status'], dest_host
+        except Exception:
+            continue
+    return None
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Camoufox Tech Fingerprinter")
     parser.add_argument('urls', nargs='*', help="List of URLs or a text file containing URLs")
@@ -295,12 +564,15 @@ async def main() -> None:
     handler_margin_s = min(1.0, nav_timeout / 10)
     # Budget for the post-load settle ladder, and what is held back from it for
     # the capture call itself.
-    settle_budget_s = 8.0
+    settle_budget_s = 12.0
     shot_reserve_s = min(5.0, nav_timeout / 6)
-    # A viewport-sized solid-colour frame encodes to a couple of KB; anything
-    # above this is assumed to carry real pixels. Deliberately conservative —
-    # the in-page content assertion is the primary blank signal.
-    blank_png_max_bytes = 8192
+    # Held back from the settle budget for the in-page content assertion. The
+    # ladder could otherwise spend the whole budget and leave the assertion no
+    # time to run at all, so blankness was decided by budget exhaustion rather
+    # than by evidence. Worst case stays inside the handler: ladder 8s +
+    # assertion 4s + shot_reserve_s 5s, against a 30s nav_timeout that has
+    # already navigated.
+    content_reserve_s = 4.0
 
     browser_launch_options = {"proxy": proxy_options} if proxy_options else {}
     crawler = PlaywrightCrawler(
@@ -331,18 +603,39 @@ async def main() -> None:
     # Request keys that already produced a line, so the normal and the failure
     # path can never both emit for the same host.
     emitted: set[str] = set()
+    # Contracted markers already written, keyed (request key, kind). Deliberately
+    # a separate set from `emitted`: that one guards the one-result-line-per-host
+    # invariant, and a marker sharing it would consume the host's single allowed
+    # result line.
+    marked: set[tuple[str, str]] = set()
 
-    def emit_line(request_key: str, line: str) -> None:
-        """Write one result line to -o (or stdout), at most once per request."""
-        if request_key in emitted:
-            return
-        emitted.add(request_key)
+    def _write_out(line: str) -> None:
         if args.output:
             with open(args.output, 'a', encoding='utf-8') as f:
                 f.write(line + '\n')
         else:
             sys.__stdout__.write(line + '\n')
             sys.__stdout__.flush()
+
+    def emit_line(request_key: str, line: str) -> None:
+        """Write one result line to -o (or stdout), at most once per request."""
+        if request_key in emitted:
+            return
+        emitted.add(request_key)
+        _write_out(line)
+        # Mirror it into the batch log so that stays self-contained after the
+        # engine unlinks the summary file.
+        diag("result", line=line)
+
+    def emit_marker(request_key: str, kind: str, line: str) -> None:
+        """Write one contracted marker per request per kind, alongside the
+        result lines. Markers carry three bracket groups, so the parser's
+        result-line regex never matches them."""
+        marker_key = (request_key, kind)
+        if marker_key in marked:
+            return
+        marked.add(marker_key)
+        _write_out(line)
 
     @crawler.pre_navigation_hook
     async def record_navigation(context) -> None:
@@ -375,6 +668,7 @@ async def main() -> None:
                 detach()
                 nav_records.pop(key, None)
                 emitted.discard(key)
+                marked.discard((key, "shot"))
 
             context.register_deferred_cleanup(_cleanup)
         except Exception:
@@ -398,14 +692,14 @@ async def main() -> None:
             requested_url = context.request.url
             requested_host = urlparse(requested_url).hostname
             domain = urlparse(requested_url).netloc
-            for rec in nav_records.get(key) or []:
-                if not (300 <= rec['status'] < 400) or not rec['location']:
-                    continue
-                # Location may be relative; resolve it against the hop it came from.
-                dest_host = urlparse(urljoin(rec['url'], rec['location'])).hostname
-                if dest_host and requested_host and dest_host != requested_host:
-                    emit_line(key, f"[{domain}][{rec['status']}][][][][{dest_host}]")
-                    return
+            hit = _redirect_from_records(nav_records.get(key), requested_host)
+            if hit is not None:
+                status, dest_host = hit
+                emit_line(key, f"[{domain}][{status}][][][][{dest_host}]")
+                return
+            # Nothing redirect-shaped to report: the host itself did not answer.
+            # TLS handshake failures used to vanish here without a trace.
+            diag("nav-failed", domain=domain, err=f"{type(error).__name__}: {error}")
         except Exception:
             pass
 
@@ -507,11 +801,28 @@ async def main() -> None:
             req_host = urlparse(url).hostname
             final_host = urlparse(context.page.url).hostname
             if final_host and req_host and final_host != req_host:
+                # Every rung of this ladder is substantiated by a 3xx that
+                # points at THIS hop's destination. There is deliberately no
+                # fallback to status_code: that is the DESTINATION page's status,
+                # so the asset would be stored as the 200 of the page it landed
+                # on. Nor is there a rung taking any 3xx in the chain: a host
+                # that redirects to itself and only then leaves via a client-side
+                # location assignment would have its own same-host 301 credited
+                # to the cross-host hop. When no cross-host 3xx exists the hop
+                # was client-side (a location assignment or a meta refresh) and
+                # the honest answer is an empty status, which the parser turns
+                # into None and the engine writes as NULL.
+                key = context.request.unique_key
                 redirect_status = await _initial_redirect_status(response)
                 if redirect_status is None:
-                    redirect_status = status_code
-                out_str = f"[{domain}][{redirect_status}][][][][{final_host}]"
-                emit_line(context.request.unique_key, out_str)
+                    hit = _redirect_from_records(nav_records.get(key), req_host)
+                    if hit is not None:
+                        redirect_status = hit[0]
+                if redirect_status is None:
+                    diag("redirect-status-unknown", domain=domain, dest=final_host)
+                status_field = '' if redirect_status is None else redirect_status
+                out_str = f"[{domain}][{status_field}][][][][{final_host}]"
+                emit_line(key, out_str)
                 return  # no tech extraction, dump, or screenshot for redirects
 
             title = await context.page.title()
@@ -562,19 +873,23 @@ async def main() -> None:
                     # what is left of the handler deadline after reserving
                     # shot_reserve_s for the capture itself — so the ladder can
                     # never eat request_handler_timeout and cost this asset its
-                    # already-emitted line's screenshot. Each step is swallowed:
-                    # a step that times out just means the next one runs with
-                    # less budget.
-                    settle_deadline = min(
-                        time.monotonic() + settle_budget_s,
-                        deadline - shot_reserve_s,
+                    # already-emitted line's screenshot. content_reserve_s is held
+                    # back on top of that: the ladder could otherwise spend the
+                    # whole settle budget and leave the content assertion below
+                    # unable to run even once, making blankness a verdict of
+                    # budget exhaustion rather than of evidence. Each step is
+                    # swallowed: a step that times out just means the next one
+                    # runs with less budget.
+                    ladder_deadline = min(
+                        time.monotonic() + settle_budget_s - content_reserve_s,
+                        deadline - shot_reserve_s - content_reserve_s,
                     )
 
-                    def settle_left(cap: float) -> float:
-                        return max(0.0, min(cap, settle_deadline - time.monotonic()))
+                    def ladder_left(cap: float) -> float:
+                        return max(0.0, min(cap, ladder_deadline - time.monotonic()))
 
                     for state, cap in (('domcontentloaded', 3.0), ('networkidle', 5.0)):
-                        left = settle_left(cap)
+                        left = ladder_left(cap)
                         if left <= 0:
                             break
                         try:
@@ -583,20 +898,32 @@ async def main() -> None:
                             pass  # proceed with whatever has rendered so far
 
                     # Assert real rendered content rather than trusting load
-                    # events: bot-manager interstitials return a genuine 200 whose
-                    # body is a white challenge page that then calls
-                    # location.reload(). That reload destroys the execution
-                    # context underneath the wait, so a raised error gets one more
-                    # attempt against the reloaded page while budget remains.
+                    # events: an unhydrated SPA shell (<app-root></app-root>, an
+                    # empty #root) and a bot-manager interstitial both answer 200
+                    # over a body with nothing painted in it. The assertion gets
+                    # its OWN deadline, computed here rather than shared with the
+                    # ladder, so a ladder that ran long cannot zero it. The
+                    # interstitial calls location.reload(), which destroys the
+                    # execution context underneath the wait, so a raised error
+                    # gets one more attempt against the reloaded page while budget
+                    # remains.
+                    content_deadline = min(
+                        time.monotonic() + content_reserve_s,
+                        deadline - shot_reserve_s,
+                    )
+
+                    def content_left(cap: float) -> float:
+                        return max(0.0, min(cap, content_deadline - time.monotonic()))
+
                     content_ok = False
                     for _ in range(2):
-                        left = settle_left(3.0)
+                        left = content_left(3.0)
                         if left <= 0:
                             break
                         try:
                             await context.page.wait_for_function(
                                 "document.body && (document.body.innerText.trim().length > 0 "
-                                "|| document.querySelector('img,svg,canvas,video'))",
+                                "|| document.querySelector('img,svg,canvas,video,input,button,iframe'))",
                                 timeout=int(left * 1000),
                             )
                             content_ok = True
@@ -604,34 +931,120 @@ async def main() -> None:
                         except Exception:
                             continue
 
+                    # Only when the cheap polled predicate has given up: one
+                    # evaluate that also looks for CSS background imagery, which
+                    # a page can be painted entirely with. It doubles as the DOM
+                    # snapshot the blank diagnostic reports, and every field is
+                    # read under its own guard so one unreadable value never
+                    # costs the others.
+                    #
+                    # Page.evaluate takes no timeout of its own and is not
+                    # governed by the default action timeout: it blocks until the
+                    # page's execution context answers, and the pages that reach
+                    # here are exactly the ones whose main thread is busy. The
+                    # bound has to be imposed from outside, or this one await
+                    # escapes the handler deadline and crawlee cancels the
+                    # request — a cancel skips the except below, so the host
+                    # would lose its screenshot AND its marker.
+                    dom_info = {}
+                    ev_budget = min(2.0, remaining_s(shot_reserve_s))
+                    if not content_ok and ev_budget > 0:
+                        try:
+                            dom_info = await asyncio.wait_for(
+                                context.page.evaluate("""() => {
+                                    const out = {};
+                                    try {
+                                        out.bg = Array.from(document.querySelectorAll('body *'))
+                                            .slice(0, 300)
+                                            .some(el => {
+                                                const b = getComputedStyle(el).backgroundImage;
+                                                return b && b !== 'none';
+                                            });
+                                    } catch (e) {}
+                                    try { out.body_len = document.body ? document.body.innerText.trim().length : -1; } catch (e) {}
+                                    try { out.nodes = document.getElementsByTagName('*').length; } catch (e) {}
+                                    try { out.ready = document.readyState; } catch (e) {}
+                                    try { out.url = location.href; } catch (e) {}
+                                    return out;
+                                }"""),
+                                timeout=ev_budget,
+                            ) or {}
+                        except Exception:
+                            # Including the timeout: losing the background-image
+                            # promotion in that tail is far cheaper than losing
+                            # the handler.
+                            dom_info = {}
+
+                    if dom_info.get('bg'):
+                        content_ok = True
+
                     # Capture to a buffer so a blank frame can be rejected before
-                    # it reaches disk. No image library is available in the engine
-                    # image, so blankness is inferred from the in-page assertion
-                    # above (primary) plus an encoded-size floor: a solid-colour
-                    # viewport compresses to a couple of KB.
+                    # it reaches disk. There is deliberately no size threshold in
+                    # the verdict: measured across camoufox's randomised
+                    # viewports, solid-colour frames encode to 5–16 KB while real
+                    # content can encode smaller, so the two distributions overlap
+                    # and no byte floor can separate them. The frame's own pixels
+                    # decide instead, with the DOM assertion catching the
+                    # near-blank shell that painted a single header bar.
                     shot_budget_ms = int(remaining_s() * 1000)
                     if shot_budget_ms <= 0:
                         raise TimeoutError("handler budget exhausted before capture")
                     png = await context.page.screenshot(
                         full_page=False, timeout=shot_budget_ms
                     )
-                    if not content_ok and len(png) < blank_png_max_bytes:
+                    # A provably single-colour frame is worthless whatever the DOM
+                    # claimed — it means the capture caught the page mid-paint or
+                    # behind an unpainted layer, so pixels win. An undecodable
+                    # frame leaves the assertion as the only signal.
+                    uniform = _png_is_uniform(png)
+                    if uniform is True or not content_ok:
+                        # Removing any previous image is what lets the engine's
+                        # mtime freshness test see "no image from this run".
                         try:
                             os.unlink(shot_path)
                         except OSError:
                             pass
-                        sys.__stdout__.write(f"[screenshot-blank][{domain}]\n")
-                        sys.__stdout__.flush()
+                        size = _png_dimensions(png)
+                        frame = f"{size[0]}x{size[1]}" if size else ''
+                        diag(
+                            "screenshot-blank",
+                            domain=domain,
+                            # Reported for observability only; no branch reads it.
+                            bytes=len(png),
+                            frame=frame,
+                            content_ok=1 if content_ok else 0,
+                            uniform='unknown' if uniform is None else (1 if uniform else 0),
+                            # The signals disagreeing is a population worth
+                            # watching, so it is flagged rather than inferred.
+                            disagree=1 if (uniform is True and content_ok) else 0,
+                            body_len=dom_info.get('body_len', ''),
+                            nodes=dom_info.get('nodes', ''),
+                            ready=dom_info.get('ready', ''),
+                            url=dom_info.get('url', ''),
+                        )
+                        emit_marker(context.request.unique_key, "shot", f"[shot][{domain}][blank]")
                     else:
                         with open(shot_path, 'wb') as sf:
                             sf.write(png)
+                        emit_marker(context.request.unique_key, "shot", f"[shot][{domain}][ok]")
                 except Exception as se:
-                    sys.__stdout__.write(f"[screenshot-error][{domain}] {se}\n")
-                    sys.__stdout__.flush()
+                    diag("screenshot-error", domain=domain, err=f"{type(se).__name__}: {se}")
+                    emit_marker(context.request.unique_key, "shot", f"[shot][{domain}][error]")
 
-        except Exception:
-            # Complete suppression of any runtime or handling errors
-            pass
+        except Exception as e:
+            # Still a complete swallow: one asset failing mid-handler must never
+            # take the rest of the batch with it. It only stops being silent.
+            # `domain` is unbound if the failure preceded its assignment, so fall
+            # back to the requested URL.
+            failed_domain = ''
+            try:
+                failed_domain = domain
+            except NameError:
+                try:
+                    failed_domain = context.request.url
+                except Exception:
+                    pass
+            diag("handler-error", domain=failed_domain, err=f"{type(e).__name__}: {e}")
 
     await crawler.run(target_urls)
 
