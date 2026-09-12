@@ -31,6 +31,7 @@ import zlib
 
 from camoufox import AsyncNewBrowser
 from typing_extensions import override
+from crawlee import ConcurrencySettings
 from crawlee.browsers import (
     BrowserPool,
     PlaywrightBrowserController,
@@ -46,6 +47,29 @@ from crawlee.storage_clients import MemoryStorageClient
 # root, so the two copies must be kept in sync by hand. The trailing space is
 # part of the prefix.
 DIAG_PREFIX = "[diag] "
+
+
+# One number for two settings that must agree: how many pages a single browser
+# controller will hold open, and how many requests the crawler runs at once.
+# They were allowed to disagree before — the cap was pinned at 1 while
+# PlaywrightCrawler autoscaled concurrency above it — so the pool periodically
+# asked a saturated controller for a page and got
+# `ValueError: Cannot open more pages in this browser.` That reached the
+# failed-request handler, costing that asset its result line and having the
+# engine record SCAN_ERROR. Driving both from one constant makes in-flight page
+# demand incapable of exceeding one controller's capacity.
+#
+# The value is 2 and must not be raised. It is crawlee's own default
+# concurrency, so the request rate these targets see does not change; they
+# already rate-limit and block us, and `--delay` throttles inside the handler
+# (per request, not across them), so a higher concurrency would silently
+# multiply the real request rate rather than pace it. Raising the page cap
+# above 1 at all is only safe because every page now gets its own browser
+# context (use_incognito_pages below), so concurrent pages cannot see each
+# other's cookies. It is deliberately not derived from batch size or asset
+# count: it bounds resident memory, and a Firefox context costs roughly
+# 30-60 MB.
+BROWSER_PAGE_CONCURRENCY = 2
 
 
 def diag(event: str, **kv) -> None:
@@ -102,6 +126,11 @@ class WappalyzerEngine:
                         f"Failed to download technologies.json and no local cache exists at {cache_path}"
                     )
         
+        # implies/excludes are normalised once, here at construction, so the
+        # per-asset path never re-parses them.
+        self.implies = {}
+        self.excludes = {}
+
         for tech, data in tech_data.items():
             self.rules[tech] = {
                 'headers': {},
@@ -121,6 +150,37 @@ class WappalyzerEngine:
                 self.rules[tech]['js'][k] = self._get_compiled(v)
                 self.js_keys.add(k)
 
+            # Both fields are either a single string or a list of strings in the
+            # data file, and an implied name may carry its own "\;confidence:NN"
+            # suffix (8 do), which is stripped off the name and kept as weight.
+            implies = data.get('implies') or []
+            if isinstance(implies, str):
+                implies = [implies]
+            if implies:
+                self.implies[tech] = [(f[0], self._confidence_of(f[1:]))
+                                      for f in (i.split('\\;') for i in implies if isinstance(i, str))]
+
+            excludes = data.get('excludes') or []
+            if isinstance(excludes, str):
+                excludes = [excludes]
+            if excludes:
+                self.excludes[tech] = [e for e in excludes if isinstance(e, str)]
+
+    @staticmethod
+    def _confidence_of(fields):
+        """Read the confidence out of a value's tagged fields. Anything else is
+        ignored; version extraction is not implemented, so a version tag is
+        parsed only far enough to be skipped."""
+        for field in fields:
+            if field.startswith('confidence:'):
+                try:
+                    return max(0, min(100, int(field[len('confidence:'):].strip())))
+                except ValueError:
+                    # A value that cannot be read must not mute the rule: a
+                    # parse slip falls back to a full-weight signal, never 0.
+                    return 100
+        return 100
+
     def _get_compiled(self, patterns):
         if isinstance(patterns, str):
             patterns = [patterns]
@@ -130,52 +190,99 @@ class WappalyzerEngine:
         res = []
         for p in patterns:
             if not isinstance(p, str): continue
-            # Strip custom Wappalyzer versioning syntax e.g., "\;version:\1"
-            clean_p = p.split('\\;')[0]
+            # A Wappalyzer value is a regex followed by optional tagged fields
+            # joined with "\;", e.g. "aksb\.min\.js\;confidence:50" or
+            # "([\d.]+)\;version:\1". Element 0 is the pattern; the confidence
+            # tag says how much a match is worth and defaults to 100.
+            fields = p.split('\\;')
             try:
-                res.append(re.compile(clean_p, re.IGNORECASE))
+                res.append((re.compile(fields[0], re.IGNORECASE), self._confidence_of(fields[1:])))
             except re.error:
                 continue
         return res
 
     def analyze(self, html, headers, cookies, scripts, meta, js_data):
-        detected = set()
+        # A pattern is evidence, not proof: real Wappalyzer only reports a
+        # technology once its accumulated confidence reaches 100, so matches are
+        # summed per technology instead of flagging it on the first hit. Only
+        # the 189 patterns carrying a confidence below 100 keep a technology
+        # scanning past its first match; everything else still stops there.
+        scores = {}
         headers_lower = {k.lower(): str(v) for k, v in headers.items()}
         cookies_lower = {k.lower(): str(v) for k, v in cookies.items()}
         meta_lower = {k.lower(): str(v) for k, v in meta.items()}
+        # Name-keyed signal classes share one shape — a rule map keyed by a
+        # lowercased name against a lowercased subject map — so they are walked
+        # by one block rather than three copies. Built once, outside the loop.
+        keyed_signals = (('headers', headers_lower), ('cookies', cookies_lower), ('meta', meta_lower))
 
         for tech, rules in self.rules.items():
+            score = 0
+
             # Match HTML
-            if any(r.search(html) for r in rules['html']):
-                detected.add(tech); continue
-            
+            for r, c in rules['html']:
+                if r.search(html):
+                    score += c
+                    if score >= 100: break
+
             # Match Script Src
-            if any(r.search(src) for src in scripts for r in rules['scriptSrc']):
-                detected.add(tech); continue
-            
-            # Match Headers
-            if any(h_name in headers_lower and any(r.search(headers_lower[h_name]) for r in h_rules) 
-                   for h_name, h_rules in rules['headers'].items()):
-                detected.add(tech); continue
+            if score < 100:
+                for src in scripts:
+                    for r, c in rules['scriptSrc']:
+                        if r.search(src):
+                            score += c
+                            if score >= 100: break
+                    if score >= 100: break
 
-            # Match Cookies
-            if any(c_name in cookies_lower and any(r.search(cookies_lower[c_name]) for r in c_rules) 
-                   for c_name, c_rules in rules['cookies'].items()):
-                detected.add(tech); continue
-
-            # Match Meta
-            if any(m_name in meta_lower and any(r.search(meta_lower[m_name]) for r in m_rules) 
-                   for m_name, m_rules in rules['meta'].items()):
-                detected.add(tech); continue
+            # Match Headers, Cookies, Meta
+            for rule_key, subject in keyed_signals:
+                if score >= 100: break
+                for name, n_rules in rules[rule_key].items():
+                    val = subject.get(name)
+                    if val is None: continue
+                    for r, c in n_rules:
+                        if r.search(val):
+                            score += c
+                            if score >= 100: break
+                    if score >= 100: break
 
             # Match JS
-            for j_name, j_rules in rules['js'].items():
-                if j_name in js_data:
-                    val = str(js_data[j_name])
-                    if not j_rules or any(r.search(val) for r in j_rules):
-                        detected.add(tech); break
+            if score < 100:
+                for j_name, j_rules in rules['js'].items():
+                    if j_name in js_data:
+                        val = str(js_data[j_name])
+                        if not j_rules:
+                            # A key with no patterns: its mere presence is proof.
+                            score += 100
+                        else:
+                            for r, c in j_rules:
+                                if r.search(val):
+                                    score += c
+                                    if score >= 100: break
+                        if score >= 100: break
 
-        return list(detected)
+            if score:
+                scores[tech] = score
+
+        reported = {t for t, s in scores.items() if s >= 100}
+
+        # Apply `implies` transitively (Akamai Bot Manager implies Akamai). The
+        # implies graph contains cycles, so a technology is queued only on the
+        # transition that first puts it in `reported` — that membership test is
+        # what makes this terminate, since nothing is removed until afterwards.
+        worklist = list(reported)
+        while worklist:
+            for implied, conf in self.implies.get(worklist.pop(), ()):
+                scores[implied] = scores.get(implied, 0) + conf
+                if scores[implied] >= 100 and implied not in reported:
+                    reported.add(implied)
+                    worklist.append(implied)
+
+        # Apply `excludes` last, deciding every removal from the set as it stood
+        # before any removal, so the outcome cannot depend on iteration order.
+        # Implies is deliberately not re-run: a removal never adds anything back.
+        removals = {e for tech in reported for e in self.excludes.get(tech, ()) if e in reported}
+        return list(reported - removals)
 
 
 class CamoufoxPlugin(PlaywrightBrowserPlugin):
@@ -189,7 +296,19 @@ class CamoufoxPlugin(PlaywrightBrowserPlugin):
             browser=await AsyncNewBrowser(
                 self._playwright, **self._browser_launch_options
             ),
-            max_open_pages_per_browser=1,
+            max_open_pages_per_browser=BROWSER_PAGE_CONCURRENCY,
+            # One browser context per page, destroyed with it. Without this
+            # crawlee's default reuses a single context for every page the
+            # browser serves, and the handler's cookie read then returns the
+            # whole context's jar — cookies set by assets scanned earlier
+            # included. Observed in production: python.org, scanned in a context
+            # previously used for an Akamai-fronted host, carried `bm_sz`,
+            # `_abck` and `AKA_A2` and was tagged Akamai Bot Manager on the
+            # strength of another host's session. The flag is also set on the
+            # plugin in main(); the two copies must agree, because the plugin's
+            # copy drives the capacity and page-option plumbing while this one
+            # drives the actual context-per-page behaviour.
+            use_incognito_pages=True,
             header_generator=None,
         )
 
@@ -574,15 +693,43 @@ async def main() -> None:
     # already navigated.
     content_reserve_s = 4.0
 
-    browser_launch_options = {"proxy": proxy_options} if proxy_options else {}
+    # Everything here flows through `**self._browser_launch_options` into
+    # AsyncNewBrowser, the same path `proxy` already took. geoip and humanize
+    # are conditional on there actually being a proxy, and deliberately so.
+    # Camoufox emits `LeakWarning: When using a proxy, it is heavily recommended
+    # that you pass geoip=True` on every proxied launch, and it is right: without
+    # it the browser reports the timezone and locale of the VPS while the traffic
+    # exits from a residential IP somewhere else, which is exactly the kind of
+    # contradiction the targets fingerprint on. Unproxied, the same two options
+    # are pure cost — a geoip lookup of the VPS's own address describes the host
+    # we are already leaking, and humanize buys nothing while charging per-action
+    # latency inside page.goto and page.screenshot.
+    browser_launch_options = (
+        {"proxy": proxy_options, "geoip": True, "humanize": True}
+        if proxy_options
+        else {}
+    )
     crawler = PlaywrightCrawler(
         max_requests_per_crawl=len(target_urls),
         # No automatic retries: a handler timeout would otherwise revisit the
         # host and emit a second line for the same domain.
         max_request_retries=0,
+        # Pinned to the page cap rather than autoscaled: see
+        # BROWSER_PAGE_CONCURRENCY. Concurrency above the cap is what produced
+        # `Cannot open more pages in this browser.`
+        concurrency_settings=ConcurrencySettings(
+            min_concurrency=1,
+            desired_concurrency=BROWSER_PAGE_CONCURRENCY,
+            max_concurrency=BROWSER_PAGE_CONCURRENCY,
+        ),
         browser_pool=BrowserPool(plugins=[CamoufoxPlugin(
             browser_launch_options=browser_launch_options,
+            # Applied per new_context call under incognito rather than once at
+            # browser open, so it still reaches every page. A TLS-broken host
+            # silently failing navigation is the regression signature if it
+            # ever stops being honoured.
             browser_new_context_options={"ignore_https_errors": True},
+            use_incognito_pages=True,
         )]),
         storage_client=MemoryStorageClient(),  # Prevents the on-disk storage folder creation
         ignore_http_error_status_codes=list(range(400, 600)),
@@ -833,7 +980,17 @@ async def main() -> None:
                 content_length = str(len(html.encode('utf-8')))
 
             # Extract deeply nested DOM / network characteristics
-            cookies_list = await context.page.context.cookies()
+            # Scoped to the page's own URL, never the whole jar: an unscoped read
+            # returns every cookie the context holds, and Wappalyzer's cookie
+            # rules would then credit this asset with technologies proven only by
+            # some other host's session. Guarded because Playwright raises on a
+            # URL it cannot match against — about:blank, or a malformed one — and
+            # cookies are one signal among six, so losing them must cost this
+            # asset a little precision rather than its entire result line.
+            try:
+                cookies_list = await context.page.context.cookies(context.page.url)
+            except Exception:
+                cookies_list = []
             cookies = {c['name']: c['value'] for c in cookies_list}
             scripts = await context.page.evaluate("Array.from(document.scripts).map(s => s.src)")
             meta = await context.page.evaluate("Array.from(document.querySelectorAll('meta')).reduce((acc, el) => { if(el.name || el.property) acc[el.name || el.property] = el.content; return acc; }, {})")
