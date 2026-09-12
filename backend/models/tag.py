@@ -23,13 +23,21 @@ SOURCE_SEED = "Seed"
 # removed automatically when a later direct pass succeeds for that asset.
 SYSTEM_TAG_PROXIED = "Proxied"
 
+# Confidence tag, also engine-written and also reconciled automatically: it
+# records that the STORED result is a block or throttle the engine retried from a
+# second vantage point and could not confirm, because that retry never reached
+# the host. Reserved here for the same reason as the tags above — an operator
+# hand-creating this name would get an is_system=False row that collides with the
+# engine's on uq_tags_project_name. No migration: tags are created lazily.
+SYSTEM_TAG_UNVERIFIED = "Unverified"
+
 # Every name the API refuses to let an operator create, rename, delete, or
 # hand-attach. Membership buys exactly that; discovery-source attribution is
 # driven by the individual SOURCE_* constants, not by this tuple.
 SYSTEM_TAG_NAMES = (
     SOURCE_PASSIVE, SOURCE_BRUTEFORCE, SOURCE_PERMUTATIONS, SOURCE_CRAWLING,
     SOURCE_REDIRECT, SOURCE_MANUAL, SOURCE_SEED,
-    SYSTEM_TAG_PROXIED,
+    SYSTEM_TAG_PROXIED, SYSTEM_TAG_UNVERIFIED,
 )
 
 # "New!" is never stored. It is derived per request by comparing an asset's

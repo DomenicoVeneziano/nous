@@ -17,6 +17,7 @@ from queue_manager import (
     get_project_domains, get_project_asset_hostnames,
     insert_asset_if_absent, enqueue_scan, is_in_scope, SOURCE_REDIRECT, utc_now_str,
     attach_tag, detach_tag, job_is_cancelled, SYSTEM_TAG_PROXIED,
+    SYSTEM_TAG_UNVERIFIED,
 )
 
 
@@ -197,8 +198,9 @@ async def _scan_batch(
 
     parsed = []
     # Screenshot verdicts ride along in the SAME text as the result lines, so
-    # they cost no extra read and no second pass over disk. They exist only to
-    # explain a missing image to the user; nothing is written from them.
+    # they cost no extra read and no second pass over disk. They explain a
+    # missing image to the user, and a "blank"/"error" verdict is also the
+    # engine's only evidence that the script unlinked the PNG.
     markers: dict[str, str] = {}
     if batch_summary.is_file():
         log_content = batch_summary.read_text(encoding="utf-8", errors="replace")
@@ -269,38 +271,45 @@ async def _scan_batch(
                     fresh = shot_file.stat().st_mtime >= run_started
                 except OSError:
                     fresh = False
+                verdict = markers.get(hostname)
                 if fresh:
                     # Overwritten in place by the script, so the path is stable
                     # across re-scans — only the latest screenshot is retained.
                     # Stored relative to the projects dir (the convention the
                     # /files/image endpoint expects).
                     extra_fields["screenshot_path"] = f"{project_id}/screenshots/{safe_domain}.png"
-                elif spec.may_delete_stale_screenshot:
-                    # No image from this run: drop any older one rather than
-                    # attributing it to this result.
-                    _remove_screenshot(screenshots_dir, safe_domain)
+                elif spec.may_delete_stale_screenshot or verdict in ("blank", "error"):
+                    # Detach on EVERY pass for a blank/error verdict: the script
+                    # unlinked the PNG at this path, an earlier run's good image
+                    # included, so a retry that left the row pointing at it
+                    # would be pointing at nothing.
                     extra_fields["screenshot_path"] = None
-                    if line_broadcast:
-                        # A blank render, a capture error and a host the script
-                        # never reached are three different problems with three
-                        # different fixes; one shared sentence sent the user
-                        # looking in the wrong place. The "ok" case should be
-                        # unreachable — the script claims a capture the mtime
-                        # test denies — so it reports the disagreement instead
-                        # of asserting a cause nothing here can support.
-                        verdict = markers.get(hostname)
-                        if verdict == "blank":
-                            await line_broadcast(
-                                f"[!] Page rendered blank for {hostname} - screenshot discarded (continuing)")
-                        elif verdict == "error":
-                            await line_broadcast(
-                                f"[!] Screenshot capture error for {hostname} - see scan log (continuing)")
-                        elif verdict == "ok":
-                            await line_broadcast(
-                                f"[!] Screenshot for {hostname} could not be attributed to this run (continuing)")
-                        else:
-                            await line_broadcast(
-                                f"[!] No screenshot attempted for {hostname} (continuing)")
+                    if spec.may_delete_stale_screenshot:
+                        # No image from this run: drop any older one rather than
+                        # attributing it to this result. Pass 1 only, so a retry
+                        # deletes nothing of its own and repeats no line.
+                        _remove_screenshot(screenshots_dir, safe_domain)
+                        if line_broadcast:
+                            # A blank render, a capture error and a host the
+                            # script never reached are three different problems
+                            # with three different fixes; one shared sentence
+                            # sent the user looking in the wrong place. The "ok"
+                            # case should be unreachable — the script claims a
+                            # capture the mtime test denies — so it reports the
+                            # disagreement instead of asserting a cause nothing
+                            # here can support.
+                            if verdict == "blank":
+                                await line_broadcast(
+                                    f"[!] Page rendered blank for {hostname} - screenshot discarded (continuing)")
+                            elif verdict == "error":
+                                await line_broadcast(
+                                    f"[!] Screenshot capture error for {hostname} - see scan log (continuing)")
+                            elif verdict == "ok":
+                                await line_broadcast(
+                                    f"[!] Screenshot for {hostname} could not be attributed to this run (continuing)")
+                            else:
+                                await line_broadcast(
+                                    f"[!] No screenshot attempted for {hostname} (continuing)")
                 else:
                     # Retry pass, no fresh capture: screenshot handling here is
                     # additive-only. Omit screenshot_path from the update
@@ -374,6 +383,58 @@ def _retry_candidates(outcomes: dict[str, tuple[str, int | None]]) -> set[str]:
 def _stored_hosts(outcomes: dict[str, tuple[str, int | None]]) -> list[str]:
     """Hostnames whose result this pass actually wrote to the DB."""
     return [h for h, (kind, _) in outcomes.items() if kind in ("ok", "redirect")]
+
+
+def _merge_stored(
+    prior: dict[str, tuple[str, int | None]],
+    newer: dict[str, tuple[str, int | None]],
+) -> dict[str, tuple[str, int | None]]:
+    """What is STORED after `newer` ran on top of `prior`.
+
+    Not a plain dict merge, because a retry pass carries write_failures=False: a
+    "missing" in `newer` wrote nothing, so the earlier pass's row is still what
+    the asset holds. Only outcomes that actually reached the DB — "ok" and
+    "redirect" — may displace a prior entry.
+    """
+    merged = dict(prior)
+    merged.update({h: o for h, o in newer.items() if o[0] in ("ok", "redirect")})
+    return merged
+
+
+def _unverified_hosts(
+    outcomes: dict[str, tuple[str, int | None]],
+    prior: dict[str, tuple[str, int | None]],
+) -> list[str]:
+    """Hosts whose stored block this pass attempted and failed to confirm.
+
+    One predicate, and every exclusion falls out of it with no special cases:
+
+    - this pass produced no result line at all for the host ("missing"), so the
+      second vantage never got an answer to compare;
+    - and what is already stored is a real response whose status is retry-worthy
+      (403/429/5xx), i.e. a block or throttle that another exit IP plausibly
+      changes.
+
+    So a host that failed pass 1 with SCAN_ERROR or TIMEOUT has prior kind
+    "missing" and is not tagged; the unreachable_assets injected into the proxy
+    pass have no prior entry at all, so TCP_UNREACHABLE stays untagged; and a
+    stored redirect — a settled answer, never retry-worthy — is never tagged.
+
+    Known limitation, accepted: when a batch's script invocation hits its own
+    timeout, every host it never reached comes back "missing" alongside the ones
+    it genuinely failed on, so a host can be tagged without a single proxy
+    request having been issued for it. The wording survives that — the block
+    really was not confirmed — and _scan_batch does not surface result.timed_out
+    per host, so distinguishing the two would mean new plumbing for no change in
+    the verdict. Note that per_domain_timeout=0 disables the batch timeout
+    outright, which removes the case entirely.
+    """
+    hosts = []
+    for host, (kind, _) in outcomes.items():
+        stored = prior.get(host)
+        if kind == "missing" and stored is not None and stored[0] == "ok" and stored[1] in RETRY_STATUSES:
+            hosts.append(host)
+    return hosts
 
 
 async def run_tech_job(job: dict, ws_broadcast=None):
@@ -467,6 +528,20 @@ async def run_tech_job(job: dict, ws_broadcast=None):
 
         if not live_assets:
             # All assets failed DNS — mark job done (nothing to scan)
+            #
+            # This return is upstream of the job-level Unverified reconciliation,
+            # so the one contradiction reachable here has to be settled on the
+            # spot: the loop above just rewrote every one of these rows to
+            # status_code=0 / NO_RECORDS, which no longer says "blocked", and a
+            # tag left from an earlier job would still claim otherwise. Reached
+            # by a single-asset rescan of a host whose DNS has since gone away as
+            # readily as by a resolver outage. Nothing is attached: no pass ran,
+            # so no second vantage was attempted and nothing was learned about
+            # any host that is still blocked.
+            detach_tag(
+                session, project_id,
+                [a["hostname"] for a in dead_assets], SYSTEM_TAG_UNVERIFIED,
+            )
             refresh_project_counts(session, project_id)
             transition_status(session, job_id, "running", "done",
                               duration_s=0,
@@ -534,7 +609,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
         # the reported total can never exceed the asset count.
         succeeded: set[str] = set()
         asset_by_host = {a["hostname"]: a for a in scannable_assets}
-        pass_total = 3 if retry_proxy_url else 2
+        pass_total = 4 if retry_proxy_url else 2
 
         # Progress is ASSET-weighted: assets_total starts at the pass-1 sweep
         # size and GROWS at each pass boundary, as each candidate set becomes
@@ -635,6 +710,14 @@ async def run_tech_job(job: dict, ws_broadcast=None):
                 attach_tag(session, project_id, stored, SYSTEM_TAG_PROXIED)
             else:
                 detach_tag(session, project_id, stored, SYSTEM_TAG_PROXIED)
+            # SYSTEM_TAG_UNVERIFIED is deliberately NOT reconciled here. Proxied
+            # is a fact about one pass — which vantage wrote the row — so it
+            # settles as soon as that pass writes. Whether a block went
+            # unconfirmed is a conclusion about the whole job: it is not knowable
+            # until the proxy pass has had its chance, and a per-pass detach
+            # would make the tag a function of which hosts survived the retry
+            # truncation. run_tech_job reconciles it once, after the last
+            # proxy pass.
             return outcomes
 
         # ── Pass 1: direct sweep over everything reachable ──────────
@@ -698,6 +781,16 @@ async def run_tech_job(job: dict, ws_broadcast=None):
         # Skipped entirely without a retry proxy — no candidate set is even
         # built. Rotating exit IPs make per-IP throttling a non-issue, so this
         # pass runs at the NORMAL delay rather than the widened one.
+        outcomes_3: dict[str, tuple[str, int | None]] = {}
+        # Distinct from "outcomes_3 is empty": a pass that ran and reached every
+        # host it was given returns entries for all of them, while a pass that
+        # never ran must not be allowed to conclude anything. The Unverified
+        # attach below is gated on this flag, never on the map being non-empty.
+        pass_3_ran = False
+        # The exact asset dicts pass 3 was handed, keyed by hostname. Pass 4
+        # resolves its hosts through this and not through asset_by_host, so the
+        # injected unreachable assets below stay resolvable.
+        pass_3_by_host: dict[str, dict] = {}
         if retry_proxy_url and not cancelled:
             if job_is_cancelled(session, job_id):
                 cancelled = True
@@ -723,7 +816,11 @@ async def run_tech_job(job: dict, ws_broadcast=None):
 
                 if candidates:
                     progress["total"] += len(candidates)
-                    await _run_pass(
+                    pass_3_ran = True
+                    # Captured AFTER the truncation, so pass 4 can only ever see
+                    # hosts pass 3 actually attempted.
+                    pass_3_by_host = {a["hostname"]: a for a in candidates}
+                    outcomes_3 = await _run_pass(
                         PassSpec(
                             index=3, total=pass_total, label="proxy retry",
                             proxy_url=retry_proxy_url, delay=tech_rate_limit_delay,
@@ -732,6 +829,171 @@ async def run_tech_job(job: dict, ws_broadcast=None):
                         ),
                         candidates,
                     )
+
+        # ── Pass 4: second proxy attempt for hosts pass 3 missed ────
+        # A pass-3 "missing" is overwhelmingly a REFUSED proxy connection: on a
+        # measured 997-asset run pass 3 attempted 642 assets and produced no
+        # result line for 367 of them, 344 of those NS_ERROR_PROXY_CONNECTION_
+        # REFUSED and 23 timeouts. Each host got exactly one attempt. A refused
+        # connection transfers no bytes, so a second attempt costs essentially
+        # nothing against metered proxy traffic — which is the constraint that
+        # bounds every other retry decision in this job.
+        #
+        # Deliberately NOT narrowed to the refusals, though that is what the
+        # pass is for. The error class exists only inside the script's
+        # "[diag] nav-failed" line, which runner.py filters out of
+        # ScriptResult.stdout on purpose, so selecting on it would take a new
+        # contracted marker in scripts/tech_analysis.py, a parser for it in
+        # engine/parsers/tech_parser.py and a wider _scan_batch return type.
+        # With 344 of 367 costing no traffic, re-attempting all 367 is the
+        # cheaper trade. Should metered traffic ever become the binding
+        # constraint, that marker route is the follow-up.
+        #
+        # Bounded: exactly one extra pass, over a strict subset of a pass-3 set
+        # TECH_RETRY_MAX_ASSETS has already clipped, so the worst case adds one
+        # pass-3 duration and no new env var.
+        outcomes_4: dict[str, tuple[str, int | None]] = {}
+        if retry_proxy_url and not cancelled:
+            # Same pass-boundary checkpoint passes 2 and 3 use: the worker only
+            # polls every POLL_INTERVAL, so without this a whole extra pass
+            # could start after a cancel was already requested.
+            if job_is_cancelled(session, job_id):
+                cancelled = True
+            else:
+                pass_4_hosts = sorted(
+                    host for host, (kind, _) in outcomes_3.items() if kind == "missing"
+                )
+                # No TECH_RETRY_MAX_ASSETS cut here: this pass INHERITS pass 3's.
+                # pass_4_hosts keys ⊆ outcomes_3 keys ⊆ pass_3_by_host, which
+                # pass 3 clipped to the bound before running, so re-applying it
+                # could never shrink anything. It is the same subset
+                # relationship last_proxy's plain dict merge relies on below.
+                assert len(pass_4_hosts) <= len(pass_3_by_host)
+
+                # Nothing to do: skip the pass outright rather than run it
+                # empty — no _run_pass call, so no "Pass 4/4" line, no batch
+                # artifacts and no progress accounting for a pass that is not
+                # happening.
+                if pass_4_hosts:
+                    # Resolved through pass 3's OWN candidate list, never
+                    # asset_by_host: pass 3 deliberately injects the
+                    # TCP-unreachable assets, which never entered
+                    # scannable_assets and so are absent from asset_by_host.
+                    # Both their https:// URL and their claim to a proxied
+                    # attempt have to survive into this pass.
+                    progress["total"] += len(pass_4_hosts)
+                    outcomes_4 = await _run_pass(
+                        PassSpec(
+                            index=4, total=pass_total, label="proxy retry (refused)",
+                            proxy_url=retry_proxy_url, delay=tech_rate_limit_delay,
+                            write_failures=False, may_delete_stale_screenshot=False,
+                            tag_proxied=True,
+                        ),
+                        [pass_3_by_host[h] for h in pass_4_hosts],
+                    )
+
+        # ── Reconcile the Unverified tag, once for the whole job ────
+        # Placed here, not inside _run_pass, because "the stored block could not
+        # be confirmed" is a conclusion about the job: it is only true once the
+        # proxy pass has had its chance at the host. Runs on the cancelled path
+        # too — everything below the passes is kept on that path by design, and
+        # the conclusion is sound for the batches that did run.
+        #
+        # Two bulk calls total, one detach and one attach, never per pass and
+        # never per asset: detach_tag/attach_tag each end in a chunked
+        # sync_tags_text, which is a correlated-subquery UPDATE over the ids
+        # handed to them, so the number of those sweeps is what has to stay
+        # bounded, not just their batching.
+        final = _merge_stored(
+            _merge_stored(_merge_stored(outcomes_1, outcomes_2), outcomes_3),
+            outcomes_4,
+        )
+
+        # The LAST proxy outcome per host, which is what both halves of the
+        # reconciliation below key on. A host pass 4 recovered was confirmed from
+        # the second vantage after all. A plain dict merge is correct here
+        # precisely because pass 4's key set is by construction a subset of pass
+        # 3's — every host pass 4 touched is described by pass 4's result, and a
+        # host pass 3 missed that pass 4 never covered keeps pass 3's "missing".
+        # _merge_stored is needed for `final` for the opposite reason: there a
+        # later pass's "missing" wrote nothing to the DB and so must not displace
+        # an earlier pass's stored row, whereas here "missing" is the very signal
+        # being carried forward. Empty when no proxy pass ran, which is what
+        # keeps the terms that read it inert on a proxyless run.
+        last_proxy = {**outcomes_3, **outcomes_4}
+
+        # The detach is applied on EVERY run, proxy or not: it names the hosts
+        # whose current state CONTRADICTS the tag, and a contradiction has to be
+        # cleared whether or not a second vantage was available this time.
+        # Anything else lets the tag outlive the result it describes.
+        contradicted = [
+            host for host, (kind, status) in final.items()
+            # Answered with something that is not a block or throttle, or
+            # redirects away — settled answers, nothing left to confirm.
+            if kind == "redirect" or (kind == "ok" and status not in RETRY_STATUSES)
+        ]
+        # A host gone DNS-dead was rewritten to status_code=0 / NO_RECORDS
+        # without ever entering a pass, so it produced no result line and is
+        # absent from `final`. The row no longer says "blocked", so a tag left
+        # over from an earlier run would describe a row that is gone.
+        contradicted += [a["hostname"] for a in dead_assets]
+        # A host that failed the TCP precheck detaches for a different reason,
+        # and NOT because its row must read status_code=0: the proxy pass takes
+        # these hosts on deliberately, bypassing the local precheck, so one it
+        # reached has a fresh result stored and IS in `final` — a 403 among them.
+        # Either way the second vantage got its answer. It either corroborated
+        # the block or replaced it, and a corroborated block is confirmed, which
+        # is exactly what the tag denies.
+        contradicted += [a["hostname"] for a in unreachable_assets]
+        # The pass-1 failure only counts as a contradiction while it is still
+        # what the row holds: a host that failed pass 1 and then answered 403 on
+        # a retry has a block stored again, and belongs to the attach set below
+        # rather than this one.
+        contradicted += [
+            host for host, (kind, _) in outcomes_1.items()
+            if kind == "missing" and final[host][0] == "missing"
+        ]
+        # Every host a proxy pass actually got an answer for, whatever that
+        # answer was. An answer settles the question in BOTH directions: a
+        # non-block replaces the stored block, and a repeated 403 from a
+        # different exit IP is the second vantage CORROBORATING the block, which
+        # is confirmation — the precise opposite of what the tag asserts. Term 1
+        # cannot cover this, because it rejects exactly the retry-worthy statuses
+        # a still-blocked host comes back with; without this term every genuinely
+        # blocked host keeps a tag from any earlier run whose proxy was
+        # unreachable. Scoped to the proxy passes' own outcome map, never to "some
+        # pass reached it" — that was the bug this whole block was restructured
+        # to fix.
+        contradicted += _stored_hosts(last_proxy)
+        # The terms overlap — a TCP-unreachable host a proxy pass then answered
+        # for hits several of them — and a repeat would cost a second
+        # no-op chunk through detach_tag's sweep. dict.fromkeys drops it in one
+        # pass and keeps insertion order, so the call sees each host once.
+        detach_tag(
+            session, project_id,
+            list(dict.fromkeys(contradicted)), SYSTEM_TAG_UNVERIFIED,
+        )
+
+        # Attached only when the proxy pass actually ran. Without it no second
+        # vantage was attempted, so this run has learned nothing about the hosts
+        # that are still blocked: leave their tags exactly as the last run left
+        # them. This is what keeps a proxyless run inert rather than destructive,
+        # and it keeps the tag from becoming a function of which hosts happened
+        # to survive the TECH_RETRY_MAX_ASSETS cut.
+        if pass_3_ran:
+            # Reads the same last_proxy map the detach term above does, and the
+            # two can never overlap: _unverified_hosts requires kind "missing",
+            # _stored_hosts requires kind "ok" or "redirect".
+            unverified = _unverified_hosts(last_proxy, final)
+            if unverified:
+                attach_tag(session, project_id, unverified, SYSTEM_TAG_UNVERIFIED)
+                # One line for the whole job. Never one per host: the per-host
+                # detail is already in the batch log as the script's own
+                # nav-failed diagnostic, and 367 extra lines would bury it.
+                await line_broadcast(
+                    f"[!] {len(unverified)} asset(s) tagged {SYSTEM_TAG_UNVERIFIED} - "
+                    f"stored block could not be confirmed from a second vantage"
+                )
 
         analyzed = len(succeeded)
 

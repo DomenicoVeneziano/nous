@@ -28,6 +28,23 @@ SOURCE_REDIRECT = "Redirect"
 # automatically — a later direct pass that succeeds detaches it.
 SYSTEM_TAG_PROXIED = "Proxied"
 
+# Confidence tag, not a discovery source: it marks assets whose STORED result is
+# a block or throttle that a SECOND vantage point was attempted on and failed to
+# confirm — the retry never reached the host, so the stored answer stands
+# unverified rather than corroborated.
+#
+# Unlike Proxied this is NOT reconciled per pass. Whether a block went
+# unconfirmed is a conclusion about a whole job, so the tech job settles it once,
+# after its proxy pass, against the job's FINAL stored state. Do not "restore" a
+# per-pass detach: reaching a host is not grounds for dropping the tag — a retry
+# that answers with another 403 has corroborated the block, while a pass that
+# merely got to the host at the same vantage has confirmed nothing. And a run
+# with no retry proxy attempts no second vantage at all, so it must leave every
+# still-blocked host's tag exactly as it found it rather than clearing the
+# project. Only a contradiction detaches: a settled answer, a redirect, or a row
+# that no longer reads as blocked.
+SYSTEM_TAG_UNVERIFIED = "Unverified"
+
 # SQLite caps bound parameters per statement; chunk long id lists well under it.
 _ID_CHUNK = 500
 
