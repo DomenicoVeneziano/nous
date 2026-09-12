@@ -57,7 +57,7 @@ export default function ProxyConfig() {
       setDirty(false);
       flash('Saved');
     } catch (e: any) {
-      flash(e?.response?.data?.detail || 'Failed to save', true);
+      flash(e?.message || 'Failed to save', true);
     } finally {
       setSaving(false);
     }
@@ -71,7 +71,7 @@ export default function ProxyConfig() {
       const res = await testProxyConfig(cfg.host.trim(), Number(cfg.port));
       flash(res.message, !res.reachable);
     } catch (e: any) {
-      flash(e?.response?.data?.detail || 'Test failed', true);
+      flash(e?.message || 'Test failed', true);
     } finally {
       setTesting(false);
     }

@@ -203,11 +203,6 @@ def build_body(event: dict, esc=plain_escape, limit: int = TELEGRAM_BODY_CHARS) 
     return _clip("\n".join(lines), limit)
 
 
-def build_generic_payload(event: dict) -> dict:
-    """The generic webhook body: the canonical event, unchanged."""
-    return event
-
-
 def build_slack_payload(event: dict) -> dict:
     body = build_body(event, slack_escape, SLACK_BODY_CHARS)
     return {

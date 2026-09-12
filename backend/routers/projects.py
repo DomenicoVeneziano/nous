@@ -6,8 +6,7 @@ from database import get_db
 from auth.middleware import require_admin, require_viewer
 from schemas.project import ProjectCreate, ProjectUpdate, ProjectOut, BulkProjectAction
 from services import asset_service, project_service
-from config import settings
-from pathlib import Path
+from storage import PROJECTS_DIR, resolve_within
 
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 MAX_ICON_SIZE = 2 * 1024 * 1024  # 2MB
@@ -59,7 +58,7 @@ async def upload_icon(
     ext_map = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
     ext = ext_map.get(file.content_type, ".png")
 
-    project_dir = settings.DATA_DIR / "projects" / project_id
+    project_dir = PROJECTS_DIR / project_id
     project_dir.mkdir(parents=True, exist_ok=True)
 
     # Remove old icon files
@@ -81,7 +80,7 @@ def delete_icon(project_id: str, db: Session = Depends(get_db), _: dict = Depend
     project = project_service.get_project(db, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
-    project_dir = settings.DATA_DIR / "projects" / project_id
+    project_dir = PROJECTS_DIR / project_id
     for old in project_dir.glob("icon.*"):
         old.unlink()
     project.icon = None
@@ -94,9 +93,11 @@ def get_icon(project_id: str, db: Session = Depends(get_db), _: dict = Depends(r
     project = project_service.get_project(db, project_id)
     if not project or not project.icon:
         raise HTTPException(404, "No icon")
-    icon_path = (settings.DATA_DIR / "projects" / project_id / project.icon).resolve()
-    safe_base = (settings.DATA_DIR / "projects" / project_id).resolve()
-    if not icon_path.is_relative_to(safe_base) or not icon_path.is_file():
+    # Confined to this project's own directory, not the shared projects root: the
+    # stored icon name is the only part of the path the client influences, and a
+    # project must not be able to serve another project's files.
+    icon_path = resolve_within(project.icon, PROJECTS_DIR / project_id)
+    if icon_path is None or not icon_path.is_file():
         raise HTTPException(404, "Icon not found")
     return FileResponse(icon_path, headers={"Content-Security-Policy": "default-src 'none'"})
 

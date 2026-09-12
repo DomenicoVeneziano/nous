@@ -2,7 +2,7 @@
 import json
 import os
 import uuid
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,13 +13,11 @@ DB_PATH = DATA_DIR / "db" / "nous.db"
 # Canonical empty per-source endpoint object stored in assets.crawled_urls.
 EMPTY_CRAWLED_URLS = '{"crawling": [], "archived": []}'
 
-# Discovery-source tag names for the paths the engine discovers through. A
-# partial mirror of backend/models/tag.py — the engine runs as a separate service
-# and cannot import backend code — deliberately leaving out Manual and Seed,
-# which only the backend ever applies. Keep the shared names in step.
-SOURCE_PASSIVE = "Passive"
-SOURCE_BRUTEFORCE = "Bruteforce"
-SOURCE_PERMUTATIONS = "Permutations"
+# Discovery-source tag names the jobs in this service apply by name. A partial
+# mirror of backend/models/tag.py — the engine runs as a separate service and
+# cannot import backend code — leaving out Manual and Seed, which only the
+# backend applies, and the recon.sh source labels, which recon writes as text
+# and parsers/recon_parser._KNOWN_SOURCES validates. Keep the shared names in step.
 SOURCE_CRAWLING = "Crawling"
 SOURCE_REDIRECT = "Redirect"
 
@@ -111,10 +109,6 @@ def _parse_json(raw, default=None):
     return raw if raw is not None else default
 
 
-def _parse_dns(raw) -> list:
-    return _parse_json(raw, default=[])
-
-
 def migrations_complete(session: Session) -> bool:
     """True once the backend has committed its schema migrations.
 
@@ -177,15 +171,40 @@ def transition_status(session: Session, job_id: str, from_status: str, to_status
     return result.rowcount > 0
 
 
-def get_asset_hostnames(session: Session, asset_ids: list[str]) -> list[str]:
-    """Retrieve hostnames for given asset IDs."""
-    if not asset_ids:
-        return []
-    placeholders, params = _in_params(asset_ids)
-    rows = session.execute(
-        text(f"SELECT asset FROM assets WHERE id IN ({placeholders})"), params
-    ).fetchall()
-    return [r[0] for r in rows]
+def _select_assets(session: Session, columns: str, ids, project_id) -> list:
+    """Asset rows for either an explicit id list or a whole project.
+
+    Exactly one of `ids` / `project_id` picks the row set; passing both or
+    neither is a caller bug, not a defaulting decision, so it raises.
+
+    The id path runs in _ID_CHUNK batches: `expanding=True` still expands to one
+    bound parameter per id, so a job carrying more ids than SQLite's parameter
+    cap would otherwise raise on a perfectly valid scan.
+    """
+    if (ids is None) == (project_id is None):
+        raise ValueError("pass exactly one of ids= or project_id=")
+    if project_id is not None:
+        return session.execute(
+            text(f"SELECT {columns} FROM assets WHERE project_id = :pid"),
+            {"pid": project_id},
+        ).fetchall()
+    stmt = text(f"SELECT {columns} FROM assets WHERE id IN :ids").bindparams(
+        bindparam("ids", expanding=True)
+    )
+    rows = []
+    for start in range(0, len(ids), _ID_CHUNK):
+        rows.extend(session.execute(stmt, {"ids": ids[start:start + _ID_CHUNK]}).fetchall())
+    return rows
+
+
+def get_asset_hostnames(session: Session, ids: list[str] | None = None, *,
+                        project_id: str | None = None) -> list[str]:
+    """Hostnames for the given asset ids, or for every asset in a project.
+
+    Separate from get_asset_details on purpose: the callers that only need names
+    would otherwise pay a json.loads per asset for dns_records they discard.
+    """
+    return [r[0] for r in _select_assets(session, "asset", ids, project_id)]
 
 
 def get_job_status(session: Session, job_id: str) -> str | None:
@@ -209,36 +228,14 @@ def job_is_cancelled(session: Session, job_id: str) -> bool:
     return get_job_status(session, job_id) != "running"
 
 
-def get_project_asset_hostnames(session: Session, project_id: str) -> list[str]:
-    """Retrieve all asset hostnames for a project."""
-    rows = session.execute(text(
-        "SELECT asset FROM assets WHERE project_id = :pid"
-    ), {"pid": project_id}).fetchall()
-    return [r[0] for r in rows]
-
-
-def get_asset_details(session: Session, asset_ids: list[str]) -> list[dict]:
-    """Retrieve id, hostname, asset_type, and dns_records for given asset IDs."""
-    if not asset_ids:
-        return []
-    placeholders, params = _in_params(asset_ids)
-    rows = session.execute(
-        text(f"SELECT id, asset, asset_type, dns_records FROM assets WHERE id IN ({placeholders})"), params
-    ).fetchall()
+def get_asset_details(session: Session, ids: list[str] | None = None, *,
+                      project_id: str | None = None) -> list[dict]:
+    """id, hostname, asset_type and dns_records for the given asset ids, or for
+    every asset in a project."""
     return [
-        {"id": r[0], "hostname": r[1], "asset_type": r[2], "dns_records": _parse_dns(r[3])}
-        for r in rows
-    ]
-
-
-def get_all_project_asset_details(session: Session, project_id: str) -> list[dict]:
-    """Retrieve id, hostname, asset_type, and dns_records for ALL assets in a project."""
-    rows = session.execute(text(
-        "SELECT id, asset, asset_type, dns_records FROM assets WHERE project_id = :pid"
-    ), {"pid": project_id}).fetchall()
-    return [
-        {"id": r[0], "hostname": r[1], "asset_type": r[2], "dns_records": _parse_dns(r[3])}
-        for r in rows
+        {"id": r[0], "hostname": r[1], "asset_type": r[2],
+         "dns_records": _parse_json(r[3], default=[])}
+        for r in _select_assets(session, "id, asset, asset_type, dns_records", ids, project_id)
     ]
 
 
@@ -332,7 +329,7 @@ def _dns_key_set(raw) -> set:
     backend/routers/assets.py::_flatten_dns_records — change one only by changing
     the other.
     """
-    records = _parse_dns(raw)
+    records = _parse_json(raw, default=[])
     if not isinstance(records, list):
         return set()
     keys = set()
@@ -533,8 +530,9 @@ _SYNC_TAGS_TEXT_SQL = f"UPDATE assets SET tags_text = {_TAGS_TEXT_EXPR}"
 # Restrict the rewrite to rows whose mirror does not already hold what the SET
 # would write. Every UPDATE on `assets` fires assets_au, which deletes and
 # reinserts the entire FTS row, so an id-scoped rewrite with no value comparison
-# pays full reindex cost for assets whose tags did not change — and attach_source_tag
-# is handed the whole result set on every recon pass, most of it already tagged.
+# pays full reindex cost for assets whose tags did not change — and the source-tag
+# attach_tag call is handed the whole result set on every recon pass, most of it
+# already tagged.
 #
 # `IS NOT`, never `!=`: SQLite evaluates `NULL != x` to NULL, so `!=` would drop a
 # NULL mirror from the update set and leave that row's drift unrepaired. tags_text
@@ -635,16 +633,6 @@ def detach_tag(session: Session, project_id: str, hostnames: list[str], name: st
     session.commit()
 
 
-def attach_source_tag(session: Session, project_id: str, hostnames: list[str], source: str) -> None:
-    """Tag every named asset with a discovery source.
-
-    Applied to hostnames that already existed as well as newly inserted ones:
-    an asset independently re-found by bruteforce genuinely has two sources, and
-    that accumulation is the signal. Source tags are never removed automatically.
-    """
-    attach_tag(session, project_id, hostnames, source)
-
-
 def set_last_crawl_at(session: Session, project_id: str, hostnames: list[str]) -> None:
     """Stamp the crawl timestamp on the given assets."""
     names = [h.strip().lower() for h in hostnames if h and h.strip()]
@@ -675,6 +663,11 @@ def insert_assets_bulk(
     first_seen / first_seen_scan_id are set on insert only, never on a
     re-discovery: they record when the asset entered the project, and the
     scan id is what the derived "New!" badge is compared against.
+
+    The source tag below is applied to every hostname handed in, the ones that
+    already existed included, not just the rows this call created: an asset
+    independently re-found by bruteforce genuinely has two sources, and that
+    accumulation is the signal. Source tags are never removed automatically.
     """
     count = 0
     now = utc_now_str()
@@ -692,7 +685,7 @@ def insert_assets_bulk(
         count += result.rowcount
     session.commit()
     if source:
-        attach_source_tag(session, project_id, hostnames, source)
+        attach_tag(session, project_id, hostnames, source)
     return count
 
 
@@ -718,7 +711,7 @@ def insert_asset_if_absent(
         "now": utc_now_str(), "job": scan_job_id})
     session.commit()
     if source:
-        attach_source_tag(session, project_id, [hostname], source)
+        attach_tag(session, project_id, [hostname], source)
     return new_id if result.rowcount else None
 
 

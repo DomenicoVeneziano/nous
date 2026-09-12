@@ -17,7 +17,6 @@ export function useAuth() {
     token,
     role,
     isAdmin: role === 'admin',
-    isAuthenticated: !!token,
     login,
     logout,
   };

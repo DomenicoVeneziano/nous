@@ -1,5 +1,6 @@
 // frontend/src/api/settings.ts
 import client from './client';
+import { downloadBlob } from '../lib/download';
 import type { User, UserCreate } from '../types/user';
 import type { AssetSearchResult } from '../types/asset';
 
@@ -140,11 +141,5 @@ export async function exportAssets(query: string, format: 'json' | 'csv', projec
   const params: Record<string, string> = { query, format };
   if (projectId) params.project_id = projectId;
   const { data } = await client.get('/search/export', { params, responseType: 'blob' });
-  const mime = format === 'csv' ? 'text/csv' : 'application/json';
-  const url = URL.createObjectURL(new Blob([data], { type: mime }));
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `export.${format}`;
-  a.click();
-  URL.revokeObjectURL(url);
+  downloadBlob(data, `export.${format}`, format === 'csv' ? 'text/csv' : 'application/json');
 }

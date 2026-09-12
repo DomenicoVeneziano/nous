@@ -82,8 +82,7 @@ export default function ApiKeyManagement() {
       setShowCreate(false);
       load();
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setCreateError(msg || 'Failed to create key');
+      setCreateError((err as Error)?.message || 'Failed to create key');
     } finally {
       setCreating(false);
     }
@@ -122,8 +121,7 @@ export default function ApiKeyManagement() {
       cancelEdit();
       load();
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setEditError(msg || 'Failed to rename');
+      setEditError((err as Error)?.message || 'Failed to rename');
     }
   };
 

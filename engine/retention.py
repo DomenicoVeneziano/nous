@@ -30,7 +30,7 @@ LOGS_ROOT = Path("data/projects")
 # after the tree was removed. Playwright/camoufox profiles are the expensive
 # ones — roughly 70 MB per abandoned tech-analysis run.
 TMP_ROOT = Path(os.environ.get("TMPDIR", "/tmp"))
-TMP_RETENTION_HOURS = int(os.environ.get("TMP_RETENTION_HOURS", "6"))
+TMP_RETENTION_HOURS = 6
 STALE_TMP_PREFIXES = (
     "nous_run_",
     "playwright_firefoxdev_profile",
@@ -43,11 +43,11 @@ STALE_TMP_PREFIXES = (
 # asset_changes gains a row per changed field per scan write, so a churning
 # project grows it without bound. A quarter of history still answers "what
 # changed since last month" and bounds the table at a knowable size.
-CHANGE_RETENTION_DAYS = int(os.environ.get("CHANGE_RETENTION_DAYS", "90"))
-CHANGE_PRUNE_BATCH = int(os.environ.get("CHANGE_PRUNE_BATCH", "1000"))
+CHANGE_RETENTION_DAYS = 90
+CHANGE_PRUNE_BATCH = 1000
 # Hard ceiling of 200k rows per sweep so one call cannot hold the write lock
 # indefinitely; the remainder goes with the next tick six hours later.
-CHANGE_PRUNE_MAX_BATCHES = int(os.environ.get("CHANGE_PRUNE_MAX_BATCHES", "200"))
+CHANGE_PRUNE_MAX_BATCHES = 200
 
 
 def _cleanup_old_logs_sync():
@@ -89,7 +89,6 @@ def _newest_mtime(path: Path) -> float:
 def _cleanup_stale_tmp_sync():
     cutoff = time.time() - TMP_RETENTION_HOURS * 3600
     removed = 0
-    reclaimed = 0
     try:
         entries = list(TMP_ROOT.iterdir())
     except OSError as e:
@@ -102,27 +101,18 @@ def _cleanup_stale_tmp_sync():
             if entry.is_dir():
                 if _newest_mtime(entry) >= cutoff:
                     continue
-                size = sum(
-                    os.lstat(os.path.join(r, f)).st_size
-                    for r, _, fs in os.walk(entry, onerror=lambda e: None)
-                    for f in fs
-                    if os.path.exists(os.path.join(r, f))
-                )
                 shutil.rmtree(entry, ignore_errors=True)
             else:
-                stat = entry.stat()
-                if stat.st_mtime >= cutoff:
+                if entry.stat().st_mtime >= cutoff:
                     continue
-                size = stat.st_size
                 entry.unlink()
             removed += 1
-            reclaimed += size
         except Exception as e:
             log.warning(f"Could not remove {entry}: {e}")
     if removed:
         log.info(
             f"Removed {removed} stale tmp entr{'y' if removed == 1 else 'ies'} "
-            f"older than {TMP_RETENTION_HOURS}h ({reclaimed / 1_048_576:.1f} MB reclaimed)"
+            f"older than {TMP_RETENTION_HOURS}h"
         )
 
 

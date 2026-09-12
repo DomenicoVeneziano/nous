@@ -22,10 +22,10 @@ import re
 import httpx
 
 from config import settings as cfg
-from services.settings_store import NOTIFY_BOUNDS, validate_webhook_url
+from services.settings_store import validate_webhook_url
 
 from . import render
-from .summary import empty_summary, is_failure, is_success
+from .summary import clamped, empty_summary, is_failure, is_success
 
 log = logging.getLogger("backend.notifications")
 
@@ -124,22 +124,12 @@ _TIMEOUT_GRACE_SECONDS = 1.0
 _USER_AGENT = "Nous/1.0"
 
 
-def _clamped(key: str) -> int:
-    """A bounded NOTIFY_* integer, re-clamped at use time as well as at save time."""
-    low, high = NOTIFY_BOUNDS[key]
-    try:
-        value = int(getattr(cfg, key, low))
-    except (TypeError, ValueError):
-        value = low
-    return max(low, min(high, value))
-
-
 def _timeout_seconds() -> float:
-    return float(_clamped("NOTIFY_TIMEOUT_SECONDS"))
+    return float(clamped("NOTIFY_TIMEOUT_SECONDS"))
 
 
 def _retries() -> int:
-    return _clamped("NOTIFY_RETRIES")
+    return clamped("NOTIFY_RETRIES")
 
 
 def _stored(key: str) -> str:
@@ -191,7 +181,8 @@ def _build_target(channel: str, event: dict) -> tuple[str, dict, dict] | None:
         if token:
             headers = dict(headers)
             headers["Authorization"] = f"Bearer {token}"
-        return url, headers, render.build_generic_payload(event)
+        # The canonical event IS the generic webhook body; nothing to render.
+        return url, headers, event
 
     if channel == "telegram":
         token = _stored("NOTIFY_TELEGRAM_BOT_TOKEN")

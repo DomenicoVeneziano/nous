@@ -4,7 +4,7 @@ from fastapi.responses import PlainTextResponse, FileResponse
 from pydantic import BaseModel
 from pathlib import Path
 from auth.middleware import require_viewer, require_admin
-from config import settings
+from storage import PROJECTS_DIR, resolve_within
 import os
 
 _ALLOWED_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp"}
@@ -23,10 +23,8 @@ def get_image(
     _: dict = Depends(require_viewer),
 ):
     """Serve a binary image (e.g. a tech-analysis screenshot) from data/projects/."""
-    file_path = (settings.DATA_DIR / "projects" / path).resolve()
-    safe_base = (settings.DATA_DIR / "projects").resolve()
-
-    if not file_path.is_relative_to(safe_base):
+    file_path = resolve_within(path)
+    if file_path is None:
         raise HTTPException(403, "Access denied")
     if file_path.suffix.lower() not in _ALLOWED_IMAGE_EXT:
         raise HTTPException(400, "Not an image file")
@@ -42,12 +40,18 @@ def get_file_tree(
     _: dict = Depends(require_viewer),
 ):
     """Return the directory structure for a project's data folder."""
-    project_dir = settings.DATA_DIR / "projects" / project_id
+    base = PROJECTS_DIR.resolve()
+    # project_id is a raw query parameter: confine it like every other stored
+    # path before walking it, or "../.." lists the whole app root (the
+    # relative_to() below matches lexically and would not catch it). Landing on
+    # the projects root itself ("" or ".") is an escape of the same kind.
+    project_dir = resolve_within(project_id)
+    if project_dir is None or project_dir == base:
+        raise HTTPException(403, "Access denied")
     if not project_dir.is_dir():
         raise HTTPException(404, "Project directory not found")
 
     tree = []
-    base = settings.DATA_DIR / "projects"
     for root, dirs, files in os.walk(project_dir):
         rel_root = Path(root).relative_to(base)
         for f in sorted(files):
@@ -61,11 +65,8 @@ def get_file_content(
     _: dict = Depends(require_viewer),
 ):
     """Read file content within the data/projects/ directory."""
-    # Validate path stays within data/projects/
-    file_path = (settings.DATA_DIR / "projects" / path).resolve()
-    safe_base = (settings.DATA_DIR / "projects").resolve()
-
-    if not file_path.is_relative_to(safe_base):
+    file_path = resolve_within(path)
+    if file_path is None:
         raise HTTPException(403, "Access denied")
     if not file_path.is_file():
         raise HTTPException(404, "File not found")
@@ -84,10 +85,10 @@ def update_file_content(
     _: dict = Depends(require_admin),
 ):
     """Write file content within the data/projects/ directory. Admin only."""
-    file_path = (settings.DATA_DIR / "projects" / data.path).resolve()
-    safe_base = (settings.DATA_DIR / "projects").resolve()
-
-    if not file_path.is_relative_to(safe_base):
+    # No is_file() test here, unlike the read paths: this route creates the file
+    # when it does not exist yet, so only its parent has to be a real directory.
+    file_path = resolve_within(data.path)
+    if file_path is None:
         raise HTTPException(403, "Access denied")
     if not file_path.parent.is_dir():
         raise HTTPException(404, "Parent directory not found")

@@ -13,9 +13,11 @@ interface Props {
   onChanged?: () => void;
 }
 
+/** The API client's response interceptor has already collapsed FastAPI's
+ *  `detail` — string, 422 array, or bare status — onto `message`. The fallback
+ *  only covers a rejection that never reached it. */
 function errorMessage(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
-  return typeof detail === 'string' ? detail : fallback;
+  return (err as { message?: string })?.message || fallback;
 }
 
 const DEFAULT_COLOR = '#a3a3a3';
@@ -109,6 +111,8 @@ export default function TagManager({ projectId, open, onClose, onChanged }: Prop
     run(() => deleteTag(projectId, tagId), 'Could not delete tag')
       .then(() => setConfirmId(null));
 
+  /* Not the shared `.input` rule: that is the 13px page-level field on
+   * --bg-base with 11px/14px padding. These are the compact mono fields. */
   const inputStyle: React.CSSProperties = {
     background: 'var(--bg-void)', border: '1px solid var(--border-default)',
     borderRadius: 'var(--radius-sm)', color: 'var(--text-primary)',

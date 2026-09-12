@@ -11,7 +11,7 @@ import AssetTable from '../components/project/AssetTable';
 import AssetDetail from '../components/project/AssetDetail';
 import TechPieChart from '../components/project/TechPieChart';
 import BulkActionsMenu from '../components/projects/BulkActionsMenu';
-import ProjectEditOverlay from '../components/projects/ProjectEditOverlay';
+import ProjectOverlay from '../components/projects/ProjectOverlay';
 import ReconScopeModal from '../components/project/ReconScopeModal';
 import FindingsSearchView from '../components/project/FindingsSearchView';
 import ScreenshotsView from '../components/project/ScreenshotsView';
@@ -46,29 +46,6 @@ function withHighlights(prev: Asset, fresh: Asset): Asset {
   if (!highlights) return fresh;
   const merged: AssetSearchResult = { ...fresh, highlights };
   return merged;
-}
-
-/** Pull FastAPI's `detail` off a failed request so the operator sees the
- *  server's reason (a CIDR that expands past the cap, a duplicate hostname).
- *  `detail` is a string for an explicit HTTPException and a list of error
- *  objects for a pydantic-level 422, so both shapes are rendered; a
- *  transport-level failure falls back to the error's own message. */
-function errorDetail(reason: unknown): string {
-  const detail = (reason as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
-  if (typeof detail === 'string') return detail;
-  if (Array.isArray(detail)) {
-    const parts = detail.flatMap((entry) => {
-      const { msg, loc } = (entry ?? {}) as { msg?: unknown; loc?: unknown };
-      if (typeof msg !== 'string') return [];
-      // `loc` reads like ['body', 'asset']; only its tail names the field the
-      // operator can act on, so the envelope prefix is dropped.
-      const field = Array.isArray(loc) ? loc[loc.length - 1] : undefined;
-      return [typeof field === 'string' || typeof field === 'number' ? `${field}: ${msg}` : msg];
-    });
-    if (parts.length > 0) return parts.join('; ');
-  }
-  if (reason instanceof Error && reason.message) return reason.message;
-  return 'Request failed';
 }
 
 /** HTTP status of a failed request, when the failure reached the server at all. */
@@ -245,7 +222,7 @@ export default function ProjectView() {
       // fails with the server's own explanation and the rest still land.
       const failures = outcomes.flatMap((outcome, idx) => (
         outcome.status === 'rejected'
-          ? [{ line: lines[idx], detail: errorDetail(outcome.reason) }]
+          ? [{ line: lines[idx], detail: (outcome.reason as Error).message }]
           : []
       ));
       setAddErrors(failures);
@@ -299,14 +276,6 @@ export default function ProjectView() {
   };
 
   if (!current) return <div style={{ color: 'var(--text-muted)' }}>Loading...</div>;
-
-  const inputStyle: React.CSSProperties = {
-    width: '100%', background: 'var(--bg-base)',
-    border: '1px solid var(--border-default)',
-    borderRadius: 6, color: 'var(--text-primary)', padding: '9px 12px', fontSize: 13,
-    outline: 'none', fontFamily: 'var(--font-mono)',
-    transition: 'border-color var(--transition-fast)',
-  };
 
   return (
     <div style={{ display: 'flex', height: '100%' }}>
@@ -400,11 +369,15 @@ export default function ProjectView() {
             <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
               <div style={{ flex: 1 }}>
                 <textarea
+                  className="input"
                   value={newAssetValue}
                   onChange={(e) => { setNewAssetValue(e.target.value); setAddErrors([]); }}
                   placeholder={"sub.example.com [200] [Page Title] [12345] [Next.js, PHP]\nanother.example.com"}
                   rows={3}
-                  style={{ ...inputStyle, resize: 'vertical', lineHeight: 1.6, fontSize: 12 }}
+                  style={{
+                    padding: '9px 12px', fontFamily: 'var(--font-mono)',
+                    resize: 'vertical', lineHeight: 1.6, fontSize: 12,
+                  }}
                 />
               </div>
               <button
@@ -508,11 +481,11 @@ export default function ProjectView() {
       )}
 
       {current && (
-        <ProjectEditOverlay
+        <ProjectOverlay
           project={current}
           open={showEdit}
           onClose={() => setShowEdit(false)}
-          onUpdated={() => { if (id) loadProject(id); loadProjects(); }}
+          onSaved={() => { if (id) loadProject(id); loadProjects(); }}
           onDeleted={() => { loadProjects(); navigate('/projects'); }}
         />
       )}

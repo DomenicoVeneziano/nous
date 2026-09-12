@@ -38,6 +38,3 @@ services:
       - ./scripts:/app/scripts:ro
     depends_on:
       - backend
-
-volumes:
-  data:

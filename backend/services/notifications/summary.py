@@ -75,15 +75,18 @@ _SQL_NEW_ASSET_SAMPLE = text(
 _SQL_PROJECT_TITLE = text("SELECT title FROM projects WHERE id = :pid")
 
 
-def clamped_sample_size() -> int:
-    """NOTIFY_SAMPLE_SIZE forced back inside its declared bounds (0-20).
+def clamped(key: str) -> int:
+    """A bounded NOTIFY_* integer forced back inside its declared bounds.
 
-    Re-clamped at read time, not just at save time, so a row edited straight in
-    the database can never widen how many rows a notification reads.
+    Re-clamped at use time, not just at save time, so a row edited straight in
+    the database can never widen how many rows a notification reads, how long a
+    send may hang, or how many times it retries. sender.py imports this for its
+    timeout and retry bounds rather than keeping a second copy; summary.py is
+    the lower module of the two, so the import direction cannot cycle.
     """
-    low, high = NOTIFY_BOUNDS["NOTIFY_SAMPLE_SIZE"]
+    low, high = NOTIFY_BOUNDS[key]
     try:
-        value = int(getattr(cfg, "NOTIFY_SAMPLE_SIZE", low))
+        value = int(getattr(cfg, key, low))
     except (TypeError, ValueError):
         value = low
     return max(low, min(high, value))
@@ -128,7 +131,7 @@ def collect_summary(project_id: str, scan_id: str) -> dict:
     running outside a request (the notifier, the scheduler) never holds a
     connection across an await.
     """
-    n = clamped_sample_size()
+    n = clamped("NOTIFY_SAMPLE_SIZE")
     db = SessionLocal()
     try:
         params = {"pid": project_id, "sid": scan_id}

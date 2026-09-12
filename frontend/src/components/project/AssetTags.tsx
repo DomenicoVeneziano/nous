@@ -15,9 +15,11 @@ interface Props {
   onTagsChanged?: (asset: Asset) => void;
 }
 
+/** The API client's response interceptor has already collapsed FastAPI's
+ *  `detail` — string, 422 array, or bare status — onto `message`. The fallback
+ *  only covers a rejection that never reached it. */
 function errorMessage(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { detail?: unknown } } })?.response?.data?.detail;
-  return typeof detail === 'string' ? detail : fallback;
+  return (err as { message?: string })?.message || fallback;
 }
 
 /**

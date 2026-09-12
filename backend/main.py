@@ -83,37 +83,24 @@ _notifier_task: asyncio.Task | None = None
 log = logging.getLogger("backend.main")
 
 
-def _scheduler_task_done(task: asyncio.Task):
-    """Report a scheduler loop that ended on its own.
+def _loop_done(name: str, clause: str):
+    """Build a done-callback that reports a background loop ending on its own.
 
     Nothing else would: the API keeps serving and /health keeps returning ok
-    while schedules quietly stop firing. Logged rather than restarted — a loop
-    that died did so for a reason a restart would hit again, and the operator
-    needs to see it in the container logs.
+    while the loop's work quietly stops happening. Logged rather than restarted
+    — a loop that died did so for a reason a restart would hit again, and the
+    operator needs to see it in the container logs.
     """
-    if _shutdown_event.is_set() or task.cancelled():
-        return  # Ordinary shutdown.
-    exc = task.exception()
-    if exc is not None:
-        log.error("Scheduler loop crashed; recurring scans have stopped", exc_info=exc)
-    else:
-        log.error("Scheduler loop exited early; recurring scans have stopped")
+    def callback(task: asyncio.Task):
+        if _shutdown_event.is_set() or task.cancelled():
+            return  # Ordinary shutdown.
+        exc = task.exception()
+        if exc is not None:
+            log.error("%s loop crashed; %s", name, clause, exc_info=exc)
+        else:
+            log.error("%s loop exited early; %s", name, clause)
 
-
-def _notifier_task_done(task: asyncio.Task):
-    """Report a notifier loop that ended on its own.
-
-    Same reasoning as the scheduler's callback: the API keeps serving while
-    finished scans quietly stop producing notifications, so the exit is logged
-    rather than restarted and the operator sees it in the container logs.
-    """
-    if _shutdown_event.is_set() or task.cancelled():
-        return  # Ordinary shutdown.
-    exc = task.exception()
-    if exc is not None:
-        log.error("Notifier loop crashed; notifications have stopped", exc_info=exc)
-    else:
-        log.error("Notifier loop exited early; notifications have stopped")
+    return callback
 
 
 @app.on_event("startup")
@@ -146,9 +133,9 @@ async def startup():
 
     global _scheduler_task, _notifier_task
     _scheduler_task = asyncio.create_task(scheduler_loop(_shutdown_event))
-    _scheduler_task.add_done_callback(_scheduler_task_done)
+    _scheduler_task.add_done_callback(_loop_done("Scheduler", "recurring scans have stopped"))
     _notifier_task = asyncio.create_task(notifier_loop(_shutdown_event))
-    _notifier_task.add_done_callback(_notifier_task_done)
+    _notifier_task.add_done_callback(_loop_done("Notifier", "notifications have stopped"))
 
 
 async def _stop(task: asyncio.Task | None):

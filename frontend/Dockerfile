@@ -11,11 +11,7 @@ CMD ["npm", "run", "dev", "--", "--host"]
 
 # ── Build stage ──────────────────────────────────────────────
 # Produces the optimized static bundle in /app/dist (vite build, after tsc).
-FROM node:20-alpine AS build
-WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm install
-COPY . .
+FROM dev AS build
 RUN npm run build
 
 # ── Production runtime (default) ──────────────────────────────

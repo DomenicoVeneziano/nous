@@ -17,11 +17,6 @@ export async function fetchHistory(): Promise<ScanJob[]> {
   return data;
 }
 
-export async function reorderJob(jobId: string, queuePos: number): Promise<ScanJob> {
-  const { data } = await client.patch<ScanJob>(`/scans/${jobId}/position`, { queue_pos: queuePos });
-  return data;
-}
-
 export async function cancelJob(jobId: string): Promise<void> {
   await client.delete(`/scans/${jobId}`);
 }

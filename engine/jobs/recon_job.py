@@ -11,8 +11,8 @@ from parsers.recon_parser import (
 )
 from queue_manager import (
     get_session, transition_status, get_project_domains,
-    get_project_asset_hostnames, insert_assets_bulk, merge_crawled_urls_bulk,
-    refresh_project_counts, attach_source_tag,
+    get_asset_hostnames, insert_assets_bulk, merge_crawled_urls_bulk,
+    refresh_project_counts, attach_tag,
 )
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -58,7 +58,7 @@ async def run_recon_job(job: dict, ws_broadcast=None):
             mode="w", suffix=".txt", prefix="nous_known_", delete=False
         ) as tmp:
             known_subs_path = tmp.name
-            tmp.write("\n".join(get_project_asset_hostnames(session, project_id)))
+            tmp.write("\n".join(get_asset_hostnames(session, project_id=project_id)))
 
         # Read settings from job config (set at enqueue time), fall back to env vars
         cfg = job.get("config") or {}
@@ -141,7 +141,7 @@ async def run_recon_job(job: dict, ws_broadcast=None):
             # already known to the project are tagged too — an independent
             # rediscovery is a real second source.
             for source, hosts in sources.items():
-                attach_source_tag(session, project_id, sorted(hosts), source)
+                attach_tag(session, project_id, sorted(hosts), source)
             if host_paths:
                 merge_crawled_urls_bulk(session, project_id, host_paths, source="archived")
             if subs or host_paths:

@@ -92,11 +92,6 @@ export async function fetchAssetChanges(
   return data;
 }
 
-export async function countAssets(projectId: string): Promise<number> {
-  const { data } = await client.get<{ count: number }>(`/projects/${projectId}/assets/count`);
-  return data.count;
-}
-
 export async function fetchTechDistribution(): Promise<{ name: string; count: number }[]> {
   const { data } = await client.get<{ name: string; count: number }[]>('/stats/technologies');
   return data;

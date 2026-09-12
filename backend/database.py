@@ -50,7 +50,9 @@ _NOTIFY_BACKFILL_SENTINEL = "NOTIFY_BACKFILL_DONE"
 
 # How SQLAlchemy renders a DateTime for SQLite: naive, no offset. Raw SQL writes
 # to those columns have to match it or the two forms sort against each other.
-_TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+# Public: the routers and services that write or parse those columns import it
+# from here rather than restating the literal.
+TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
 
 _FTS_CREATE = """
     CREATE VIRTUAL TABLE IF NOT EXISTS asset_fts USING fts5(
@@ -164,7 +166,7 @@ def _migrate_asset_rows(cur):
                 cur.execute(
                     "INSERT INTO tags (id, project_id, name, is_system, created_at) "
                     "VALUES (?, ?, 'Manual', 1, ?)",
-                    (tag_id, pid, datetime.now(timezone.utc).strftime(_TS_FORMAT)),
+                    (tag_id, pid, datetime.now(timezone.utc).strftime(TS_FORMAT)),
                 )
             for asset_id in asset_ids:
                 cur.execute(
@@ -331,6 +333,39 @@ def init_db():
                 conn.commit()
             except Exception:
                 pass  # Column or index already exists
+
+    # Retire three Project columns nothing reads any more: logo_path (never
+    # populated), subdomains (the scope's non-wildcard entries have been stored
+    # as assets for a long time) and is_master. They cannot simply be left in
+    # place unmapped: subdomains and is_master are NOT NULL with a Python-side
+    # default, so create_all emitted no SQL-level default, and an INSERT from the
+    # current model — which no longer names them — would fail the NOT NULL
+    # constraint, making every new project unwritable. As with manually_inserted
+    # above, DROP COLUMN needs SQLite 3.35.0; older builds parse it as a syntax
+    # error, so refuse explicitly and say what to upgrade rather than boot into
+    # that state. PRAGMA table_info is the idempotence check: once the columns
+    # are gone a re-run finds nothing to do.
+    with engine.connect() as conn:
+        present = {r[1] for r in conn.execute(text("PRAGMA table_info(projects)"))}
+        stale = [c for c in ("logo_path", "subdomains", "is_master") if c in present]
+        if stale:
+            sqlite_version = conn.execute(text("SELECT sqlite_version()")).scalar()
+            if tuple(int(p) for p in sqlite_version.split(".")[:2]) < (3, 35):
+                raise RuntimeError(
+                    f"SQLite 3.35.0 or newer is required to complete this schema "
+                    f"upgrade (found {sqlite_version}). Upgrade SQLite and restart."
+                )
+            # No try/except here on purpose: PRAGMA table_info above already
+            # supplies the idempotence, so a swallow could only hide a genuine
+            # failure. SQLite refuses DROP COLUMN when the column is named by an
+            # index, view, trigger, CHECK constraint or generated column, and a
+            # silent failure there leaves subdomains/is_master on the table while
+            # the ORM no longer maps them — the exact NOT NULL breakage this
+            # migration exists to prevent. Let the SQLite error propagate; it
+            # carries the offending statement, so it names the column itself.
+            for col in stale:
+                conn.execute(text(f"ALTER TABLE projects DROP COLUMN {col}"))
+                conn.commit()
 
     # One-shot claim of the historical backlog. Every job that had already
     # reached a terminal state before notifications existed is stamped as sent,

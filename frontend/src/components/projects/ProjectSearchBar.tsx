@@ -3,6 +3,7 @@ import React, { useCallback } from 'react';
 import { Search, Download } from 'lucide-react';
 import type { Project } from '../../types/project';
 import SearchHelpButton from '../shared/SearchHelpButton';
+import { downloadBlob } from '../../lib/download';
 
 interface Props {
   value: string;
@@ -38,16 +39,6 @@ const linkStyle: React.CSSProperties = {
   fontWeight: 500, letterSpacing: '0.03em', cursor: 'pointer',
   transition: 'all var(--transition-fast)',
 };
-
-function downloadBlob(content: string, filename: string, mime: string) {
-  const blob = new Blob([content], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
 
 export default function ProjectSearchBar({ value, onChange, filtered }: Props) {
   const exportJSON = useCallback(() => {

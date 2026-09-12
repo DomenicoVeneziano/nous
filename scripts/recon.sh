@@ -114,6 +114,7 @@ permuted_subs=$(mktemp "${TMPDIR:-/tmp}/nous_perm.XXXXXX")
 combined_subs=$(mktemp "${TMPDIR:-/tmp}/nous_combined.XXXXXX")
 wildcard_domains=$(mktemp "${TMPDIR:-/tmp}/nous_wildcard.XXXXXX")
 new_words=$(mktemp "${TMPDIR:-/tmp}/nous_newwords.XXXXXX")
+novel_words=$(mktemp "${TMPDIR:-/tmp}/nous_novelwords.XXXXXX")
 expanded_wordlist=$(mktemp "${TMPDIR:-/tmp}/nous_expanded_wl.XXXXXX")
 filtered_wordlist=$(mktemp "${TMPDIR:-/tmp}/nous_filtered_wl.XXXXXX")
 raw_archived_urls=$(mktemp "${TMPDIR:-/tmp}/nous_archived_urls.XXXXXX")
@@ -125,7 +126,7 @@ sources_file="$(dirname "$output_file")/subdomain_sources.tsv"
 
 cleanup() {
     rm -f "$active_subs" "$bruteforced_subs" "$permuted_subs" \
-          "$combined_subs" "$wildcard_domains" "$new_words" \
+          "$combined_subs" "$wildcard_domains" "$new_words" "$novel_words" \
           "$expanded_wordlist" "$filtered_wordlist" "$raw_archived_urls" \
           "$output_file.tmp.$$" "$archived_urls_file.tmp.$$" "$sources_file.tmp.$$"
 }
@@ -279,17 +280,22 @@ else
         }' "$active_subs" \
             | sort -u > "$new_words"
 
-        # Append only words that are NOT already in the expanded wordlist
+        # Append only words that are NOT already in the expanded wordlist.
+        # One grep pass over the whole token set, not one per token: the
+        # wordlist runs to ~110k lines and a per-word scan of it is quadratic.
+        # Staged in $novel_words because the pattern side and the append target
+        # are the same file — reading and appending to it in one pipeline would
+        # race itself. `awk NF` on both sides is load-bearing: a blank line in
+        # the pattern file makes -vxFf reject every input line, and a blank
+        # token on the input side is one the per-word loop used to skip.
+        # `awk !seen` keeps the loop's behaviour for a token repeated within
+        # $new_words: the first occurrence was appended, the rest then matched.
         if [[ -s "$new_words" ]]; then
-            added=0
-            while IFS= read -r word; do
-                # Skip empty tokens
-                [[ -z "$word" ]] && continue
-                if ! grep -qxF -- "$word" "$expanded_wordlist"; then
-                    echo "$word" >> "$expanded_wordlist"
-                    ((added++)) || true
-                fi
-            done < "$new_words"
+            awk 'NF' "$new_words" \
+                | grep -vxFf <(awk 'NF' "$expanded_wordlist") - \
+                | awk '!seen[$0]++' > "$novel_words" || true
+            added=$(wc -l < "$novel_words" | tr -d '[:space:]')
+            cat "$novel_words" >> "$expanded_wordlist"
             echo "[+] Appended $added new word(s) to expanded wordlist."
         else
             echo "[*] No new tokens extracted from active scan results."

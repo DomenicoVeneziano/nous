@@ -65,7 +65,6 @@ class ProjectCreate(BaseModel):
     title: str
     description: str | None = None
     root_domains: list[str] = Field(max_length=MAX_SCOPE_ENTRIES)
-    subdomains: list[str] = []
     schedule_enabled: bool = False
     schedule_interval_value: int | None = Field(default=None, ge=1, le=MAX_INTERVAL_VALUE)
     schedule_interval_unit: Literal["hours", "days", "weeks", "months"] | None = None
@@ -82,7 +81,6 @@ class ProjectUpdate(BaseModel):
     title: str | None = None
     description: str | None = None
     root_domains: list[str] | None = Field(default=None, max_length=MAX_SCOPE_ENTRIES)
-    subdomains: list[str] | None = None
     status: str | None = None
     schedule_enabled: bool | None = None
     schedule_interval_value: int | None = Field(default=None, ge=1, le=MAX_INTERVAL_VALUE)
@@ -102,15 +100,12 @@ class ProjectOut(BaseModel):
     title: str
     description: str | None
     icon: str | None
-    logo_path: str | None
     root_domains: list[str]
-    subdomains: list[str]
     status: str
     last_scan_date: datetime | None
     last_scan_duration_s: float | None
     asset_count: int
     tech_count: int
-    is_master: bool
     schedule_enabled: bool
     schedule_interval_value: int | None
     schedule_interval_unit: str | None

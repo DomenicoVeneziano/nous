@@ -1,5 +1,6 @@
 # backend/routers/stats.py
 import json
+from collections import Counter
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -21,7 +22,7 @@ def tech_distribution(db: Session = Depends(get_db), _: dict = Depends(require_v
         "WHERE technologies IS NOT NULL AND technologies != '' AND technologies != '[]'"
     )).fetchall()
 
-    counts: dict[str, int] = {}
+    counts: Counter[str] = Counter()
     for (value,) in rows:
         # value may be a Python list (ORM path) or a JSON string (raw-SQL path)
         if isinstance(value, list):
@@ -33,12 +34,6 @@ def tech_distribution(db: Session = Depends(get_db), _: dict = Depends(require_v
                 continue
         else:
             continue
-        for tech in techs:
-            if tech and isinstance(tech, str):
-                counts[tech] = counts.get(tech, 0) + 1
+        counts.update(tech for tech in techs if tech and isinstance(tech, str))
 
-    return sorted(
-        [{"name": k, "count": v} for k, v in counts.items()],
-        key=lambda x: x["count"],
-        reverse=True,
-    )
+    return [{"name": name, "count": count} for name, count in counts.most_common()]

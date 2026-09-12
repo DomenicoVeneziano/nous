@@ -25,14 +25,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -sL "https://github.com/projectdiscovery/subfinder/releases/download/v2.13.0/subfinder_2.13.0_linux_${TARGETARCH}.zip" \
     -o /tmp/subfinder.zip && \
     unzip /tmp/subfinder.zip subfinder -d /usr/local/bin && \
-    rm /tmp/subfinder.zip
-
-RUN curl -sL "https://github.com/lc/gau/releases/download/v2.2.4/gau_2.2.4_linux_${TARGETARCH}.tar.gz" \
+    rm /tmp/subfinder.zip && \
+    curl -sL "https://github.com/lc/gau/releases/download/v2.2.4/gau_2.2.4_linux_${TARGETARCH}.tar.gz" \
     -o /tmp/gau.tar.gz && \
     tar -xzf /tmp/gau.tar.gz -C /usr/local/bin gau && \
-    rm /tmp/gau.tar.gz
-
-RUN curl -sL "https://github.com/d3mondev/puredns/releases/download/v2.1.1/puredns-Linux-${TARGETARCH}.tgz" \
+    rm /tmp/gau.tar.gz && \
+    curl -sL "https://github.com/d3mondev/puredns/releases/download/v2.1.1/puredns-Linux-${TARGETARCH}.tgz" \
     -o /tmp/puredns.tgz && \
     tar -xzf /tmp/puredns.tgz -C /usr/local/bin puredns && \
     rm /tmp/puredns.tgz

@@ -3,17 +3,16 @@ import asyncio
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 
 from runner import run_script
 from parsers.crawler_parser import parse_crawler_output
 from queue_manager import (
     get_session, transition_status, get_asset_hostnames,
-    get_all_project_asset_details, insert_assets_bulk, merge_crawled_urls_bulk,
+    insert_assets_bulk, merge_crawled_urls_bulk,
     refresh_project_counts, set_last_crawl_at, SOURCE_CRAWLING, SOURCE_REDIRECT,
     attach_tag, detach_tag, job_is_cancelled, SYSTEM_TAG_PROXIED,
-    get_project_domains, is_in_scope, insert_asset_if_absent, attach_source_tag,
+    get_project_domains, is_in_scope, insert_asset_if_absent,
     enqueue_scan,
 )
 
@@ -38,12 +37,6 @@ RETRY_STATUSES = frozenset({403, 429, 503, 520, 521, 522, 523, 524})
 # direct re-crawl would trade up to 20 minutes of wall clock per host for a
 # near-zero recovery rate.
 PASS_LABELS = ("direct crawl", "proxy retry")
-
-# Re-validated at the DB boundary before a redirect destination is inserted.
-# The parser already enforces this shape, but the value crosses a process
-# boundary (an attacker-controlled Location header, via a file on disk) before
-# it reaches a write, so it is checked once more where it is used.
-HOSTNAME_RE = re.compile(r"^[a-zA-Z0-9._\-]+$")
 
 
 def _is_retry_candidate(parsed: dict | None) -> bool:
@@ -155,7 +148,7 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
         if asset_ids:
             hostnames = get_asset_hostnames(session, asset_ids)
         else:
-            hostnames = [a["hostname"] for a in get_all_project_asset_details(session, project_id)]
+            hostnames = get_asset_hostnames(session, project_id=project_id)
         if not hostnames:
             transition_status(session, job_id, "running", "failed", error_msg="No assets to crawl")
             if ws_broadcast:
@@ -520,11 +513,8 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
                 if not is_in_scope(dest, root_domains):
                     await line_broadcast(f"[!] Redirect target out of scope, not added: {dest}")
                     continue
-                # 3. Defence in depth at the DB boundary.
-                if not HOSTNAME_RE.match(dest):
-                    continue
-                # 4. `source` is deliberately NOT passed here. insert_asset_if_absent
-                #    runs `if source: attach_source_tag(...)` BEFORE it inspects
+                # 3. `source` is deliberately NOT passed here. insert_asset_if_absent
+                #    runs `if source: attach_tag(...)` BEFORE it inspects
                 #    rowcount, so handing it a source would tag a host that already
                 #    existed — breaking the rule that an already-tracked
                 #    destination gets no change at all. The tag is attached below,
@@ -552,11 +542,11 @@ async def run_crawler_job(job: dict, ws_broadcast=None):
                 await line_broadcast(f"[+] In-scope redirect target added: {dest}")
 
             # Both guarded on an actual insert. Every destination can be skipped
-            # — already tracked, out of scope, or an unusable hostname — and in
-            # that case nothing was written, so there is no source tag to attach
-            # and no count that changed to refresh.
+            # — already tracked, or out of scope — and in that case nothing was
+            # written, so there is no source tag to attach and no count that
+            # changed to refresh.
             if inserted_hosts:
-                attach_source_tag(session, project_id, inserted_hosts, SOURCE_REDIRECT)
+                attach_tag(session, project_id, inserted_hosts, SOURCE_REDIRECT)
                 refresh_project_counts(session, project_id)
 
             # Exactly ONE batched job for every new host, never one per host —

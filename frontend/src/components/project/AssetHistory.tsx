@@ -36,7 +36,9 @@ function statusColor(value: string | null): string {
   return 'var(--status-error)';
 }
 
-/** Render an ISO timestamp in the viewer's locale, or "Unknown" when unset. */
+/** Render an ISO timestamp in the viewer's locale, or "Unknown" when unset.
+ *  Not lib/datetime's formatDateTime: that renders dateStyle 'medium' /
+ *  timeStyle 'short', which drops the seconds and restyles the date. */
 function formatTimestamp(value: string | null): string {
   if (!value) return 'Unknown';
   const parsed = parseBackendDate(value);

@@ -54,6 +54,8 @@ function resolveFileSpans(highlights: Highlight[], fileContent: string): { start
 /** Render an ISO timestamp in the viewer's locale, or "Unknown" when unset.
  *  Assets that predate tagging have no recorded discovery date — that is
  *  genuinely unknown rather than zero, so it is not faked from another field. */
+/*  Not lib/datetime's formatDateTime: that renders dateStyle 'medium' /
+ *  timeStyle 'short', which drops the seconds and restyles the date. */
 function formatTimestamp(value: string | null): string {
   if (!value) return 'Unknown';
   const parsed = parseBackendDate(value);
@@ -505,6 +507,8 @@ export default function AssetDetail({ asset, highlights, onClose, onAssetUpdated
     letterSpacing: '0.08em', marginBottom: 8,
   };
 
+  /* Not the shared `.input` rule: that is the 13px page-level field on
+   * --bg-base with 11px/14px padding. These are the compact mono fields. */
   const inputStyle: React.CSSProperties = {
     width: '100%', background: 'var(--bg-elevated)',
     border: '1px solid var(--border-default)',

@@ -1,3 +1,2 @@
 sqlalchemy==2.0.35
-aiosqlite==0.20.0
 websockets==13.1

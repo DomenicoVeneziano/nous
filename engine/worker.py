@@ -26,7 +26,7 @@ logging.basicConfig(
 log = logging.getLogger("engine.worker")
 
 BACKEND_WS_URL = os.environ.get("BACKEND_WS_URL", "ws://backend:8000/ws/scan")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
+POLL_INTERVAL = 5
 
 
 def _engine_ws_url() -> str:
@@ -57,23 +57,17 @@ class WSBroadcaster:
     def __init__(self, url: str):
         self.url = url
         self._ws = None
-        self._connecting = False
 
     async def connect(self):
         """Establish connection. Safe to call multiple times — only connects once."""
         if self._ws is not None:
             return
-        if self._connecting:
-            return
-        self._connecting = True
         try:
             self._ws = await websockets.connect(self.url)
             log.info("Connected to backend WebSocket")
         except Exception as e:
             log.warning(f"Could not connect to backend WS: {e}")
             self._ws = None
-        finally:
-            self._connecting = False
 
     async def broadcast(self, event_type: str, data: dict):
         if not self._ws:
@@ -98,7 +92,7 @@ class WSBroadcaster:
             self._ws = None
 
 
-def wait_for_db(retries: int = 10, delay: int = 3):
+def wait_for_db():
     """Block until the backend's schema migrations have committed.
 
     Waits on the migration sentinel rather than on a table: scan_jobs exists
@@ -107,6 +101,7 @@ def wait_for_db(retries: int = 10, delay: int = 3):
     were not there yet. An absent sentinel is as much "not ready" as an absent
     table, so both retry.
     """
+    retries, delay = 10, 3
     for attempt in range(1, retries + 1):
         session = get_session()
         try:

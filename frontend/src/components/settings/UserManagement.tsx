@@ -93,8 +93,7 @@ export default function UserManagement() {
       cancelEdit();
       load();
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setEditError(msg || 'Failed to update');
+      setEditError((err as Error)?.message || 'Failed to update');
     }
   };
 

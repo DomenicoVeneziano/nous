@@ -52,9 +52,3 @@ def record_success(ip: str) -> None:
     """Clear any throttle state for an IP after a successful login."""
     with _lock:
         _state.pop(ip, None)
-
-
-def reset() -> None:
-    """Clear all state — intended for tests."""
-    with _lock:
-        _state.clear()

@@ -3,7 +3,6 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 import { Shield } from 'lucide-react';
-import { DottedSurface } from '../components/ui/dotted-surface';
 
 export default function Login() {
   const [username, setUsername] = useState('');
@@ -38,7 +37,7 @@ export default function Login() {
     <div style={{
       height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center',
     }}>
-      <DottedSurface />
+      <div className="dot-surface" />
       <form onSubmit={handleSubmit} style={{
         background: 'var(--bg-surface)',
         border: '1px solid var(--border-default)', borderRadius: 'var(--radius-xl)',

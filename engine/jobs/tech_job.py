@@ -13,8 +13,8 @@ from dns_precheck import dns_precheck
 from sqlalchemy import text
 from queue_manager import (
     get_session, transition_status, get_asset_details,
-    get_all_project_asset_details, update_asset_record, refresh_project_counts,
-    get_project_domains, get_project_asset_hostnames,
+    get_asset_hostnames, update_asset_record, refresh_project_counts,
+    get_project_domains,
     insert_asset_if_absent, enqueue_scan, is_in_scope, SOURCE_REDIRECT, utc_now_str,
     attach_tag, detach_tag, job_is_cancelled, SYSTEM_TAG_PROXIED,
     SYSTEM_TAG_UNVERIFIED,
@@ -24,16 +24,16 @@ from queue_manager import (
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 SCRIPTS_DIR = Path(os.environ.get("SCRIPTS_DIR", "./scripts"))
 PER_DOMAIN_TIMEOUT = int(os.environ.get("TECH_PER_DOMAIN_TIMEOUT", "120"))
-TCP_PRECHECK_TIMEOUT = float(os.environ.get("TECH_TCP_PRECHECK_TIMEOUT", "5"))
-TECH_BATCH_SIZE = int(os.environ.get("TECH_BATCH_SIZE", "10"))
+TCP_PRECHECK_TIMEOUT = 5.0
+TECH_BATCH_SIZE = 10
 TECH_RATE_LIMIT_DELAY = float(os.environ.get("TECH_RATE_LIMIT_DELAY", "0"))
 DNS_RATE_LIMIT_DELAY = float(os.environ.get("DNS_RATE_LIMIT_DELAY", "0"))
-TCP_PRECHECK_CONCURRENCY = int(os.environ.get("TECH_TCP_PRECHECK_CONCURRENCY", "100"))
+TCP_PRECHECK_CONCURRENCY = 100
 # Upper bound on how many assets EITHER retry pass may touch. Proxy traffic is
 # metered, and the direct retry runs at widened spacing, so a project whose whole
 # DNS-live set fails pass 1 would otherwise push every asset through both passes
 # and add hours of wall clock to a run least likely to benefit. 0 means unbounded.
-TECH_RETRY_MAX_ASSETS = int(os.environ.get("TECH_RETRY_MAX_ASSETS", "1000"))
+TECH_RETRY_MAX_ASSETS = 1000
 
 # Deliberately narrow: only outcomes a different vantage point can plausibly
 # change. Blocks (403), throttling (429) and edge/origin errors (5xx) qualify.
@@ -477,7 +477,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
         if asset_ids:
             assets = get_asset_details(session, asset_ids)
         else:
-            assets = get_all_project_asset_details(session, project_id)
+            assets = get_asset_details(session, project_id=project_id)
         if not assets:
             transition_status(session, job_id, "running", "failed", error_msg="No assets to analyze")
             if ws_broadcast:
@@ -1003,7 +1003,7 @@ async def run_tech_job(job: dict, ws_broadcast=None):
         # hosts are queued, which prevents redirect loops and redundant scans.
         if redirect_targets:
             root_domains = get_project_domains(session, project_id)
-            existing = set(get_project_asset_hostnames(session, project_id))
+            existing = set(get_asset_hostnames(session, project_id=project_id))
             for dest in sorted(redirect_targets):
                 dest = (dest or "").strip().lower()
                 if not dest or dest in existing or not is_in_scope(dest, root_domains):

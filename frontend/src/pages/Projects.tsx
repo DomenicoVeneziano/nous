@@ -2,7 +2,7 @@
 import React, { useEffect, useState, useMemo } from 'react';
 import { useProjectStore } from '../store/projectStore';
 import ProjectGrid from '../components/projects/ProjectGrid';
-import NewProjectOverlay from '../components/projects/NewProjectOverlay';
+import ProjectOverlay from '../components/projects/ProjectOverlay';
 import ProjectSearchBar from '../components/projects/ProjectSearchBar';
 import { Plus, CheckSquare, X, Trash2, Radar } from 'lucide-react';
 import { useAuth } from '../hooks/useAuth';
@@ -185,7 +185,7 @@ export default function Projects() {
         selectedIds={selectedIds}
         onToggleSelect={toggleSelect}
       />
-      <NewProjectOverlay open={showNew} onClose={() => setShowNew(false)} onCreated={loadProjects} />
+      <ProjectOverlay open={showNew} onClose={() => setShowNew(false)} onSaved={loadProjects} />
     </div>
   );
 }

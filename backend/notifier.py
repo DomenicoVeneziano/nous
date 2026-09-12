@@ -22,7 +22,8 @@ from sqlalchemy import text
 
 from database import SessionLocal
 from models.scan import ScanJob
-from services.notifications import build_event, dispatch
+from services.notifications.sender import dispatch
+from services.notifications.summary import build_event
 
 log = logging.getLogger("backend.notifier")
 

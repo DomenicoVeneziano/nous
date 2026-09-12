@@ -1,5 +1,4 @@
 # backend/ws/scan_stream.py
-import asyncio
 import hashlib
 import hmac
 import json
@@ -135,15 +134,3 @@ async def broadcast(event_type: str, data: dict):
         except Exception:
             dead.add(client)
     _consumers.difference_update(dead)
-
-
-def broadcast_sync(event_type: str, data: dict):
-    """Synchronous wrapper for broadcast, usable from non-async context."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            asyncio.ensure_future(broadcast(event_type, data))
-        else:
-            loop.run_until_complete(broadcast(event_type, data))
-    except RuntimeError:
-        pass

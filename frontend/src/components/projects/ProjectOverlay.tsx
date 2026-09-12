@@ -1,23 +1,35 @@
-// frontend/src/components/projects/ProjectEditOverlay.tsx
+// frontend/src/components/projects/ProjectOverlay.tsx
 import React, { useState, useEffect, useRef } from 'react';
-import { updateProject, deleteProject, uploadProjectIcon, deleteProjectIcon, fetchProjectIconUrl } from '../../api/projects';
-import type { Project, ProjectUpdate, ScanPhase, ScheduleUnit } from '../../types/project';
+import {
+  createProject, updateProject, deleteProject,
+  uploadProjectIcon, deleteProjectIcon, fetchProjectIconUrl,
+} from '../../api/projects';
+import type { Project, ProjectCreate, ProjectUpdate, ScanPhase, ScheduleUnit } from '../../types/project';
 import { Trash2, Upload, X } from 'lucide-react';
 import ScheduleFields, { isScheduleValid } from './ScheduleFields';
 
 interface Props {
-  project: Project;
   open: boolean;
   onClose: () => void;
-  onUpdated: () => void;
-  onDeleted: () => void;
+  /** Absent for a creation; present to edit that project in place. */
+  project?: Project;
+  onSaved: () => void;
+  /** Only meaningful alongside `project` — the delete control renders with it. */
+  onDeleted?: () => void;
 }
 
+/** The shared `.input` class sits on the page background with roomier padding;
+ *  inside the overlay card the fields are raised and tighter. */
+const fieldStyle: React.CSSProperties = { background: 'var(--bg-elevated)', padding: '9px 12px' };
 
-export default function ProjectEditOverlay({ project, open, onClose, onUpdated, onDeleted }: Props) {
-  const [title, setTitle] = useState(project.title);
-  const [description, setDescription] = useState(project.description || '');
-  const [domains, setDomains] = useState(project.root_domains.join('\n'));
+const labelStyle: React.CSSProperties = {
+  display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 6,
+};
+
+export default function ProjectOverlay({ open, onClose, project, onSaved, onDeleted }: Props) {
+  const [title, setTitle] = useState(project?.title ?? '');
+  const [description, setDescription] = useState(project?.description ?? '');
+  const [domains, setDomains] = useState(project?.root_domains.join('\n') ?? '');
   const [iconFile, setIconFile] = useState<File | null>(null);
   const [iconPreview, setIconPreview] = useState<string | null>(null);
   const [removeIcon, setRemoveIcon] = useState(false);
@@ -25,21 +37,24 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [error, setError] = useState('');
-  const [scheduleEnabled, setScheduleEnabled] = useState(project.schedule_enabled);
-  const [intervalValue, setIntervalValue] = useState(project.schedule_interval_value ?? 7);
-  const [intervalUnit, setIntervalUnit] = useState<ScheduleUnit>(project.schedule_interval_unit ?? 'days');
-  const [phases, setPhases] = useState<ScanPhase[]>(project.schedule_phases ?? ['recon']);
+  const [scheduleEnabled, setScheduleEnabled] = useState(project?.schedule_enabled ?? false);
+  const [intervalValue, setIntervalValue] = useState(project?.schedule_interval_value ?? 7);
+  const [intervalUnit, setIntervalUnit] = useState<ScheduleUnit>(project?.schedule_interval_unit ?? 'days');
+  const [phases, setPhases] = useState<ScanPhase[]>(project?.schedule_phases ?? ['recon']);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const scheduleValid = isScheduleValid({ enabled: scheduleEnabled, intervalValue, intervalUnit, phases });
 
+  // Editing re-seats the form on the project every time the overlay opens. A
+  // creation deliberately keeps whatever was typed, so a rejected attempt can be
+  // corrected rather than retyped.
   useEffect(() => {
-    if (!open) return;
+    if (!open || !project) return;
     setTitle(project.title);
     setDescription(project.description || '');
     setDomains(project.root_domains.join('\n'));
-    // A disabled schedule carries nulls; fall back to the same defaults the
-    // create overlay offers so the fields are usable the moment it is enabled.
+    // A disabled schedule carries nulls; fall back to the same defaults a new
+    // project offers so the fields are usable the moment it is enabled.
     setScheduleEnabled(project.schedule_enabled);
     setIntervalValue(project.schedule_interval_value ?? 7);
     setIntervalUnit(project.schedule_interval_unit ?? 'days');
@@ -65,6 +80,17 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
     };
   }, [open, project]);
 
+  // Escape dismisses the overlay the same way a backdrop click does, matching
+  // the shared Modal. Bound only while open, so a closed overlay holds nothing.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setError(''); onClose(); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
   if (!open) return null;
 
   const handleIconSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -84,69 +110,107 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
     if (fileRef.current) fileRef.current.value = '';
   };
 
-  const handleSave = async () => {
+  // The overlay stays mounted between openings, so a failed attempt would
+  // otherwise greet the operator with its old banner the next time around.
+  const handleClose = () => {
+    setError('');
+    onClose();
+  };
+
+  const handleCreate = async () => {
+    const payload: ProjectCreate = {
+      title: title.trim(),
+      description: description.trim() || undefined,
+      root_domains: domains.split('\n').map((d) => d.trim()).filter(Boolean),
+    };
+    // The interval and phases only mean anything alongside an enabled
+    // schedule, so they stay out of the payload otherwise.
+    if (scheduleEnabled) {
+      payload.schedule_enabled = true;
+      payload.schedule_interval_value = intervalValue;
+      payload.schedule_interval_unit = intervalUnit;
+      payload.schedule_phases = phases;
+    }
+    const created = await createProject(payload);
+    if (iconFile) {
+      try { await uploadProjectIcon(created.id, iconFile); } catch { /* non-fatal */ }
+    }
+    setTitle('');
+    setDescription('');
+    setDomains('');
+    setScheduleEnabled(false);
+    setIntervalValue(7);
+    setIntervalUnit('days');
+    setPhases(['recon']);
+    clearIcon();
+    setRemoveIcon(false);
+  };
+
+  const handleUpdate = async (target: Project) => {
+    const payload: ProjectUpdate = {};
+    if (title.trim() !== target.title) payload.title = title.trim();
+    if ((description.trim() || '') !== (target.description || '')) payload.description = description.trim();
+    const newDomains = domains.split('\n').map((d) => d.trim()).filter(Boolean);
+    if (JSON.stringify(newDomains) !== JSON.stringify(target.root_domains)) payload.root_domains = newDomains;
+    // While the schedule is off the interval fields hold placeholder defaults
+    // rather than the project's nulls, so they only count as a change when it is on.
+    const scheduleChanged =
+      scheduleEnabled !== target.schedule_enabled ||
+      (scheduleEnabled && (
+        intervalValue !== target.schedule_interval_value ||
+        intervalUnit !== target.schedule_interval_unit ||
+        JSON.stringify(phases) !== JSON.stringify(target.schedule_phases)
+      ));
+    if (scheduleChanged) {
+      payload.schedule_enabled = scheduleEnabled;
+      // An enabled schedule is only ever accepted as a complete set, so the
+      // interval and phases ride along with every change that keeps it on.
+      if (scheduleEnabled) {
+        payload.schedule_interval_value = intervalValue;
+        payload.schedule_interval_unit = intervalUnit;
+        payload.schedule_phases = phases;
+      }
+    }
+    if (Object.keys(payload).length > 0) {
+      await updateProject(target.id, payload);
+    }
+    if (iconFile) {
+      await uploadProjectIcon(target.id, iconFile);
+    } else if (removeIcon && target.icon) {
+      await deleteProjectIcon(target.id);
+    }
+  };
+
+  const handleSubmit = async () => {
     if (!title.trim()) { setError('Title is required'); return; }
-    if (!scheduleValid) { setError('Select at least one phase'); return; }
+    if (!project && !domains.trim()) { setError('At least one scope entry is required'); return; }
+    if (!scheduleValid) { setError(project ? 'Select at least one phase' : 'Check the rescan interval and phases'); return; }
     setSaving(true);
     setError('');
     try {
-      const payload: ProjectUpdate = {};
-      if (title.trim() !== project.title) payload.title = title.trim();
-      if ((description.trim() || '') !== (project.description || '')) payload.description = description.trim();
-      const newDomains = domains.split('\n').map((d) => d.trim()).filter(Boolean);
-      if (JSON.stringify(newDomains) !== JSON.stringify(project.root_domains)) payload.root_domains = newDomains;
-      // While the schedule is off the interval fields hold placeholder defaults
-      // rather than the project's nulls, so they only count as a change when it is on.
-      const scheduleChanged =
-        scheduleEnabled !== project.schedule_enabled ||
-        (scheduleEnabled && (
-          intervalValue !== project.schedule_interval_value ||
-          intervalUnit !== project.schedule_interval_unit ||
-          JSON.stringify(phases) !== JSON.stringify(project.schedule_phases)
-        ));
-      if (scheduleChanged) {
-        payload.schedule_enabled = scheduleEnabled;
-        // An enabled schedule is only ever accepted as a complete set, so the
-        // interval and phases ride along with every change that keeps it on.
-        if (scheduleEnabled) {
-          payload.schedule_interval_value = intervalValue;
-          payload.schedule_interval_unit = intervalUnit;
-          payload.schedule_phases = phases;
-        }
-      }
-      if (Object.keys(payload).length > 0) {
-        await updateProject(project.id, payload);
-      }
-      if (iconFile) {
-        await uploadProjectIcon(project.id, iconFile);
-      } else if (removeIcon && project.icon) {
-        await deleteProjectIcon(project.id);
-      }
-      onUpdated();
+      if (project) await handleUpdate(project);
+      else await handleCreate();
+      onSaved();
       onClose();
-    } catch {
-      setError('Failed to save');
+    } catch (e) {
+      // The overlay keeps whatever was typed so the operator can correct the
+      // field the server named and submit again.
+      setError(project ? 'Failed to save' : (e as Error).message);
     } finally {
       setSaving(false);
     }
   };
 
   const handleDelete = async () => {
+    if (!project) return;
     setDeleting(true);
     try {
       await deleteProject(project.id);
-      onDeleted();
+      onDeleted?.();
     } catch {
       setError('Failed to delete');
       setDeleting(false);
     }
-  };
-
-  const inputStyle: React.CSSProperties = {
-    width: '100%', background: 'var(--bg-elevated)',
-    border: '1px solid var(--border-default)',
-    borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', padding: '9px 12px', fontSize: 13,
-    outline: 'none', transition: 'border-color var(--transition-fast)',
   };
 
   return (
@@ -155,7 +219,7 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
       background: 'rgba(0,0,0,0.75)', backdropFilter: 'blur(6px)',
       WebkitBackdropFilter: 'blur(6px)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
-    }} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    }} onClick={(e) => { if (e.target === e.currentTarget) handleClose(); }}>
       <div style={{
         background: 'var(--bg-surface)',
         border: '1px solid var(--border-default)', borderRadius: 'var(--radius-xl)',
@@ -167,16 +231,20 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
         // short of both edges keeps the card on screen; as a column it still
         // sizes to its content, and stays centred, whenever that fits.
         display: 'flex', flexDirection: 'column', maxHeight: 'calc(100vh - 48px)',
-        overflow: 'hidden', position: 'relative',
+        overflow: 'hidden',
+        position: 'relative',
       }}>
+        {/* Violet top accent */}
         <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 1, background: 'linear-gradient(90deg, transparent, rgba(124,107,255,0.3), transparent)' }} />
         <div style={{
           padding: '18px 22px', borderBottom: '1px solid var(--border-subtle)',
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',
           flexShrink: 0,
         }}>
-          <h3 style={{ color: 'var(--text-primary)', fontSize: 15, fontWeight: 600, margin: 0 }}>Edit Project</h3>
-          {!confirmDelete ? (
+          <h3 style={{ color: 'var(--text-primary)', fontSize: 15, fontWeight: 600, margin: 0 }}>
+            {project ? 'Edit Project' : 'New Project'}
+          </h3>
+          {project && (!confirmDelete ? (
             <button onClick={() => setConfirmDelete(true)} style={{
               background: 'transparent', color: 'var(--text-muted)', border: 'none',
               cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4,
@@ -196,7 +264,7 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
               </button>
               <button onClick={() => setConfirmDelete(false)} className="btn-secondary" style={{ padding: '3px 10px', fontSize: 11 }}>No</button>
             </div>
-          )}
+          ))}
         </div>
 
         {/* The body is the only scrolling region, so the header and the footer
@@ -219,9 +287,7 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
 
           {/* Icon upload */}
           <div>
-            <label style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 6 }}>
-              Project Icon
-            </label>
+            <label style={labelStyle}>Project Icon</label>
             <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
               {iconPreview ? (
                 <div style={{ position: 'relative' }}>
@@ -270,7 +336,7 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
                 onChange={handleIconSelect}
                 style={{ display: 'none' }}
               />
-              {iconPreview && (
+              {project && iconPreview && (
                 <button
                   onClick={() => fileRef.current?.click()}
                   className="btn-secondary"
@@ -284,28 +350,40 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
           </div>
 
           <div>
-            <label style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 6 }}>Title</label>
-            <input value={title} onChange={(e) => setTitle(e.target.value)} style={inputStyle} />
+            <label style={labelStyle}>Title</label>
+            <input
+              className="input"
+              style={fieldStyle}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Project name"
+            />
           </div>
           <div>
-            <label style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 6 }}>Description</label>
-            <input value={description} onChange={(e) => setDescription(e.target.value)} style={inputStyle} placeholder="Optional" />
+            <label style={labelStyle}>Description</label>
+            <input
+              className="input"
+              style={fieldStyle}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Optional"
+            />
           </div>
           <div>
-            <label style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 6 }}>
-              Scope (one per line)
-            </label>
+            <label style={labelStyle}>Scope (one per line)</label>
             <textarea
+              className="input"
               value={domains}
               onChange={(e) => setDomains(e.target.value)}
               rows={5}
               style={{
-                ...inputStyle, fontFamily: 'var(--font-mono)', fontSize: 12,
+                ...fieldStyle, fontFamily: 'var(--font-mono)', fontSize: 12,
                 resize: 'vertical', lineHeight: 1.6,
               }}
+              placeholder={"*.example.com\n*.target.io\nsub.target.io"}
             />
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4, lineHeight: 1.5 }}>
-              Wildcard domains (*.example.com) define recon scope. Specific hostnames are added as assets automatically.
+              Wildcard domains (*.example.com) define recon scope. Specific hostnames (sub.example.com) are added as assets directly.
             </div>
           </div>
 
@@ -328,9 +406,11 @@ export default function ProjectEditOverlay({ project, open, onClose, onUpdated, 
           display: 'flex', justifyContent: 'flex-end', gap: 8,
           flexShrink: 0,
         }}>
-          <button onClick={onClose} className="btn-secondary">Cancel</button>
-          <button onClick={handleSave} disabled={saving || !scheduleValid} className="btn-primary">
-            {saving ? 'Saving...' : 'Save Changes'}
+          <button onClick={handleClose} className="btn-secondary">Cancel</button>
+          <button onClick={handleSubmit} disabled={saving || !scheduleValid} className="btn-primary">
+            {project
+              ? (saving ? 'Saving...' : 'Save Changes')
+              : (saving ? 'Creating...' : 'Create Project')}
           </button>
         </div>
       </div>

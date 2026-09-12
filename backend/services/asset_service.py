@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from database import TS_FORMAT
 from models.asset import Asset
 from models.asset_change import AssetChange
 from models.tag import SOURCE_MANUAL
@@ -138,10 +139,8 @@ _INSERT_ASSET_SQL = (
     " VALUES (:id, :pid, :asset, :atype, '[]', '[]', :cu, :now, '')"
 )
 
-# SQLAlchemy stores DateTime columns on SQLite as naive
-# "%Y-%m-%d %H:%M:%S.%f". A raw insert has to emit that exact shape or the value
-# will not read back through the ORM; see engine/queue_manager._TS_FORMAT.
-_TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+# A raw insert has to emit database.TS_FORMAT exactly or the value will not read
+# back through the ORM; see engine/queue_manager._TS_FORMAT for the engine side.
 
 
 def create_assets_bulk(
@@ -165,8 +164,8 @@ def create_assets_bulk(
 
     Names that already exist are not re-inserted but are still returned and
     still tagged: naming an asset is what the source tag records, the same
-    reasoning that has the engine's attach_source_tag stamp its source on rows
-    it did not create.
+    reasoning that has the engine's queue_manager.attach_tag stamp its source on
+    rows it did not create.
 
     Each name is classified by detect_asset_type, so an IP is stored as "ip"
     whether it came from a CIDR, from a project's scope, or on its own.
@@ -184,7 +183,7 @@ def create_assets_bulk(
     existing = _asset_ids_by_name(db, project_id, unique)
     to_insert = [name for name in unique if name not in existing]
     if to_insert:
-        now = datetime.now(timezone.utc).strftime(_TS_FORMAT)
+        now = datetime.now(timezone.utc).strftime(TS_FORMAT)
         db.execute(text(_INSERT_ASSET_SQL), [
             {
                 "id": str(uuid.uuid4()),

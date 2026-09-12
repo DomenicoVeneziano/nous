@@ -1,6 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
-@import "tailwindcss";
-
 /* frontend/src/index.css — Dark Monochromatic Design System (Black / White / Greys) */
 
 :root {
@@ -71,12 +68,6 @@
   --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', monospace;
 
-  /* Tailwind's preflight applies these to html and to code/pre/kbd/samp.
-     Force ligatures off so JetBrains Mono never fuses != -> => && in those
-     elements (e.g. the raw response-file <pre>). */
-  --default-font-feature-settings: "liga" 0, "calt" 0;
-  --default-mono-font-feature-settings: "liga" 0, "calt" 0;
-
   /* ── Radii ────────────────────────────────────────────── */
   --radius-sm: 3px;
   --radius-md: 6px;
@@ -104,6 +95,32 @@
   box-sizing: border-box;
   margin: 0;
   padding: 0;
+}
+
+/* ── Base element reset ─────────────────────────────────────
+   Form controls, media, and lists in this app are styled entirely from
+   inline styles and the utility classes below; both assume a blank slate
+   (transparent controls, block-level media, unmarked lists). Keep these
+   rules — removing them puts native chrome back on roughly thirty
+   bare <button> elements. */
+button, input, select, optgroup, textarea {
+  background-color: transparent;
+  border: 0 solid;
+  border-radius: 0;
+  color: inherit;
+}
+
+img, svg, video, canvas {
+  display: block;
+  vertical-align: middle;
+}
+
+ul, ol {
+  list-style: none;
+}
+
+code, pre, kbd, samp {
+  font-feature-settings: "liga" 0, "calt" 0;
 }
 
 html, body, #root {
@@ -157,11 +174,6 @@ input, textarea, select, button {
 @keyframes pulse-glow {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
-}
-
-@keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
 }
 
 @keyframes fadeIn {
@@ -257,18 +269,60 @@ input:focus, textarea:focus, select:focus {
   box-shadow: var(--shadow-card);
 }
 
-/* ── Section Title ────────────────────────────────────────── */
-.section-title {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-  font-family: var(--font-sans);
-}
-
 /* ── Select styling ─────────────────────────────────────── */
 select option {
   background: var(--bg-surface);
   color: var(--text-primary);
+}
+
+/* ── Text Input ───────────────────────────────────────────── */
+.input {
+  width: 100%;
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  color: var(--text-primary);
+  padding: 11px 14px;
+  font-size: 13px;
+  outline: none;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+/* ── Data Table ───────────────────────────────────────────── */
+.data-table th {
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 10px 16px;
+  text-align: left;
+  cursor: pointer;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  border-bottom: 1px solid var(--border-default);
+  white-space: nowrap;
+}
+
+.data-table td {
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 14px;
+}
+
+/* ── Login Backdrop ───────────────────────────────────────── */
+.dot-surface {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.10) 1px, transparent 1px);
+  background-size: 28px 28px;
+  animation: dot-drift 24s linear infinite;
+}
+
+@keyframes dot-drift {
+  to { background-position: 28px 28px; }
 }

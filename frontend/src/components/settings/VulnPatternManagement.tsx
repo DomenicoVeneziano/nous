@@ -140,7 +140,7 @@ export default function VulnPatternManagement() {
       setShowCreate(false);
       load();
     } catch (e: any) {
-      setCreateError(e?.response?.data?.detail ?? 'Failed to create pattern');
+      setCreateError(e?.message || 'Failed to create pattern');
     } finally {
       setCreating(false);
     }
@@ -170,7 +170,7 @@ export default function VulnPatternManagement() {
       cancelEdit(p.id);
       load();
     } catch (e: any) {
-      setEditStates((prev) => ({ ...prev, [p.id]: { ...prev[p.id], saving: false, error: e?.response?.data?.detail ?? 'Failed to save' } }));
+      setEditStates((prev) => ({ ...prev, [p.id]: { ...prev[p.id], saving: false, error: e?.message || 'Failed to save' } }));
     }
   };
 

@@ -22,15 +22,10 @@ def normalize_crawled_urls(value) -> dict:
         crawling = value.get("crawling") or []
         archived = value.get("archived") or []
 
+    # dict keys are insertion-ordered and first-wins, which is exactly the
+    # dedup semantics the stored order relies on.
     def _dedup(items) -> list[str]:
-        seen = set()
-        out = []
-        for item in items:
-            s = str(item)
-            if s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
+        return list(dict.fromkeys(str(i) for i in items))
 
     return {"crawling": _dedup(crawling), "archived": _dedup(archived)}
 
@@ -63,20 +58,12 @@ class AssetCreate(BaseModel):
         return None if v is None else normalize_crawled_urls(v)
 
 
-class AssetUpdate(BaseModel):
+class AssetUpdate(AssetCreate):
+    # Same fields and the same crawled_urls normalization as AssetCreate, with
+    # one difference: a PUT is a partial edit, so `asset` is optional here.
+    # update_asset dumps with exclude_unset, so an omitted field is left alone
+    # rather than written as None.
     asset: str | None = None
-    asset_type: Literal["subdomain", "ip"] | None = None
-    technologies: list[str] | None = None
-    status_code: int | None = None
-    title: str | None = None
-    content_length: int | None = None
-    dns_records: list[dict] | None = None
-    crawled_urls: CrawledUrls | None = None
-
-    @field_validator("crawled_urls", mode="before")
-    @classmethod
-    def _normalize(cls, v):
-        return None if v is None else normalize_crawled_urls(v)
 
 
 class AssetOut(BaseModel):

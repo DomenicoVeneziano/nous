@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from database import get_db
+from database import get_db, TS_FORMAT
 from auth.middleware import require_admin, require_viewer
 from models.asset_change import AssetChange
 from models.finding import Finding
@@ -15,7 +15,7 @@ from models.tag import SOURCE_MANUAL
 from schemas.asset import AssetCreate, AssetUpdate, AssetOut, normalize_crawled_urls
 from schemas.asset_change import AssetChangePage
 from services import asset_service, project_service, tag_service
-from config import settings
+from storage import resolve_within
 
 router = APIRouter(prefix="/projects/{project_id}/assets", tags=["assets"])
 
@@ -29,9 +29,8 @@ def _read_response_file(rel_path: str) -> str | None:
     lookup isn't doubled, and refuse anything that escapes the safe base.
     """
     stripped = rel_path[len("projects/"):] if rel_path.startswith("projects/") else rel_path
-    file_path = (settings.DATA_DIR / "projects" / stripped).resolve()
-    safe_base = (settings.DATA_DIR / "projects").resolve()
-    if not file_path.is_relative_to(safe_base) or not file_path.is_file():
+    file_path = resolve_within(stripped)
+    if file_path is None or not file_path.is_file():
         return None
     try:
         return file_path.read_text(encoding="utf-8", errors="replace")
@@ -165,12 +164,10 @@ def export_asset(project_id: str, asset_id: str, db: Session = Depends(get_db), 
     )
 
 
-# asset_changes.changed_at is a naive UTC DateTime, stored by SQLAlchemy as
-# "%Y-%m-%d %H:%M:%S.%f"; see database._TS_FORMAT. The cursor round-trips
-# through that exact shape, and the value parsed back out of it stays naive —
-# an offset-aware datetime sorts before every stored row and would silently
-# return an empty page.
-_TS_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+# asset_changes.changed_at is a naive UTC DateTime, stored by SQLAlchemy in
+# database.TS_FORMAT. The cursor round-trips through that exact shape, and the
+# value parsed back out of it stays naive — an offset-aware datetime sorts
+# before every stored row and would silently return an empty page.
 
 
 def _parse_change_cursor(cursor: str) -> tuple[datetime, str]:
@@ -184,7 +181,7 @@ def _parse_change_cursor(cursor: str) -> tuple[datetime, str]:
     if not sep or not change_id:
         raise HTTPException(422, "Malformed cursor")
     try:
-        changed_at = datetime.strptime(ts, _TS_FORMAT)
+        changed_at = datetime.strptime(ts, TS_FORMAT)
     except ValueError:
         raise HTTPException(422, "Malformed cursor")
     return changed_at, change_id
@@ -237,7 +234,7 @@ def list_asset_changes(
     if len(rows) > limit:
         rows = rows[:limit]
         last = rows[-1]
-        next_cursor = f"{last.changed_at.strftime(_TS_FORMAT)}|{last.id}"
+        next_cursor = f"{last.changed_at.strftime(TS_FORMAT)}|{last.id}"
     return {"items": rows, "next_cursor": next_cursor}
 
 
@@ -335,9 +332,8 @@ def delete_asset_screenshot(project_id: str, asset_id: str, db: Session = Depend
     if asset.screenshot_path:
         # screenshot_path is stored relative to data/projects/ (e.g.
         # "<project_id>/screenshots/<host>.png"). Resolve + confine before unlink.
-        file_path = (settings.DATA_DIR / "projects" / asset.screenshot_path).resolve()
-        safe_base = (settings.DATA_DIR / "projects").resolve()
-        if file_path.is_relative_to(safe_base) and file_path.is_file():
+        file_path = resolve_within(asset.screenshot_path)
+        if file_path is not None and file_path.is_file():
             file_path.unlink()
         asset.screenshot_path = None
         db.commit()

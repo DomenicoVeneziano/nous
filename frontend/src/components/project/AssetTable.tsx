@@ -142,19 +142,6 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
   const sortIndicator = (key: SortKey) =>
     sortKey === key ? (sortDir === 'asc' ? ' \u25B2' : ' \u25BC') : '';
 
-  const thStyle: React.CSSProperties = {
-    background: 'var(--bg-elevated)', color: 'var(--text-muted)',
-    fontSize: 11, fontWeight: 600,
-    textTransform: 'uppercase', letterSpacing: '0.08em',
-    padding: '10px 16px', textAlign: 'left', cursor: 'pointer',
-    position: 'sticky', top: 0, zIndex: 1,
-    borderBottom: '1px solid var(--border-default)', whiteSpace: 'nowrap',
-  };
-
-  const tdStyle: React.CSSProperties = {
-    padding: '9px 16px', borderBottom: '1px solid var(--border-subtle)', fontSize: 14,
-  };
-
   const btnStyle = (disabled: boolean): React.CSSProperties => ({
     background: 'var(--bg-elevated)', color: 'var(--text-secondary)',
     border: '1px solid var(--border-default)', borderRadius: 6,
@@ -170,26 +157,26 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
       border: '1px solid var(--border-subtle)', borderRadius: 8,
       boxShadow: 'var(--shadow-card)',
     }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+      <table className="data-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
         <thead>
           <tr>
-            <th style={{ ...thStyle, width: 32, cursor: 'default' }}>
+            <th style={{ width: 32, cursor: 'default' }}>
               <input type="checkbox" onChange={onSelectAll} checked={selectedIds.size === assets.length && assets.length > 0} />
             </th>
-            <th style={thStyle} onClick={() => handleSort('asset')}>
+            <th onClick={() => handleSort('asset')}>
               Hostname{sortIndicator('asset')}
             </th>
-            <th style={thStyle} onClick={() => handleSort('status_code')}>
+            <th onClick={() => handleSort('status_code')}>
               Status{sortIndicator('status_code')}
             </th>
-            <th style={thStyle} onClick={() => handleSort('title')}>
+            <th onClick={() => handleSort('title')}>
               Title{sortIndicator('title')}
             </th>
-            <th style={thStyle} onClick={() => handleSort('content_length')}>
+            <th onClick={() => handleSort('content_length')}>
               Length{sortIndicator('content_length')}
             </th>
-            <th style={{ ...thStyle, cursor: 'default' }}>Tags</th>
-            <th style={{ ...thStyle, cursor: 'default' }}>Technologies</th>
+            <th style={{ cursor: 'default' }}>Tags</th>
+            <th style={{ cursor: 'default' }}>Technologies</th>
           </tr>
         </thead>
         <tbody>
@@ -242,11 +229,11 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
                   if (!selected) e.currentTarget.style.backgroundColor = i % 2 === 0 ? 'var(--bg-base)' : 'var(--bg-surface)';
                 }}
               >
-                <td style={tdStyle} onClick={(e) => e.stopPropagation()}>
+                <td onClick={(e) => e.stopPropagation()}>
                   <input type="checkbox" checked={selected} onChange={() => onToggleSelect(asset.id)} />
                 </td>
                 <td style={{
-                  ...tdStyle, fontFamily: 'var(--font-mono)',
+                  fontFamily: 'var(--font-mono)',
                   color: 'var(--text-code)', fontSize: 13, fontWeight: 500,
                 }}>
                   {/* Capped on an inner block, not the <td>: auto table layout
@@ -262,12 +249,12 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
                   </span>
                 </td>
                 <td style={{
-                  ...tdStyle, fontFamily: 'var(--font-mono)',
+                  fontFamily: 'var(--font-mono)',
                   color: statusColor(asset.status_code), fontWeight: 600, fontSize: 12,
                 }}>
                   {asset.status_code ?? '-'}
                 </td>
-                <td style={{ ...tdStyle, color: 'var(--text-secondary)' }}>
+                <td style={{ color: 'var(--text-secondary)' }}>
                   {/* Same reason as the hostname cell: the cap lives on an inner
                       block because auto table layout ignores max-width on a
                       <td>. The title is never sliced in JS either — the
@@ -284,10 +271,10 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
                       : '-'}
                   </span>
                 </td>
-                <td style={{ ...tdStyle, fontFamily: 'var(--font-mono)', color: 'var(--text-code)', fontSize: 12 }}>
+                <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-code)', fontSize: 12 }}>
                   {asset.content_length != null ? asset.content_length.toLocaleString() : '-'}
                 </td>
-                <td style={tdStyle}>
+                <td>
                   {visibleTags.length === 0 && !asset.is_new ? (
                     <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>-</span>
                   ) : (
@@ -321,7 +308,7 @@ export default function AssetTable({ assets, selectedIds, onToggleSelect, onSele
                     </div>
                   )}
                 </td>
-                <td style={tdStyle}>
+                <td>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                     {(asset.technologies || []).slice(0, 4).map((t, idx) => {
                       const techSpans = techHls.filter((h) => h.index === idx);

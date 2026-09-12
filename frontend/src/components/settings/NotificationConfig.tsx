@@ -36,33 +36,6 @@ const EMPTY_SECRETS: Secrets = {
 const TELEGRAM_TOKEN_RE = /^[0-9]{1,20}:[A-Za-z0-9_-]{20,256}$/;
 const TELEGRAM_CHAT_ID_RE = /^(-?[0-9]{1,32}|@[A-Za-z0-9_]{5,32})$/;
 
-// A FastAPI error body is a plain string for a raised HTTPException, but an
-// ARRAY of error objects for a 422 raised by request validation. Rendering
-// either of the latter as a React child throws and blanks the whole Settings
-// page, so every shape is flattened to a readable line here.
-function errorText(e: any, fallback: string): string {
-  const detail = e?.response?.data?.detail;
-  const parts: string[] = [];
-  if (typeof detail === 'string') {
-    parts.push(detail);
-  } else if (Array.isArray(detail)) {
-    for (const item of detail) {
-      if (typeof item === 'string') { parts.push(item); continue; }
-      const loc = Array.isArray(item?.loc)
-        ? item.loc.filter((p: unknown) => typeof p === 'string' && p !== 'body').join('.')
-        : '';
-      const msg = typeof item?.msg === 'string' ? item.msg : '';
-      const line = [loc, msg].filter(Boolean).join(': ');
-      if (line) parts.push(line);
-    }
-  } else if (detail && typeof detail === 'object') {
-    if (typeof (detail as any).msg === 'string') parts.push((detail as any).msg);
-  }
-  const text = parts.join('; ').trim() || (typeof e?.message === 'string' ? e.message : '');
-  if (!text) return fallback;
-  return text.length > 200 ? `${text.slice(0, 197)}...` : text;
-}
-
 const TUNING: { key: 'sample_size' | 'timeout_seconds' | 'retries'; label: string; hint: string; min: number; max: number }[] = [
   { key: 'sample_size', label: 'Sample Size', hint: 'How many new assets to list in the message body (0-20)', min: 0, max: 20 },
   { key: 'timeout_seconds', label: 'Timeout', hint: 'Seconds to wait for each delivery attempt (1-30)', min: 1, max: 30 },
@@ -165,7 +138,7 @@ export default function NotificationConfig() {
       setDirty(false);
       flash('Saved');
     } catch (e: any) {
-      flash(errorText(e, 'Failed to save'), true);
+      flash(e?.message || 'Failed to save', true);
     } finally {
       setSaving(false);
     }
@@ -178,7 +151,7 @@ export default function NotificationConfig() {
       const res = await testNotificationConfig(channel);
       flash(res.message, !res.ok);
     } catch (e: any) {
-      flash(errorText(e, 'Test failed'), true);
+      flash(e?.message || 'Test failed', true);
     } finally {
       setTesting(null);
     }

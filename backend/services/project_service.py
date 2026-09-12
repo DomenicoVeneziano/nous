@@ -91,8 +91,8 @@ def _create_assets_from_hostnames(db: Session, project_id: str, names: list[str]
     the Seed source tag. Entries the scope names that are already assets — found
     by an earlier scan, or carried over from a previous scope edit — are not
     re-inserted but are still tagged: the scope naming them is what Seed records,
-    the same reasoning that has the engine's attach_source_tag stamp its source
-    on rows it did not create. INSERT OR IGNORE on the join table, and the mirror
+    the same reasoning that has the engine's queue_manager.attach_tag stamp its
+    source on rows it did not create. INSERT OR IGNORE on the join table, and the mirror
     rewrite skipping rows whose tags_text already matches, keep re-seeding an
     asset that carries Seed free of both writes and reindexing.
     """
@@ -142,7 +142,6 @@ def create_project(db: Session, data: ProjectCreate) -> Project:
         title=data.title,
         description=data.description,
         root_domains=wildcards,
-        subdomains=data.subdomains,
     )
     # Resolve the schedule before the first commit so a project created with one
     # already carries its due time — otherwise it would sit enabled but never

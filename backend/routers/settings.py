@@ -3,7 +3,7 @@ import re
 import socket
 from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 from pathlib import Path
 from database import get_db
@@ -16,11 +16,10 @@ from services.settings_store import (
     get_notification_settings, save_notification_settings, validate_webhook_url,
     NOTIFY_SECRET_API_FIELDS,
 )
-from services.notifications import send_test
 # The Telegram bot token is placed in a URL path by the sender, which owns the
 # canonical shape check. It is imported rather than restated so the router can
 # never accept a token the sender would refuse.
-from services.notifications.sender import TELEGRAM_TOKEN_RE
+from services.notifications.sender import TELEGRAM_TOKEN_RE, send_test
 import uuid
 
 _ALLOWED_PATH_BASES = tuple(
@@ -63,29 +62,17 @@ class ScanConfigUpdate(BaseModel):
 
 class ProxyConfigUpdate(BaseModel):
     enabled: bool | None = None
-    scheme: str | None = None
+    # The accepted set is settings_store.ALLOWED_SCHEMES, which also decides what
+    # build_proxy_url will emit; unpacking it keeps the two from drifting apart.
+    scheme: Literal[*ALLOWED_SCHEMES] | None = None
     host: str | None = None
-    port: int | None = None
+    port: int | None = Field(default=None, ge=1, le=65535)
     username: str | None = None
     password: str | None = None
     recon: bool | None = None
     tech: bool | None = None
     crawl: bool | None = None
     retries: bool | None = None
-
-    @field_validator("scheme")
-    @classmethod
-    def validate_scheme(cls, v):
-        if v is not None and v not in ALLOWED_SCHEMES:
-            raise ValueError(f"scheme must be one of {ALLOWED_SCHEMES}")
-        return v
-
-    @field_validator("port")
-    @classmethod
-    def validate_port(cls, v):
-        if v is not None and not (1 <= v <= 65535):
-            raise ValueError("port must be between 1 and 65535")
-        return v
 
     @field_validator("host")
     @classmethod
@@ -128,31 +115,12 @@ class NotificationConfigUpdate(BaseModel):
     telegram_enabled: bool | None = None
     telegram_bot_token: Any = None
     telegram_chat_id: Any = None
-    sample_size: int | None = None
-    timeout_seconds: int | None = None
-    retries: int | None = None
+    # Bounds mirror settings_store.NOTIFY_BOUNDS, which re-applies them on every
+    # save and every load.
+    sample_size: int | None = Field(default=None, ge=0, le=20)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=30)
+    retries: int | None = Field(default=None, ge=0, le=5)
     clear_secrets: list[str] | None = None
-
-    @field_validator("sample_size")
-    @classmethod
-    def validate_sample_size(cls, v):
-        if v is not None and not (0 <= v <= 20):
-            raise ValueError("sample_size must be between 0 and 20")
-        return v
-
-    @field_validator("timeout_seconds")
-    @classmethod
-    def validate_timeout_seconds(cls, v):
-        if v is not None and not (1 <= v <= 30):
-            raise ValueError("timeout_seconds must be between 1 and 30")
-        return v
-
-    @field_validator("retries")
-    @classmethod
-    def validate_retries(cls, v):
-        if v is not None and not (0 <= v <= 5):
-            raise ValueError("retries must be between 0 and 5")
-        return v
 
 
 class NotificationTestRequest(BaseModel):
@@ -165,66 +133,47 @@ router = APIRouter(prefix="/settings", tags=["settings"])
 
 # --- Scan config ---
 
+# API field -> the attribute it reads from and writes to on config.settings.
+# The read and the write share this map so the two endpoints cannot drift.
+_SCAN_CONFIG_FIELDS = {
+    "recon_timeout": "RECON_TIMEOUT",
+    "tech_timeout": "TECH_TIMEOUT",
+    "crawl_timeout": "CRAWL_TIMEOUT",
+    "crawl_max_pages": "CRAWL_MAX_PAGES",
+    "wordlist_path": "WORDLIST_PATH",
+    "resolvers_path": "RESOLVERS_PATH",
+    "dns_bruteforce_enabled": "DNS_BRUTEFORCE_ENABLED",
+    "dns_wordlist_expansion_enabled": "DNS_WORDLIST_EXPANSION_ENABLED",
+    "tech_screenshots_enabled": "TECH_SCREENSHOTS_ENABLED",
+    "tech_rate_limit_delay": "TECH_RATE_LIMIT_DELAY",
+    "dns_rate_limit_delay": "DNS_RATE_LIMIT_DELAY",
+    "crawl_rate_limit_delay": "CRAWL_RATE_LIMIT_DELAY",
+}
+
+# These two are held as Path objects on config.settings but travel as strings:
+# stored through Path(), reported through str().
+_SCAN_CONFIG_PATH_FIELDS = ("wordlist_path", "resolvers_path")
+
+
 @router.get("/scan-config")
 def get_scan_config(_: dict = Depends(require_viewer)):
-    from config import settings
     return {
-        "recon_timeout": settings.RECON_TIMEOUT,
-        "tech_timeout": settings.TECH_TIMEOUT,
-        "crawl_timeout": settings.CRAWL_TIMEOUT,
-        "crawl_max_pages": settings.CRAWL_MAX_PAGES,
-        "wordlist_path": str(settings.WORDLIST_PATH),
-        "resolvers_path": str(settings.RESOLVERS_PATH),
-        "dns_bruteforce_enabled": settings.DNS_BRUTEFORCE_ENABLED,
-        "dns_wordlist_expansion_enabled": settings.DNS_WORDLIST_EXPANSION_ENABLED,
-        "tech_screenshots_enabled": settings.TECH_SCREENSHOTS_ENABLED,
-        "tech_rate_limit_delay": settings.TECH_RATE_LIMIT_DELAY,
-        "dns_rate_limit_delay": settings.DNS_RATE_LIMIT_DELAY,
-        "crawl_rate_limit_delay": settings.CRAWL_RATE_LIMIT_DELAY,
+        field: str(getattr(_cfg, attr)) if field in _SCAN_CONFIG_PATH_FIELDS
+        else getattr(_cfg, attr)
+        for field, attr in _SCAN_CONFIG_FIELDS.items()
     }
 
 
 @router.put("/scan-config")
 def update_scan_config(data: ScanConfigUpdate, _: dict = Depends(require_admin)):
-    from config import settings as cfg
-    from pathlib import Path
-    updated = {}
-    if data.recon_timeout is not None:
-        cfg.RECON_TIMEOUT = data.recon_timeout
-        updated["recon_timeout"] = data.recon_timeout
-    if data.tech_timeout is not None:
-        cfg.TECH_TIMEOUT = data.tech_timeout
-        updated["tech_timeout"] = data.tech_timeout
-    if data.crawl_timeout is not None:
-        cfg.CRAWL_TIMEOUT = data.crawl_timeout
-        updated["crawl_timeout"] = data.crawl_timeout
-    if data.crawl_max_pages is not None:
-        cfg.CRAWL_MAX_PAGES = data.crawl_max_pages
-        updated["crawl_max_pages"] = data.crawl_max_pages
-    if data.wordlist_path is not None:
-        cfg.WORDLIST_PATH = Path(data.wordlist_path)
-        updated["wordlist_path"] = data.wordlist_path
-    if data.resolvers_path is not None:
-        cfg.RESOLVERS_PATH = Path(data.resolvers_path)
-        updated["resolvers_path"] = data.resolvers_path
-    if data.dns_bruteforce_enabled is not None:
-        cfg.DNS_BRUTEFORCE_ENABLED = data.dns_bruteforce_enabled
-        updated["dns_bruteforce_enabled"] = data.dns_bruteforce_enabled
-    if data.dns_wordlist_expansion_enabled is not None:
-        cfg.DNS_WORDLIST_EXPANSION_ENABLED = data.dns_wordlist_expansion_enabled
-        updated["dns_wordlist_expansion_enabled"] = data.dns_wordlist_expansion_enabled
-    if data.tech_screenshots_enabled is not None:
-        cfg.TECH_SCREENSHOTS_ENABLED = data.tech_screenshots_enabled
-        updated["tech_screenshots_enabled"] = data.tech_screenshots_enabled
-    if data.tech_rate_limit_delay is not None:
-        cfg.TECH_RATE_LIMIT_DELAY = data.tech_rate_limit_delay
-        updated["tech_rate_limit_delay"] = data.tech_rate_limit_delay
-    if data.dns_rate_limit_delay is not None:
-        cfg.DNS_RATE_LIMIT_DELAY = data.dns_rate_limit_delay
-        updated["dns_rate_limit_delay"] = data.dns_rate_limit_delay
-    if data.crawl_rate_limit_delay is not None:
-        cfg.CRAWL_RATE_LIMIT_DELAY = data.crawl_rate_limit_delay
-        updated["crawl_rate_limit_delay"] = data.crawl_rate_limit_delay
+    updated = data.model_dump(exclude_none=True)
+    for field, value in updated.items():
+        setattr(
+            _cfg,
+            _SCAN_CONFIG_FIELDS[field],
+            Path(value) if field in _SCAN_CONFIG_PATH_FIELDS else value,
+        )
+    # The response echoes the raw strings that arrived, not the coerced Paths.
     return {"updated": updated}
 
 
@@ -276,10 +225,6 @@ _NOTIFY_CHANNEL_REQUIREMENTS = {
 }
 
 
-def _check_webhook_url(value: str) -> None:
-    validate_webhook_url(value)
-
-
 def _check_bot_token(value: str) -> None:
     if not TELEGRAM_TOKEN_RE.match(value):
         raise ValueError("must look like 123456:AA... (digits, a colon, then the secret)")
@@ -293,9 +238,11 @@ def _check_chat_id(value: str) -> None:
 # Free-text notification fields, with the check each one's value must pass.
 # `None` means any non-empty string is acceptable (a bearer token has no shape).
 _NOTIFY_STRING_CHECKS = {
-    "slack_webhook_url": _check_webhook_url,
-    "discord_webhook_url": _check_webhook_url,
-    "webhook_url": _check_webhook_url,
+    # validate_webhook_url returns the URL unchanged and raises ValueError on a
+    # fault; the caller below only cares about the raise.
+    "slack_webhook_url": validate_webhook_url,
+    "discord_webhook_url": validate_webhook_url,
+    "webhook_url": validate_webhook_url,
     "webhook_token": None,
     "telegram_bot_token": _check_bot_token,
     "telegram_chat_id": _check_chat_id,
