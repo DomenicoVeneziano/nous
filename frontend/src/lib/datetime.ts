@@ -27,3 +27,18 @@ export function parseBackendDate(value: string): Date {
 export function formatDateTime(d: Date): string {
   return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 }
+
+/**
+ * Render a backend timestamp in the viewer's locale, or "Unknown" when unset.
+ *
+ * Deliberately not formatDateTime: the default locale rendering keeps the
+ * seconds and the numeric date, which asset detail and history both rely on.
+ * A missing value is genuinely unknown rather than zero, so it is not faked
+ * from another field.
+ */
+export function formatTimestamp(value: string | null): string {
+  if (!value) return 'Unknown';
+  const parsed = parseBackendDate(value);
+  if (Number.isNaN(parsed.getTime())) return 'Unknown';
+  return parsed.toLocaleString();
+}

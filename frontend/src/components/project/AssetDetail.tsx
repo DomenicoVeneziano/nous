@@ -5,7 +5,7 @@ import type { Asset, AssetUpdate, Highlight } from '../../types/asset';
 import { HighlightText } from '../shared/HighlightText';
 import { updateAsset, deleteAsset, fetchImageObjectUrl, exportAsset } from '../../api/assets';
 import client from '../../api/client';
-import { parseBackendDate } from '../../lib/datetime';
+import { formatTimestamp } from '../../lib/datetime';
 import { useAuth } from '../../hooks/useAuth';
 import AssetHistory from './AssetHistory';
 import FindingsPanel from './FindingsPanel';
@@ -49,18 +49,6 @@ function resolveFileSpans(highlights: Highlight[], fileContent: string): { start
     spans.push({ start: base + hl.start, end: base + hl.end });
   }
   return spans;
-}
-
-/** Render an ISO timestamp in the viewer's locale, or "Unknown" when unset.
- *  Assets that predate tagging have no recorded discovery date — that is
- *  genuinely unknown rather than zero, so it is not faked from another field. */
-/*  Not lib/datetime's formatDateTime: that renders dateStyle 'medium' /
- *  timeStyle 'short', which drops the seconds and restyles the date. */
-function formatTimestamp(value: string | null): string {
-  if (!value) return 'Unknown';
-  const parsed = parseBackendDate(value);
-  if (Number.isNaN(parsed.getTime())) return 'Unknown';
-  return parsed.toLocaleString();
 }
 
 const dateValueStyle: React.CSSProperties = {

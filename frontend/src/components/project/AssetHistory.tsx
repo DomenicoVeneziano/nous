@@ -2,7 +2,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { AssetChange, AssetChangeField } from '../../types/assetChange';
 import { fetchAssetChanges } from '../../api/assets';
-import { parseBackendDate } from '../../lib/datetime';
+import { formatTimestamp } from '../../lib/datetime';
 import TagChip from '../shared/TagChip';
 
 interface Props {
@@ -34,16 +34,6 @@ function statusColor(value: string | null): string {
   if (code >= 300 && code < 400) return 'var(--status-info)';
   if (code >= 400 && code < 500) return 'var(--status-warning)';
   return 'var(--status-error)';
-}
-
-/** Render an ISO timestamp in the viewer's locale, or "Unknown" when unset.
- *  Not lib/datetime's formatDateTime: that renders dateStyle 'medium' /
- *  timeStyle 'short', which drops the seconds and restyles the date. */
-function formatTimestamp(value: string | null): string {
-  if (!value) return 'Unknown';
-  const parsed = parseBackendDate(value);
-  if (Number.isNaN(parsed.getTime())) return 'Unknown';
-  return parsed.toLocaleString();
 }
 
 /** Read one side of a set-valued delta. The column is written by the engine but
