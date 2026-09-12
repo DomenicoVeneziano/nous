@@ -285,14 +285,15 @@ else
         # wordlist runs to ~110k lines and a per-word scan of it is quadratic.
         # Staged in $novel_words because the pattern side and the append target
         # are the same file — reading and appending to it in one pipeline would
-        # race itself. `awk NF` on both sides is load-bearing: a blank line in
-        # the pattern file makes -vxFf reject every input line, and a blank
-        # token on the input side is one the per-word loop used to skip.
+        # race itself. `awk length` on both sides is load-bearing: empty lines
+        # must go, because a blank pattern makes -vxFf reject every input
+        # line, but whitespace-only lines must stay, because the per-word
+        # loop this replaced only skipped genuinely empty tokens (`-z`).
         # `awk !seen` keeps the loop's behaviour for a token repeated within
         # $new_words: the first occurrence was appended, the rest then matched.
         if [[ -s "$new_words" ]]; then
-            awk 'NF' "$new_words" \
-                | grep -vxFf <(awk 'NF' "$expanded_wordlist") - \
+            awk 'length' "$new_words" \
+                | grep -vxFf <(awk 'length' "$expanded_wordlist") - \
                 | awk '!seen[$0]++' > "$novel_words" || true
             added=$(wc -l < "$novel_words" | tr -d '[:space:]')
             cat "$novel_words" >> "$expanded_wordlist"
