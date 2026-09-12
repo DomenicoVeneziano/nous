@@ -51,11 +51,11 @@ curl -sf "https://crt.sh/?q=%%25.${DOMAIN}&output=json" \\\n\
 ' > /usr/local/bin/crt && chmod +x /usr/local/bin/crt
 
 # ── Python tools (waymore, camoufox, crawlee) ────────────────
-# playwright is pinned: camoufox 0.4.x ships a Firefox build that speaks an
-# older Juggler protocol. With an unpinned (newer) playwright the driver
-# crashes on Firefox 'pageError' events that lack a 'location', aborting every
-# navigation with status 0 (the SCAN_ERROR flood). 1.50.0 matches camoufox's Firefox.
-RUN pip3 install --no-cache-dir --break-system-packages waymore camoufox "crawlee[playwright]" "playwright==1.50.0"
+# camoufox 0.5.5 declares playwright<1.61, but 1.50.0 is kept deliberately: it
+# matches the Juggler protocol of the Firefox build `camoufox fetch` downloads.
+# A newer driver crashes on Firefox 'pageError' events that lack a 'location',
+# aborting every navigation with status 0 (the SCAN_ERROR flood).
+RUN pip3 install --no-cache-dir --break-system-packages waymore "camoufox[geoip]==0.5.5" "crawlee[playwright]==1.9.3" "playwright==1.50.0"
 
 # ── Browsers for camoufox / crawlee ──────────────────────────
 RUN python3 -m camoufox fetch
