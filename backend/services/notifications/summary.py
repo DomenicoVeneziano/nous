@@ -8,9 +8,13 @@ count) + two samples of at most 20 each, the widest NOTIFY_SAMPLE_SIZE the
 bounds allow. Nothing here loads a table, and nothing here scales with asset
 volume.
 
+The full report (iter_report_rows) is the one read not fixed in rows: it pages
+through a scan's rows by rowid, and render.write_report bounds it in bytes.
+
 The queries are SQLAlchemy Core text() with bound parameters only — no value,
 including the sample size, is ever interpolated into the SQL string.
 """
+from collections.abc import Iterator
 from datetime import datetime, timezone
 
 from sqlalchemy import text
@@ -33,6 +37,16 @@ VALUE_CHARS = 80
 
 # Longest error message echoed into an event.
 MAX_ERROR_CHARS = 500
+
+# The full report. Pages walk ix_asset_changes_project_scan and
+# ix_assets_first_seen_scan, which carry the rowid as their implicit last
+# column, so "rowid > :after ORDER BY rowid" is a range seek with no sort.
+# Values are cut in SQL one character past the ceiling, so the ellipsis added
+# in _report_value marks only a real cut.
+REPORT_PAGE_ROWS = 500
+REPORT_VALUE_CHARS = 1000
+REPORT_ASSET_CHARS = 300
+REPORT_FIELD_CHARS = 64
 
 _SQL_TOTALS = text(
     "SELECT COUNT(*) AS total_changes, COUNT(DISTINCT asset_id) AS changed_assets "
@@ -73,6 +87,22 @@ _SQL_NEW_ASSET_SAMPLE = text(
 )
 
 _SQL_PROJECT_TITLE = text("SELECT title FROM projects WHERE id = :pid")
+
+_SQL_REPORT_NEW = text(
+    "SELECT rowid, substr(asset, 1, :achars) FROM assets "
+    "WHERE project_id = :pid AND first_seen_scan_id = :sid AND rowid > :after "
+    "ORDER BY rowid LIMIT :page"
+)
+
+# LEFT JOIN, unlike the sample: a change whose asset was deleted since is still
+# a change, and _SQL_TOTALS, which the report's item count comes from, counts it.
+_SQL_REPORT_CHANGES = text(
+    "SELECT c.rowid, substr(a.asset, 1, :achars), substr(c.field, 1, :fchars), "
+    "substr(c.old_value, 1, :vchars), substr(c.new_value, 1, :vchars) "
+    "FROM asset_changes c LEFT JOIN assets a ON a.id = c.asset_id "
+    "WHERE c.project_id = :pid AND c.scan_id = :sid AND c.rowid > :after "
+    "ORDER BY c.rowid LIMIT :page"
+)
 
 
 def clamped(key: str) -> int:
@@ -177,6 +207,47 @@ def collect_summary(project_id: str, scan_id: str) -> dict:
         }
     finally:
         db.close()
+
+
+def _report_value(value) -> str | None:
+    if value is None:
+        return None
+    out = str(value)
+    return out if len(out) <= REPORT_VALUE_CHARS else out[:REPORT_VALUE_CHARS] + "…"
+
+
+def iter_report_rows(db, project_id: str, scan_id: str, stop) -> Iterator[tuple]:
+    """Yield every new asset, then every change, of one scan, a page at a time.
+
+    Each page is its own read transaction, ended by the rollback: the database
+    runs in WAL mode, and one snapshot held open across a long report would keep
+    the WAL from checkpointing. `stop`, a threading.Event, is checked before
+    every page so a cancelled send stops reading.
+    """
+    base = {"pid": project_id, "sid": scan_id, "page": REPORT_PAGE_ROWS, "achars": REPORT_ASSET_CHARS}
+    passes = (
+        (_SQL_REPORT_NEW, base, lambda r: ("new", r[1] or "")),
+        (
+            _SQL_REPORT_CHANGES,
+            dict(base, fchars=REPORT_FIELD_CHARS, vchars=REPORT_VALUE_CHARS + 1),
+            lambda r: (
+                "change",
+                "(deleted asset)" if r[1] is None else r[1],
+                r[2] or "",
+                _report_value(r[3]),
+                _report_value(r[4]),
+            ),
+        ),
+    )
+    for sql, params, shape in passes:
+        after = -(2 ** 63)
+        while not stop.is_set():
+            rows = db.execute(sql, dict(params, after=after)).fetchall()
+            db.rollback()
+            yield from (shape(r) for r in rows)
+            if len(rows) < REPORT_PAGE_ROWS:
+                break
+            after = rows[-1][0]
 
 
 def project_title(project_id: str) -> str:

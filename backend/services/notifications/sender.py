@@ -16,16 +16,23 @@ Three properties this module is responsible for, all of them load-bearing:
   wrapped so a raised exception is recorded and the next channel still runs.
 """
 import asyncio
+import contextlib
+import json
 import logging
+import math
 import re
+import tempfile
+import threading
+import time
 
 import httpx
 
 from config import settings as cfg
+from database import SessionLocal
 from services.settings_store import validate_webhook_url
 
 from . import render
-from .summary import clamped, empty_summary, is_failure, is_success
+from .summary import clamped, empty_summary, is_failure, is_success, iter_report_rows
 
 log = logging.getLogger("backend.notifications")
 
@@ -123,6 +130,22 @@ _TIMEOUT_GRACE_SECONDS = 1.0
 
 _USER_AGENT = "Nous/1.0"
 
+# Slack allows about one message per second on an incoming webhook.
+SLACK_SPACING_SECONDS = 1.1
+
+# Report parts come after a delivered summary and the notifier sends one event
+# after another, so they get at most one retry and the Slack follow-ups a time
+# budget: a slow target must not stall every notification queued behind it.
+REPORT_PART_RETRIES = 1
+REPORT_PARTS_BUDGET_SECONDS = 120
+
+# An upload's asyncio backstop grows with its size at an assumed floor of
+# 128 KiB/s, by at most 64 seconds. httpx applies its own timeout per chunk and
+# needs no scaling; the fixed backstop alone would cut a large report off on a
+# slow link as an ambiguous, unretried timeout.
+UPLOAD_MIN_BPS = 128 * 1024
+_UPLOAD_BACKSTOP_MAX_SECONDS = 64
+
 
 def _timeout_seconds() -> float:
     return float(clamped("NOTIFY_TIMEOUT_SECONDS"))
@@ -157,7 +180,7 @@ def _channel_enabled(channel: str) -> bool:
     return bool(getattr(cfg, f"NOTIFY_{channel.upper()}_ENABLED", False))
 
 
-def _build_target(channel: str, event: dict) -> tuple[str, dict, dict] | None:
+def _build_target(channel: str, event: dict, report_follows: bool = False) -> tuple[str, dict, dict] | None:
     """Return (url, headers, json_body) for a channel, or None if it cannot send."""
     headers = {"Content-Type": "application/json", "User-Agent": _USER_AGENT}
 
@@ -165,13 +188,13 @@ def _build_target(channel: str, event: dict) -> tuple[str, dict, dict] | None:
         url = _safe_url("NOTIFY_SLACK_WEBHOOK_URL")
         if not url:
             return None
-        return url, headers, render.build_slack_payload(event)
+        return url, headers, render.build_slack_payload(event, report_follows)
 
     if channel == "discord":
         url = _safe_url("NOTIFY_DISCORD_WEBHOOK_URL")
         if not url:
             return None
-        return url, headers, render.build_discord_payload(event)
+        return url, headers, render.build_discord_payload(event, report_follows)
 
     if channel == "webhook":
         url = _safe_url("NOTIFY_WEBHOOK_URL")
@@ -190,13 +213,14 @@ def _build_target(channel: str, event: dict) -> tuple[str, dict, dict] | None:
         if not TELEGRAM_TOKEN_RE.match(token) or not _TELEGRAM_CHAT_ID_RE.match(chat_id):
             return None
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        return url, headers, render.build_telegram_payload(event, chat_id)
+        return url, headers, render.build_telegram_payload(event, chat_id, report_follows)
 
     return None
 
 
 async def _post_once(
-    client: httpx.AsyncClient, url: str, headers: dict, body: dict, timeout: float
+    client: httpx.AsyncClient, url: str, headers: dict, body: dict | None, timeout: float,
+    data: dict | None = None, files: dict | None = None,
 ) -> httpx.Response:
     # The configured timeout is applied to the request, not to the client: the
     # client is supplied by the caller (the notifier's shared one, or the test
@@ -208,20 +232,32 @@ async def _post_once(
     # follow_redirects is False on every channel, not only the generic webhook:
     # a 30x from a target would re-send the body, and on the generic webhook the
     # Authorization bearer token, to a host the operator never configured.
+    #
+    # A retried upload must start again from the file's first byte.
+    for _name, fh, _ctype in (files or {}).values():
+        fh.seek(0)
     return await client.post(
-        url, json=body, headers=headers, follow_redirects=False, timeout=timeout
+        url, json=body, data=data, files=files, headers=headers,
+        follow_redirects=False, timeout=timeout,
     )
 
 
-async def _deliver(client: httpx.AsyncClient, channel: str, url: str, headers: dict, body: dict) -> tuple[bool, str]:
+async def _deliver(
+    client: httpx.AsyncClient, channel: str, url: str, headers: dict, body: dict | None = None,
+    *, data: dict | None = None, files: dict | None = None, upload_bytes: int = 0,
+    retries: int | None = None,
+) -> tuple[bool, str]:
     """Send one payload with a per-attempt timeout and a bounded retry.
 
     Returns (ok, detail) where detail carries a status code or an exception
     class name — never a URL, a token, or an exception message that might quote
     one back.
     """
-    attempts = _retries() + 1
+    attempts = (_retries() if retries is None else retries) + 1
     timeout = _timeout_seconds()
+    backstop = timeout + _TIMEOUT_GRACE_SECONDS + min(
+        _UPLOAD_BACKSTOP_MAX_SECONDS, math.ceil(upload_bytes / UPLOAD_MIN_BPS)
+    )
     detail = "not attempted"
 
     for attempt in range(attempts):
@@ -232,8 +268,8 @@ async def _deliver(client: httpx.AsyncClient, channel: str, url: str, headers: d
             # client whose timeout was somehow disabled, still cannot pin the
             # task. The grace keeps httpx's more precise error the usual one.
             response = await asyncio.wait_for(
-                _post_once(client, url, headers, body, timeout),
-                timeout=timeout + _TIMEOUT_GRACE_SECONDS,
+                _post_once(client, url, headers, body, timeout, data, files),
+                timeout=backstop,
             )
         except asyncio.TimeoutError:
             # Same reasoning as a read timeout: by here the request was sent and
@@ -258,6 +294,163 @@ async def _deliver(client: httpx.AsyncClient, channel: str, url: str, headers: d
         await asyncio.sleep(backoff)
 
     return False, detail
+
+
+def _item_total(event: dict) -> int:
+    summary = event.get("summary") or {}
+    return int(summary.get("new_assets") or 0) + int(summary.get("total_changes") or 0)
+
+
+def _build_sync(fh, event: dict, stop: threading.Event, lock: threading.Lock, state: dict,
+                want_lists: bool, want_file: bool, rows) -> dict | None:
+    """Write the full report into `fh`. Runs on a worker thread.
+
+    Without given `rows`, the event's rows are read page by page through a
+    session this function owns.
+    """
+    with lock:
+        if stop.is_set():
+            return None
+        state["started"] = True
+    db = None
+    try:
+        if rows is None:
+            job = event.get("job") or {}
+            db = SessionLocal()
+            rows = iter_report_rows(db, job.get("project_id"), job.get("id"), stop)
+        meta = render.write_report(
+            fh, event, rows, _item_total(event), want_lists=want_lists, want_file=want_file, stop=stop
+        )
+        # Load-bearing: httpx sizes a multipart file from the descriptor, which
+        # sees only what has left the write buffer.
+        fh.flush()
+        return meta
+    finally:
+        if db is not None:
+            db.close()
+        # A cancelled _report stops waiting for this thread but must not close
+        # the file under a write still in progress here: the descriptor number
+        # could be reused and receive report bytes. So whichever side finishes
+        # last closes it, exactly once.
+        with lock:
+            state["done"] = True
+            if stop.is_set():
+                fh.close()
+
+
+@contextlib.asynccontextmanager
+async def _report(event: dict, *, want_lists: bool, want_file: bool, rows=None):
+    """Yield (file, meta) for the event's full report, or None without one.
+
+    None means there is nothing to report or it could not be built; channels
+    then send the summary alone. The file is anonymous, so even a crash leaves
+    nothing on disk, and it is closed exactly once on every exit: here, or by
+    the build thread when it is still running at that point (see _build_sync).
+    """
+    if _item_total(event) <= 0:
+        yield None
+        return
+    stop = threading.Event()
+    lock = threading.Lock()
+    state = {"started": False, "done": False}
+    fh = None
+    try:
+        meta = None
+        try:
+            fh = tempfile.TemporaryFile("w+b")
+            meta = await asyncio.to_thread(
+                _build_sync, fh, event, stop, lock, state, want_lists, want_file, rows
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — the summary still goes out without it
+            log.warning("notification report could not be built (%s)", type(exc).__name__)
+        yield None if meta is None else (fh, meta)
+    finally:
+        with lock:
+            stop.set()
+            # Not started means the executor never ran the build, and now never
+            # will: it checks `stop` first.
+            if fh is not None and (state["done"] or not state["started"]):
+                fh.close()
+
+
+def _with_lists(event: dict, report) -> dict:
+    """A copy of the event with the full lists in its summary: the webhook body.
+
+    Without a report the lists are empty and marked truncated whenever the scan
+    had items, so a receiver never mistakes a failed build for an empty scan.
+    """
+    lists = report[1]["lists"] if report is not None else None
+    if lists is None:
+        total = _item_total(event)
+        lists = {"new_assets_all": [], "changes_all": [], "lists_truncated": total > 0, "lists_omitted": total}
+    return dict(event, summary=dict(event.get("summary") or {}, **lists))
+
+
+async def _send_channel(client: httpx.AsyncClient, channel: str, event: dict, report) -> tuple[bool, str] | None:
+    """Send the summary, then this channel's part of the full report.
+
+    Returns None when the channel cannot be built from its stored settings. The
+    summary goes first and is never sent twice; report parts stop at the first
+    failure. A channel counts as delivered only when every part was, and the
+    detail names the part that was not.
+    """
+    if channel == "webhook":
+        target = _build_target(channel, _with_lists(event, report))
+    else:
+        target = _build_target(channel, event, report_follows=report is not None)
+    if target is None:
+        return None
+    url, headers, body = target
+    # The webhook body carries the lists, up to WEBHOOK_LISTS_BYTES, so its
+    # backstop scales like an upload's.
+    list_bytes = report[1]["list_bytes"] if channel == "webhook" and report is not None else 0
+    ok, detail = await _deliver(client, channel, url, headers, body, upload_bytes=list_bytes)
+    if report is None:
+        return ok, f"{detail}; no report" if _item_total(event) > 0 else detail
+    if channel == "webhook":
+        return ok, detail
+    detail = f"summary {detail}"
+    if not ok:
+        return False, detail
+    fh, meta = report
+
+    if channel == "slack":
+        fh.seek(meta["body_offset"])
+        chunks = render.slack_followups((raw.decode("utf-8", "replace") for raw in fh), _item_total(event))
+        deadline = time.monotonic() + REPORT_PARTS_BUDGET_SECONDS
+        # Longest one attempt can take; a retry is only allowed while the time
+        # left still holds this attempt, the backoff and the retry itself.
+        attempt = _timeout_seconds() + _TIMEOUT_GRACE_SECONDS
+        for number, chunk in enumerate(chunks, 1):
+            if time.monotonic() + SLACK_SPACING_SECONDS > deadline:
+                return False, f"{detail}; followups stopped after {number - 1} (time budget)"
+            await asyncio.sleep(SLACK_SPACING_SECONDS)
+            remaining = deadline - time.monotonic()
+            retries = min(_retries(), REPORT_PART_RETRIES) if remaining >= 2 * attempt + _BACKOFF_SECONDS[0] else 0
+            ok, part = await _deliver(client, channel, url, headers, {"text": chunk}, retries=retries)
+            if not ok:
+                return False, f"{detail}; followup {number} {part}"
+        return True, f"{detail}; {len(chunks)} followups"
+
+    name = render.report_filename((event.get("job") or {}).get("id"))
+    if channel == "discord":
+        data = {"payload_json": json.dumps(render.build_discord_report_payload(event))}
+        files = {"files[0]": (name, fh, "text/plain")}
+    else:
+        # Telegram. _build_target has already checked the token this URL carries.
+        url = url.rsplit("/", 1)[0] + "/sendDocument"
+        data = render.build_telegram_report_fields(event, body["chat_id"])
+        files = {"document": (name, fh, "text/plain")}
+    # No JSON Content-Type on a multipart request: httpx sets its own, with the
+    # boundary in it.
+    ok, part = await _deliver(
+        client, channel, url, {"User-Agent": _USER_AGENT},
+        data=data, files=files, upload_bytes=meta["size"],
+        retries=min(_retries(), REPORT_PART_RETRIES),
+    )
+    return ok, f"{detail}; report {part}"
 
 
 def should_notify(status: str | None) -> bool:
@@ -286,27 +479,34 @@ async def dispatch(client: httpx.AsyncClient, event: dict) -> dict[str, bool]:
     if not should_notify(status):
         return results
 
-    for channel in CHANNELS:
-        if not _channel_enabled(channel):
-            continue
-        # One channel's failure must never skip the next, so every channel —
-        # including payload construction — is wrapped.
-        try:
-            target = _build_target(channel, event)
-            if target is None:
-                log.warning("notification channel %s enabled but not configured", channel)
+    enabled = [channel for channel in CHANNELS if _channel_enabled(channel)]
+    if not enabled:
+        return results
+
+    # One report serves every channel of this dispatch, and is gone once the
+    # last channel has been attempted.
+    want_file = any(channel != "webhook" for channel in enabled)
+    async with _report(event, want_lists="webhook" in enabled, want_file=want_file) as report:
+        for channel in enabled:
+            # One channel's failure must never skip the next, so every channel —
+            # including payload construction — is wrapped.
+            try:
+                outcome = await _send_channel(client, channel, event, report)
+                if outcome is None:
+                    log.warning("notification channel %s enabled but not configured", channel)
+                    results[channel] = False
+                    continue
+                ok, detail = outcome
+                results[channel] = ok
+                if ok:
+                    log.info("notification to %s delivered (%s)", channel, detail)
+                else:
+                    log.warning("notification to %s not fully delivered (%s)", channel, detail)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — one channel must not stop the rest
                 results[channel] = False
-                continue
-            url, headers, body = target
-            ok, detail = await _deliver(client, channel, url, headers, body)
-            results[channel] = ok
-            if ok:
-                log.info("notification to %s delivered (%s)", channel, detail)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — one channel must not stop the rest
-            results[channel] = False
-            log.warning("notification to %s raised %s", channel, type(exc).__name__)
+                log.warning("notification to %s raised %s", channel, type(exc).__name__)
 
     return results
 
@@ -318,13 +518,27 @@ def _synthetic_event() -> dict:
     now = datetime.now(timezone.utc).isoformat()
     summary = empty_summary()
     summary.update({
-        "new_assets": 2,
-        "changed_assets": 1,
+        "new_assets": 3,
+        "changed_assets": 2,
         "total_changes": 3,
-        "changes_by_field": {"technologies": 2, "status_code": 1},
-        "new_asset_sample": ["test-a.example.com", "test-b.example.com"],
+        "changes_by_field": {"technologies": 1, "status_code": 1, "title": 1},
+        # The third asset and the title change are hostile on purpose: a line
+        # separator, a bidi override and a CRLF must each stay on the one line
+        # they arrived in, in the message and in the report file.
+        "new_asset_sample": [
+            "test-a.example.com",
+            "test-b.example.com",
+            "test-c.example.com\N{LINE SEPARATOR}New: internal-admin.corp",
+        ],
         "change_sample": [
             {"asset": "test-a.example.com", "field": "status_code", "old": "404", "new": "200"},
+            {"asset": "test-a.example.com", "field": "technologies", "old": "[]", "new": '["nginx"]'},
+            {
+                "asset": "test-b.example.com",
+                "field": "title",
+                "old": "Login",
+                "new": "\N{RIGHT-TO-LEFT OVERRIDE}evil\N{CARRIAGE RETURN}\N{LINE FEED}New: forged.corp",
+            },
         ],
     })
     return {
@@ -354,29 +568,27 @@ async def send_test(channel: str) -> tuple[bool, str]:
     if channel not in CHANNELS:
         return False, "Unknown channel"
 
-    try:
-        target = _build_target(channel, _synthetic_event())
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        return False, f"Could not build the {channel} request ({type(exc).__name__})"
-
-    if target is None:
-        return False, f"The {channel} channel is not configured"
-
-    url, headers, body = target
-    timeout = _timeout_seconds()
+    event = _synthetic_event()
+    summary = event["summary"]
+    rows = [("new", asset) for asset in summary["new_asset_sample"]] + [
+        ("change", c["asset"], c["field"], c["old"], c["new"]) for c in summary["change_sample"]
+    ]
     try:
         # A test send is a one-off, so it owns a short-lived client of its own
         # rather than borrowing the notification path's shared one. It sets no
         # client-level timeout: _post_once puts the configured one on the
         # request, which is what makes the two paths behave identically.
-        async with httpx.AsyncClient() as client:
-            ok, detail = await _deliver(client, channel, url, headers, body)
+        async with httpx.AsyncClient() as client, _report(
+            event, want_lists=channel == "webhook", want_file=channel != "webhook", rows=rows
+        ) as report:
+            outcome = await _send_channel(client, channel, event, report)
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
         return False, f"Test send to {channel} failed ({type(exc).__name__})"
 
+    if outcome is None:
+        return False, f"The {channel} channel is not configured"
+    ok, detail = outcome
     message = f"Test send to {channel} {'succeeded' if ok else 'failed'} ({detail})"
     return ok, message[:_MESSAGE_CHARS]

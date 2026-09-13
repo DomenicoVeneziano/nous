@@ -1,5 +1,6 @@
 # backend/services/notifications/render.py
-"""One shared body text, four per-channel payloads, and the escaping each needs.
+"""One shared body text, four per-channel payloads, the full report, and the
+escaping each needs.
 
 Everything interpolated below — asset hostnames, page titles, field values,
 project titles, engine error messages — is attacker-influenced text: it comes
@@ -7,6 +8,8 @@ from a scanned host, not from an operator. Each channel therefore gets the
 escaping its own renderer requires, applied at the point of interpolation. The
 escaping rules in this module are security controls, not formatting taste.
 """
+import json
+import re
 import unicodedata
 from datetime import datetime, timezone
 
@@ -19,6 +22,26 @@ DISCORD_BODY_CHARS = 4000
 TELEGRAM_BODY_CHARS = 4000
 # The Slack "text" fallback is the notification preview, not the message.
 FALLBACK_CHARS = 300
+
+# The full report file. 8 MiB fits Discord's 10 MB webhook attachment limit
+# with room for the multipart envelope, and sits far below Telegram's 50 MB. The
+# reserve keeps room for the trailer that says how much was left out.
+REPORT_MAX_BYTES = 8 * 1024 * 1024
+REPORT_TRAILER_RESERVE = 256
+# Lists carried in the generic webhook body. The dict and httpx's serialised
+# copy are both in memory while it sends, and a body past a receiver's proxy
+# limit comes back 413, which is not retried.
+WEBHOOK_LISTS_BYTES = 2 * 1024 * 1024
+# Slack incoming webhooks cannot attach a file, so Slack gets the summary plus
+# follow-ups. A line is clipped before slack_escape, whose worst case is 5x
+# (& -> &amp;), so any single line still fits a block.
+SLACK_MAX_MESSAGES = 10
+SLACK_LINE_CHARS = 500
+TELEGRAM_CAPTION_CHARS = 1024
+
+# The attachment name lands in a multipart Content-Disposition header, so only
+# a job id of the UUID shape may reach it.
+_REPORT_ID_RE = re.compile(r"\A[0-9a-f-]{1,64}\Z")
 
 # Longest single old/new value shown in a body line. The values already arrive
 # truncated to 80 characters by the SQL in summary.py; this only guards the
@@ -150,12 +173,9 @@ def headline(event: dict, esc=plain_escape) -> str:
     return _clip(line, FALLBACK_CHARS)
 
 
-def build_body(event: dict, esc=plain_escape, limit: int = TELEGRAM_BODY_CHARS) -> str:
-    """The shared message body, with `esc` applied to every interpolated value.
-
-    Only counts and the fixed labels are unescaped; every string that originated
-    in scan data passes through `esc` at the point it is inserted.
-    """
+def report_header_lines(event: dict, esc=plain_escape) -> list[str]:
+    """Headline, status, timing, error and counts: the top of the message body
+    and of the report file alike."""
     job = event.get("job") or {}
     summary = event.get("summary") or {}
     status = str(job.get("status") or "unknown")
@@ -177,6 +197,18 @@ def build_body(event: dict, esc=plain_escape, limit: int = TELEGRAM_BODY_CHARS) 
         f"Changed assets: {int(summary.get('changed_assets') or 0)} | "
         f"Total changes: {int(summary.get('total_changes') or 0)}"
     )
+    return lines
+
+
+def build_body(event: dict, esc=plain_escape, limit: int = TELEGRAM_BODY_CHARS,
+               report_follows: bool = False) -> str:
+    """The shared message body, with `esc` applied to every interpolated value.
+
+    Only counts and the fixed labels are unescaped; every string that originated
+    in scan data passes through `esc` at the point it is inserted.
+    """
+    summary = event.get("summary") or {}
+    lines = report_header_lines(event, esc)
 
     by_field = summary.get("changes_by_field") or {}
     if by_field:
@@ -198,13 +230,13 @@ def build_body(event: dict, esc=plain_escape, limit: int = TELEGRAM_BODY_CHARS) 
             lines.append(f"  {asset} {field}: {old} -> {new}")
 
     if summary.get("sample_truncated"):
-        lines.append("(sample truncated)")
+        lines.append("(sample truncated — full report follows)" if report_follows else "(sample truncated)")
 
     return _clip("\n".join(lines), limit)
 
 
-def build_slack_payload(event: dict) -> dict:
-    body = build_body(event, slack_escape, SLACK_BODY_CHARS)
+def build_slack_payload(event: dict, report_follows: bool = False) -> dict:
+    body = build_body(event, slack_escape, SLACK_BODY_CHARS, report_follows)
     return {
         "text": headline(event, slack_escape),
         "blocks": [
@@ -213,7 +245,7 @@ def build_slack_payload(event: dict) -> dict:
     }
 
 
-def build_discord_payload(event: dict) -> dict:
+def build_discord_payload(event: dict, report_follows: bool = False) -> dict:
     job = event.get("job") or {}
     status = str(job.get("status") or "")
     stamp = job.get("finished_at") or event.get("generated_at") or datetime.now(timezone.utc).isoformat()
@@ -222,7 +254,7 @@ def build_discord_payload(event: dict) -> dict:
         "embeds": [
             {
                 "title": _clip(headline(event, discord_escape), 256),
-                "description": build_body(event, discord_escape, DISCORD_BODY_CHARS),
+                "description": build_body(event, discord_escape, DISCORD_BODY_CHARS, report_follows),
                 "color": DISCORD_COLOR_SUCCESS if status in _SUCCESS_STATUSES else DISCORD_COLOR_FAILURE,
                 "timestamp": stamp,
             }
@@ -234,13 +266,174 @@ def build_discord_payload(event: dict) -> dict:
     }
 
 
-def build_telegram_payload(event: dict, chat_id: str) -> dict:
+def build_telegram_payload(event: dict, chat_id: str, report_follows: bool = False) -> dict:
     # parse_mode is deliberately omitted. With Markdown or HTML, an asset title
     # carrying an unbalanced * or < either makes the API reject the message with
     # a 400 ("can't parse entities") or lets scan data restyle the message.
     # Plain text has neither failure mode.
     return {
         "chat_id": chat_id,
-        "text": build_body(event, plain_escape, TELEGRAM_BODY_CHARS),
+        "text": build_body(event, plain_escape, TELEGRAM_BODY_CHARS, report_follows),
         "disable_web_page_preview": True,
     }
+
+
+# The full report. Discord and Telegram receive it as a file, Slack as capped
+# follow-up messages, the generic webhook as lists in its JSON body. Every item
+# line passes through plain_escape, so one item is always exactly one line
+# starting with two spaces: slack_followups counts items by that.
+
+
+def report_filename(job_id) -> str:
+    raw = job_id if isinstance(job_id, str) else ""
+    return f"nous-scan-report-{raw if _REPORT_ID_RE.match(raw) else 'report'}.txt"
+
+
+def _report_line(row) -> str:
+    if row[0] == "new":
+        return f"  {plain_escape(row[1])}\n"
+    _, asset, field, old, new = row
+    return (
+        f"  {plain_escape(asset)} {plain_escape(field)}: "
+        f"{plain_escape(old or '-')} -> {plain_escape(new or '-')}\n"
+    )
+
+
+def _list_item(row):
+    if row[0] == "new":
+        return row[1]
+    _, asset, field, old, new = row
+    return {"asset": asset, "field": field, "old": old, "new": new}
+
+
+def write_report(fh, event: dict, rows, total_items: int, *, want_lists: bool = False,
+                 want_file: bool = True, stop=None, max_bytes: int = REPORT_MAX_BYTES) -> dict:
+    """Stream `rows` into the binary file `fh` and describe what was written.
+
+    Rows are ("new", asset) or ("change", asset, field, old, new), new assets
+    first. Writing stops once the next line would cross the byte ceiling, and no
+    further row is read. With `want_lists`, the raw items also collect into the
+    webhook lists within WEBHOOK_LISTS_BYTES; they are left unescaped there
+    because JSON encoding is what carries them safely. Without `want_file` the
+    lists are the only consumer, so reading stops as soon as they are full.
+    """
+    header = ("\n".join(report_header_lines(event)) + "\n").encode("utf-8")
+    fh.write(header)
+    size = body_offset = len(header)
+    budget = max_bytes - REPORT_TRAILER_RESERVE
+    written = 0
+    truncated = False
+    section = None
+    new_all: list = []
+    changes_all: list = []
+    list_bytes = 0
+    lists_full = not want_lists
+
+    for row in rows:
+        if stop is not None and stop.is_set():
+            break
+        heading = "" if row[0] == section else ("\nNew assets:\n" if row[0] == "new" else "\nChanges:\n")
+        chunk = (heading + _report_line(row)).encode("utf-8")
+        if size + len(chunk) > budget:
+            truncated = True
+            break
+        fh.write(chunk)
+        size += len(chunk)
+        written += 1
+        section = row[0]
+        if not lists_full:
+            item = _list_item(row)
+            # Two bytes for the ", " that separates list items once serialised.
+            cost = len(json.dumps(item)) + 2
+            if list_bytes + cost > WEBHOOK_LISTS_BYTES:
+                lists_full = True
+            else:
+                (new_all if row[0] == "new" else changes_all).append(item)
+                list_bytes += cost
+        if lists_full and not want_file:
+            break
+
+    omitted = max(0, total_items - written) if truncated else 0
+    if truncated:
+        trailer = f"\n… {omitted} more items omitted (report size limit)\n".encode("utf-8")
+        fh.write(trailer)
+        size += len(trailer)
+
+    lists = None
+    if want_lists:
+        listed = len(new_all) + len(changes_all)
+        lists = {
+            "new_assets_all": new_all,
+            "changes_all": changes_all,
+            "lists_truncated": listed < total_items,
+            "lists_omitted": max(0, total_items - listed),
+        }
+    return {
+        "body_offset": body_offset,
+        "size": size,
+        "written": written,
+        "omitted": omitted,
+        "lists": lists,
+        "list_bytes": list_bytes,
+    }
+
+
+def slack_followups(lines, total_items: int, *, max_messages: int = SLACK_MAX_MESSAGES - 1) -> list[str]:
+    """Pack report lines into at most `max_messages` Slack messages.
+
+    Stops reading `lines` once the last message is full, so at most
+    max_messages * SLACK_BODY_CHARS characters are ever held. The last message
+    keeps room for a line counting the items that did not fit.
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    included = 0
+    for raw in lines:
+        line = slack_escape(_clip(raw.rstrip("\n"), SLACK_LINE_CHARS))
+        if not line.strip():
+            continue
+        last = len(chunks) == max_messages - 1
+        cost = len(line) + (1 if current else 0)
+        if size + cost > SLACK_BODY_CHARS - (REPORT_TRAILER_RESERVE if last else 0):
+            if last:
+                break
+            chunks.append("\n".join(current))
+            current, size, cost = [], 0, len(line)
+        current.append(line)
+        size += cost
+        if raw.startswith("  "):
+            included += 1
+    if current:
+        chunks.append("\n".join(current))
+
+    omitted = total_items - included
+    if omitted <= 0:
+        return chunks
+    note = slack_omitted_note(omitted)
+    # Filling the last message always leaves REPORT_TRAILER_RESERVE free, so the
+    # note fits there; only a message ended early by running out of lines can
+    # be too full, and then a slot is still free.
+    if not chunks or len(chunks) < max_messages and len(chunks[-1]) + 1 + len(note) > SLACK_BODY_CHARS:
+        chunks.append(note)
+    else:
+        chunks[-1] += "\n" + note
+    return chunks
+
+
+def slack_omitted_note(omitted: int) -> str:
+    return f"… {omitted} more items not shown (Slack webhooks cannot carry attachments)"
+
+
+def build_discord_report_payload(event: dict) -> dict:
+    return {
+        "username": "Nous",
+        "content": _clip("Full report: " + headline(event, discord_escape), 2000),
+        # Same reason as on the summary embed: the headline carries scan data.
+        "allowed_mentions": {"parse": []},
+    }
+
+
+def build_telegram_report_fields(event: dict, chat_id: str) -> dict:
+    # No parse_mode, for the same reason as build_telegram_payload.
+    return {"chat_id": chat_id, "caption": _clip(headline(event), TELEGRAM_CAPTION_CHARS)}
