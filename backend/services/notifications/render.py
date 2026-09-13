@@ -198,13 +198,20 @@ def build_slack_payload(event: dict) -> dict:
     }
 
 
+# Every Discord message starts from this payload. The mention guard is
+# load-bearing, not decoration: an asset hostname or a scraped page title is
+# attacker-influenced text, and a crafted one containing @everyone would
+# otherwise ping an entire server from a scan result.
+DISCORD_REPORT_PAYLOAD = {"username": "Nous", "allowed_mentions": {"parse": []}}
+
+
 def build_discord_payload(event: dict) -> dict:
     job = event.get("job") or {}
     status = str(job.get("status") or "")
     stamp = job.get("finished_at") or event.get("generated_at") or datetime.now(timezone.utc).isoformat()
-    return {
-        "username": "Nous",
-        "embeds": [
+    return dict(
+        DISCORD_REPORT_PAYLOAD,
+        embeds=[
             {
                 # The headline is the title, so the description starts below it.
                 "title": _clip(headline(event, discord_escape), 256),
@@ -213,11 +220,7 @@ def build_discord_payload(event: dict) -> dict:
                 "timestamp": stamp,
             }
         ],
-        # Load-bearing, not decoration: an asset hostname or a scraped page
-        # title is attacker-influenced text, and a crafted one containing
-        # @everyone would otherwise ping an entire server from a scan result.
-        "allowed_mentions": {"parse": []},
-    }
+    )
 
 
 def build_telegram_payload(event: dict, chat_id: str) -> dict:
@@ -230,10 +233,6 @@ def build_telegram_payload(event: dict, chat_id: str) -> dict:
         "text": build_body(event, plain_escape, TELEGRAM_BODY_CHARS),
         "disable_web_page_preview": True,
     }
-
-
-# The full report. Discord and Telegram receive it as a file, Slack as capped
-# follow-up messages, the generic webhook as lists in its JSON body.
 
 
 def report_filename(job_id) -> str:
@@ -350,7 +349,6 @@ def write_report(fh, event: dict, rows, total_items: int, *, want_lists: bool = 
         lists = {
             "new_assets_all": new_all,
             "changes_all": changes_all,
-            "lists_truncated": listed < total_items,
             "lists_omitted": max(0, total_items - listed),
         }
     return {
@@ -415,6 +413,3 @@ def slack_followups(lines, total_items: int, labels, body_lines: int, *,
 
 def slack_omitted_note(omitted: int) -> str:
     return f"… {omitted} more items not shown (Slack webhooks cannot carry attachments)"
-
-
-DISCORD_REPORT_PAYLOAD = {"username": "Nous", "allowed_mentions": {"parse": []}}

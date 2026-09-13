@@ -70,13 +70,12 @@ _SQL_REPORT_FIELDS = text(
 # scans grow large enough for it to show.
 #
 # LEFT JOIN: a change whose asset was deleted since is still a change, and
-# _SQL_TOTALS, which the report's item count comes from, counts it. "IS" rather
-# than "=" so a NULL field still matches its own rows.
+# _SQL_TOTALS, which the report's item count comes from, counts it.
 _SQL_REPORT_FIELD_CHANGES = text(
     "SELECT c.rowid, substr(a.asset, 1, :achars), "
     "substr(c.old_value, 1, :vchars), substr(c.new_value, 1, :vchars) "
     "FROM asset_changes c LEFT JOIN assets a ON a.id = c.asset_id "
-    "WHERE c.project_id = :pid AND c.scan_id = :sid AND c.field IS :field AND c.rowid > :after "
+    "WHERE c.project_id = :pid AND c.scan_id = :sid AND c.field = :field AND c.rowid > :after "
     "ORDER BY c.rowid LIMIT :page"
 )
 
@@ -182,9 +181,7 @@ def iter_report_rows(db, project_id: str, scan_id: str, stop) -> Iterator[tuple]
     marker followed by that field's ("change", asset, field, old, new) rows.
     """
     base = {"pid": project_id, "sid": scan_id, "page": REPORT_PAGE_ROWS, "achars": REPORT_ASSET_CHARS}
-    yield from _pages(db, _SQL_REPORT_NEW, base, lambda r: ("new", r[1] or ""), stop)
-    if stop.is_set():
-        return
+    yield from _pages(db, _SQL_REPORT_NEW, base, lambda r: ("new", r[1]), stop)
 
     fields = db.execute(
         _SQL_REPORT_FIELDS, {"pid": project_id, "sid": scan_id, "nfields": REPORT_MAX_FIELDS}
@@ -192,9 +189,7 @@ def iter_report_rows(db, project_id: str, scan_id: str, stop) -> Iterator[tuple]
     db.rollback()
     params = dict(base, vchars=REPORT_VALUE_CHARS + 1)
     for field, assets in fields:
-        if stop.is_set():
-            return
-        name = ("" if field is None else str(field))[:REPORT_FIELD_CHARS]
+        name = str(field)[:REPORT_FIELD_CHARS]
         yield ("field", name, int(assets or 0))
         yield from _pages(
             db,
@@ -218,11 +213,6 @@ def project_title(project_id: str) -> str:
         return _text(db.execute(_SQL_PROJECT_TITLE, {"pid": project_id}).scalar()) or ""
     finally:
         db.close()
-
-
-def empty_summary() -> dict:
-    """The summary shape with every count at zero (used by the test send)."""
-    return {"new_assets": 0, "changed_assets": 0, "total_changes": 0}
 
 
 def build_event(job, title: str | None = None) -> dict:
@@ -256,6 +246,6 @@ def build_event(job, title: str | None = None) -> dict:
             "duration_s": duration,
             "error_msg": _text(getattr(job, "error_msg", None), MAX_ERROR_CHARS),
         },
-        "summary": collect_summary(project_id, scan_id) if project_id and scan_id else empty_summary(),
+        "summary": collect_summary(project_id, scan_id) if project_id and scan_id else {"new_assets": 0, "changed_assets": 0, "total_changes": 0},
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }

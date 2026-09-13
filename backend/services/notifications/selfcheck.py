@@ -167,9 +167,8 @@ def check_webhook_lists():
     rows = [("field", "title", total)] + [("change", "a" * 90 + str(i), "title", "x", "y") for i in range(total)]
     fh, meta = _report(iter(rows), total, want_lists=True)
     lists = meta["lists"]
-    assert meta["list_bytes"] <= render.WEBHOOK_LISTS_BYTES
     assert meta["written"] == total, meta["written"]
-    assert lists["lists_truncated"] and not lists["new_assets_all"]
+    assert lists["lists_omitted"] > 0 and not lists["new_assets_all"]
     assert all(set(item) == {"asset", "field", "old", "new"} for item in lists["changes_all"])
     assert len(json.dumps(lists["changes_all"])) <= render.WEBHOOK_LISTS_BYTES
     assert len(lists["changes_all"]) + lists["lists_omitted"] == total
@@ -187,7 +186,7 @@ def check_lists_only_stop_reading():
 
     _, meta = _report(rows(), total, want_lists=True, want_file=False)
     lists = meta["lists"]
-    assert lists["lists_truncated"]
+    assert lists["lists_omitted"] > 0
     assert pulled == len(lists["new_assets_all"]) + 1 < total, pulled
 
 

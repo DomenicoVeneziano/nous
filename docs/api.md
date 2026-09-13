@@ -753,14 +753,13 @@ The generic webhook receives one JSON body. `job` carries `id`, `scan_type`,
     "total_changes": 1,
     "new_assets_all": ["a.example.com"],
     "changes_all": [{ "asset": "b.example.com", "field": "status_code", "old": "404", "new": "200" }],
-    "lists_truncated": false,
     "lists_omitted": 0
   },
   "generated_at": "2026-09-13T08:05:09+00:00"
 }
 ```
-`new_assets_all` and `changes_all` stop at 2 MiB of JSON; `lists_truncated` and
-`lists_omitted` say how many items were left out.
+`new_assets_all` and `changes_all` stop at 2 MiB of JSON; `lists_omitted` says
+how many items were left out.
 
 Delivery is at-most-once: the job is marked handled before
 the send is attempted, so a failed delivery is logged and never retried on a

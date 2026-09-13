@@ -378,13 +378,13 @@ async def _report(event: dict, *, want_lists: bool, want_file: bool, rows=None):
 def _with_lists(event: dict, report) -> dict:
     """A copy of the event with the full lists in its summary: the webhook body.
 
-    Without a report the lists are empty and marked truncated whenever the scan
-    had items, so a receiver never mistakes a failed build for an empty scan.
+    Without a report the lists are empty and every item counts as omitted, so a
+    receiver never mistakes a failed build for an empty scan.
     """
     lists = report[1]["lists"] if report is not None else None
     if lists is None:
         total = _item_total(event)
-        lists = {"new_assets_all": [], "changes_all": [], "lists_truncated": total > 0, "lists_omitted": total}
+        lists = {"new_assets_all": [], "changes_all": [], "lists_omitted": total}
     return dict(event, summary=dict(event.get("summary") or {}, **lists))
 
 
