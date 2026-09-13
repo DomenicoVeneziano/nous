@@ -65,7 +65,6 @@ class Settings(BaseSettings):
     NOTIFY_TELEGRAM_ENABLED: bool = False
     NOTIFY_TELEGRAM_BOT_TOKEN: str = ""
     NOTIFY_TELEGRAM_CHAT_ID: str = ""
-    NOTIFY_SAMPLE_SIZE: int = 5         # sample findings listed in a message (0-20)
     NOTIFY_TIMEOUT_SECONDS: int = 10    # per-delivery HTTP timeout (1-30)
     NOTIFY_RETRIES: int = 2             # delivery retry attempts (0-5)
 

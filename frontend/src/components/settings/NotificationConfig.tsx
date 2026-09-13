@@ -16,7 +16,7 @@ const EMPTY: NotificationConfigData = {
   discord_enabled: false, discord_webhook_url_set: false,
   webhook_enabled: false, webhook_url_set: false, webhook_token_set: false,
   telegram_enabled: false, telegram_bot_token_set: false, telegram_chat_id: '',
-  sample_size: 5, timeout_seconds: 10, retries: 2,
+  timeout_seconds: 10, retries: 2,
 };
 
 const MASKED = '•••••••• (stored, unchanged)';
@@ -36,8 +36,7 @@ const EMPTY_SECRETS: Secrets = {
 const TELEGRAM_TOKEN_RE = /^[0-9]{1,20}:[A-Za-z0-9_-]{20,256}$/;
 const TELEGRAM_CHAT_ID_RE = /^(-?[0-9]{1,32}|@[A-Za-z0-9_]{5,32})$/;
 
-const TUNING: { key: 'sample_size' | 'timeout_seconds' | 'retries'; label: string; hint: string; min: number; max: number }[] = [
-  { key: 'sample_size', label: 'Sample Size', hint: 'How many new assets to list in the message body (0-20)', min: 0, max: 20 },
+const TUNING: { key: 'timeout_seconds' | 'retries'; label: string; hint: string; min: number; max: number }[] = [
   { key: 'timeout_seconds', label: 'Timeout', hint: 'Seconds to wait for each delivery attempt (1-30)', min: 1, max: 30 },
   { key: 'retries', label: 'Retries', hint: 'Extra delivery attempts after the first failure (0-5)', min: 0, max: 5 },
 ];
@@ -122,7 +121,6 @@ export default function NotificationConfig() {
         webhook_enabled: cfg.webhook_enabled,
         telegram_enabled: cfg.telegram_enabled,
         telegram_chat_id: chatId,
-        sample_size: clamp(Number(cfg.sample_size), 0, 20),
         timeout_seconds: clamp(Number(cfg.timeout_seconds), 1, 30),
         retries: clamp(Number(cfg.retries), 0, 5),
       };
@@ -411,9 +409,9 @@ export default function NotificationConfig() {
           Delivery
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 14, fontFamily: 'var(--font-mono)' }}>
-          Message detail and how hard each delivery is retried
+          How long each delivery waits and how hard it is retried
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
           {TUNING.map(({ key, label, hint, min, max }) => (
             <div key={key}>
               <div style={labelStyle}>{label}</div>

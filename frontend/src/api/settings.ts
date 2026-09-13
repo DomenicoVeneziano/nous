@@ -59,7 +59,6 @@ export interface NotificationConfig {
   telegram_enabled: boolean;
   telegram_bot_token_set: boolean;
   telegram_chat_id: string;
-  sample_size: number;
   timeout_seconds: number;
   retries: number;
 }
@@ -87,7 +86,6 @@ export interface NotificationConfigUpdate {
   telegram_enabled?: boolean;
   telegram_bot_token?: string;
   telegram_chat_id?: string;
-  sample_size?: number;
   timeout_seconds?: number;
   retries?: number;
   clear_secrets?: NotificationSecretField[];

@@ -1,5 +1,5 @@
 # backend/services/notifications/render.py
-"""One shared body text, four per-channel payloads, the full report, and the
+"""One shared summary text, four per-channel payloads, the full report, and the
 escaping each needs.
 
 Everything interpolated below — asset hostnames, page titles, field values,
@@ -37,16 +37,11 @@ WEBHOOK_LISTS_BYTES = 2 * 1024 * 1024
 # (& -> &amp;), so any single line still fits a block.
 SLACK_MAX_MESSAGES = 10
 SLACK_LINE_CHARS = 500
-TELEGRAM_CAPTION_CHARS = 1024
 
 # The attachment name lands in a multipart Content-Disposition header, so only
 # a job id of the UUID shape may reach it.
 _REPORT_ID_RE = re.compile(r"\A[0-9a-f-]{1,64}\Z")
 
-# Longest single old/new value shown in a body line. The values already arrive
-# truncated to 80 characters by the SQL in summary.py; this only guards the
-# rendered line.
-VALUE_CHARS = 80
 ERROR_CHARS = 300
 
 DISCORD_COLOR_SUCCESS = 0x2ECC71
@@ -159,84 +154,42 @@ def _duration(seconds) -> str:
 def headline(event: dict, esc=plain_escape) -> str:
     """The single-line summary used as a title or a notification fallback."""
     job = event.get("job") or {}
-    summary = event.get("summary") or {}
     status = str(job.get("status") or "unknown")
     verb = "completed" if status in _SUCCESS_STATUSES else status.replace("_", " ")
     scan_type = esc(job.get("scan_type") or "scan")
     title = esc(job.get("project_title") or "unknown project")
-    line = f"{scan_type} scan {verb} for {title}"
-    if status in _SUCCESS_STATUSES:
-        line += (
-            f" — {int(summary.get('new_assets') or 0)} new,"
-            f" {int(summary.get('total_changes') or 0)} changes"
-        )
-    return _clip(line, FALLBACK_CHARS)
+    return _clip(f"{scan_type} scan {verb} for {title}", FALLBACK_CHARS)
 
 
-def report_header_lines(event: dict, esc=plain_escape) -> list[str]:
-    """Headline, status, timing, error and counts: the top of the message body
-    and of the report file alike."""
+def summary_lines(event: dict, esc=plain_escape) -> list[str]:
+    """The summary message, one list item per line, `esc` applied to every
+    interpolated value. Only counts and the fixed labels are unescaped."""
     job = event.get("job") or {}
     summary = event.get("summary") or {}
     status = str(job.get("status") or "unknown")
 
-    lines = [headline(event, esc)]
-    lines.append(
-        f"Status: {esc(status)} | Duration: {_duration(job.get('duration_s'))}"
-    )
-    finished = job.get("finished_at")
-    if finished:
-        lines.append(f"Finished: {esc(finished)}")
-
+    lines = [
+        headline(event, esc),
+        f"Status: {esc(status)}",
+        f"Duration: {_duration(job.get('duration_s'))}",
+    ]
     error = job.get("error_msg")
-    if error:
+    if error and status not in _SUCCESS_STATUSES:
         lines.append(f"Error: {_clip(esc(error), ERROR_CHARS)}")
-
-    lines.append(
-        f"New assets: {int(summary.get('new_assets') or 0)} | "
-        f"Changed assets: {int(summary.get('changed_assets') or 0)} | "
-        f"Total changes: {int(summary.get('total_changes') or 0)}"
-    )
+    lines += [
+        "",
+        f"New assets: {int(summary.get('new_assets') or 0)}",
+        f"Changed assets: {int(summary.get('changed_assets') or 0)}",
+    ]
     return lines
 
 
-def build_body(event: dict, esc=plain_escape, limit: int = TELEGRAM_BODY_CHARS,
-               report_follows: bool = False) -> str:
-    """The shared message body, with `esc` applied to every interpolated value.
-
-    Only counts and the fixed labels are unescaped; every string that originated
-    in scan data passes through `esc` at the point it is inserted.
-    """
-    summary = event.get("summary") or {}
-    lines = report_header_lines(event, esc)
-
-    by_field = summary.get("changes_by_field") or {}
-    if by_field:
-        parts = [f"{esc(field)} {int(count)}" for field, count in by_field.items()]
-        lines.append("By field: " + ", ".join(parts))
-
-    new_sample = summary.get("new_asset_sample") or []
-    if new_sample:
-        lines.append("New: " + ", ".join(esc(a) for a in new_sample))
-
-    change_sample = summary.get("change_sample") or []
-    if change_sample:
-        lines.append("Sample changes:")
-        for item in change_sample:
-            asset = esc((item or {}).get("asset"))
-            field = esc((item or {}).get("field"))
-            old = _clip(esc((item or {}).get("old") or "-"), VALUE_CHARS)
-            new = _clip(esc((item or {}).get("new") or "-"), VALUE_CHARS)
-            lines.append(f"  {asset} {field}: {old} -> {new}")
-
-    if summary.get("sample_truncated"):
-        lines.append("(sample truncated — full report follows)" if report_follows else "(sample truncated)")
-
-    return _clip("\n".join(lines), limit)
+def build_body(event: dict, esc=plain_escape, limit: int = TELEGRAM_BODY_CHARS) -> str:
+    return _clip("\n".join(summary_lines(event, esc)), limit)
 
 
-def build_slack_payload(event: dict, report_follows: bool = False) -> dict:
-    body = build_body(event, slack_escape, SLACK_BODY_CHARS, report_follows)
+def build_slack_payload(event: dict) -> dict:
+    body = build_body(event, slack_escape, SLACK_BODY_CHARS)
     return {
         "text": headline(event, slack_escape),
         "blocks": [
@@ -245,7 +198,7 @@ def build_slack_payload(event: dict, report_follows: bool = False) -> dict:
     }
 
 
-def build_discord_payload(event: dict, report_follows: bool = False) -> dict:
+def build_discord_payload(event: dict) -> dict:
     job = event.get("job") or {}
     status = str(job.get("status") or "")
     stamp = job.get("finished_at") or event.get("generated_at") or datetime.now(timezone.utc).isoformat()
@@ -253,8 +206,9 @@ def build_discord_payload(event: dict, report_follows: bool = False) -> dict:
         "username": "Nous",
         "embeds": [
             {
+                # The headline is the title, so the description starts below it.
                 "title": _clip(headline(event, discord_escape), 256),
-                "description": build_body(event, discord_escape, DISCORD_BODY_CHARS, report_follows),
+                "description": _clip("\n".join(summary_lines(event, discord_escape)[1:]), DISCORD_BODY_CHARS),
                 "color": DISCORD_COLOR_SUCCESS if status in _SUCCESS_STATUSES else DISCORD_COLOR_FAILURE,
                 "timestamp": stamp,
             }
@@ -266,22 +220,20 @@ def build_discord_payload(event: dict, report_follows: bool = False) -> dict:
     }
 
 
-def build_telegram_payload(event: dict, chat_id: str, report_follows: bool = False) -> dict:
+def build_telegram_payload(event: dict, chat_id: str) -> dict:
     # parse_mode is deliberately omitted. With Markdown or HTML, an asset title
     # carrying an unbalanced * or < either makes the API reject the message with
     # a 400 ("can't parse entities") or lets scan data restyle the message.
     # Plain text has neither failure mode.
     return {
         "chat_id": chat_id,
-        "text": build_body(event, plain_escape, TELEGRAM_BODY_CHARS, report_follows),
+        "text": build_body(event, plain_escape, TELEGRAM_BODY_CHARS),
         "disable_web_page_preview": True,
     }
 
 
 # The full report. Discord and Telegram receive it as a file, Slack as capped
-# follow-up messages, the generic webhook as lists in its JSON body. Every item
-# line passes through plain_escape, so one item is always exactly one line
-# starting with two spaces: slack_followups counts items by that.
+# follow-up messages, the generic webhook as lists in its JSON body.
 
 
 def report_filename(job_id) -> str:
@@ -289,14 +241,24 @@ def report_filename(job_id) -> str:
     return f"nous-scan-report-{raw if _REPORT_ID_RE.match(raw) else 'report'}.txt"
 
 
+def _issue_date(event: dict) -> str:
+    """When the scan finished, else when the event was built, else now, in UTC."""
+    job = event.get("job") or {}
+    for raw in (job.get("finished_at"), event.get("generated_at")):
+        try:
+            stamp = datetime.fromisoformat(raw)
+            stamp = stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        return stamp.strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
 def _report_line(row) -> str:
     if row[0] == "new":
-        return f"  {plain_escape(row[1])}\n"
-    _, asset, field, old, new = row
-    return (
-        f"  {plain_escape(asset)} {plain_escape(field)}: "
-        f"{plain_escape(old or '-')} -> {plain_escape(new or '-')}\n"
-    )
+        return f"{plain_escape(row[1])}\n"
+    _, asset, _field, old, new = row
+    return f"{plain_escape(asset)}: {plain_escape(old or '-')} -> {plain_escape(new or '-')}\n"
 
 
 def _list_item(row):
@@ -310,20 +272,34 @@ def write_report(fh, event: dict, rows, total_items: int, *, want_lists: bool = 
                  want_file: bool = True, stop=None, max_bytes: int = REPORT_MAX_BYTES) -> dict:
     """Stream `rows` into the binary file `fh` and describe what was written.
 
-    Rows are ("new", asset) or ("change", asset, field, old, new), new assets
-    first. Writing stops once the next line would cross the byte ceiling, and no
+    Rows are ("new", asset) first, then per field a ("field", field, assets)
+    marker and that field's ("change", asset, field, old, new) rows. A marker
+    only arms its heading, which is written together with the section's first
+    item, so an empty section never appears and the byte check covers both.
+    Writing stops once the next chunk would cross the byte ceiling, and no
     further row is read. With `want_lists`, the raw items also collect into the
     webhook lists within WEBHOOK_LISTS_BYTES; they are left unescaped there
     because JSON encoding is what carries them safely. Without `want_file` the
     lists are the only consumer, so reading stops as soon as they are full.
     """
-    header = ("\n".join(report_header_lines(event)) + "\n").encode("utf-8")
-    fh.write(header)
-    size = body_offset = len(header)
+    job = event.get("job") or {}
+    summary = event.get("summary") or {}
+    title = f"{plain_escape(job.get('scan_type') or 'scan')} scan for {plain_escape(job.get('project_title') or 'unknown project')}"
+    header = f"{_clip(title, FALLBACK_CHARS)}\nIssue date: {_issue_date(event)}\n".encode("utf-8")
+    opening = f"\nTotal changes: {int(summary.get('total_changes') or 0)}\n".encode("utf-8")
+    fh.write(header + opening)
+    body_offset = len(header)
+    size = body_offset + len(opening)
+    # Body line numbers, counted from the first line after the header.
+    labels = {1}
+    body_lines = 2
+
     budget = max_bytes - REPORT_TRAILER_RESERVE
     written = 0
     truncated = False
-    section = None
+    # A leading field marker overwrites this, so an empty new-assets section
+    # never prints.
+    pending = f"{int(summary.get('new_assets') or 0)} new assets:"
     new_all: list = []
     changes_all: list = []
     list_bytes = 0
@@ -332,15 +308,24 @@ def write_report(fh, event: dict, rows, total_items: int, *, want_lists: bool = 
     for row in rows:
         if stop is not None and stop.is_set():
             break
-        heading = "" if row[0] == section else ("\nNew assets:\n" if row[0] == "new" else "\nChanges:\n")
-        chunk = (heading + _report_line(row)).encode("utf-8")
+        if row[0] == "field":
+            pending = f"{int(row[2])} {plain_escape(row[1]).replace('_', ' ')} changes:"
+            continue
+        text = _report_line(row)
+        if pending is not None:
+            text = f"\n{pending}\n{text}"
+        chunk = text.encode("utf-8")
         if size + len(chunk) > budget:
             truncated = True
             break
         fh.write(chunk)
         size += len(chunk)
+        if pending is not None:
+            labels.add(body_lines + 1)
+            body_lines += 2
+            pending = None
+        body_lines += 1
         written += 1
-        section = row[0]
         if not lists_full:
             item = _list_item(row)
             # Two bytes for the ", " that separates list items once serialised.
@@ -370,6 +355,8 @@ def write_report(fh, event: dict, rows, total_items: int, *, want_lists: bool = 
         }
     return {
         "body_offset": body_offset,
+        "body_lines": body_lines,
+        "labels": frozenset(labels),
         "size": size,
         "written": written,
         "omitted": omitted,
@@ -378,9 +365,12 @@ def write_report(fh, event: dict, rows, total_items: int, *, want_lists: bool = 
     }
 
 
-def slack_followups(lines, total_items: int, *, max_messages: int = SLACK_MAX_MESSAGES - 1) -> list[str]:
-    """Pack report lines into at most `max_messages` Slack messages.
+def slack_followups(lines, total_items: int, labels, body_lines: int, *,
+                    max_messages: int = SLACK_MAX_MESSAGES - 1) -> list[str]:
+    """Pack report body lines into at most `max_messages` Slack messages.
 
+    `labels` holds the indexes of the lines that are headings rather than items;
+    reading stops at index `body_lines`, before any size-limit trailer.
     Stops reading `lines` once the last message is full, so at most
     max_messages * SLACK_BODY_CHARS characters are ever held. The last message
     keeps room for a line counting the items that did not fit.
@@ -389,7 +379,9 @@ def slack_followups(lines, total_items: int, *, max_messages: int = SLACK_MAX_ME
     current: list[str] = []
     size = 0
     included = 0
-    for raw in lines:
+    for index, raw in enumerate(lines):
+        if index >= body_lines:
+            break
         line = slack_escape(_clip(raw.rstrip("\n"), SLACK_LINE_CHARS))
         if not line.strip():
             continue
@@ -402,7 +394,7 @@ def slack_followups(lines, total_items: int, *, max_messages: int = SLACK_MAX_ME
             current, size, cost = [], 0, len(line)
         current.append(line)
         size += cost
-        if raw.startswith("  "):
+        if index not in labels:
             included += 1
     if current:
         chunks.append("\n".join(current))
@@ -425,15 +417,4 @@ def slack_omitted_note(omitted: int) -> str:
     return f"… {omitted} more items not shown (Slack webhooks cannot carry attachments)"
 
 
-def build_discord_report_payload(event: dict) -> dict:
-    return {
-        "username": "Nous",
-        "content": _clip("Full report: " + headline(event, discord_escape), 2000),
-        # Same reason as on the summary embed: the headline carries scan data.
-        "allowed_mentions": {"parse": []},
-    }
-
-
-def build_telegram_report_fields(event: dict, chat_id: str) -> dict:
-    # No parse_mode, for the same reason as build_telegram_payload.
-    return {"chat_id": chat_id, "caption": _clip(headline(event), TELEGRAM_CAPTION_CHARS)}
+DISCORD_REPORT_PAYLOAD = {"username": "Nous", "allowed_mentions": {"parse": []}}

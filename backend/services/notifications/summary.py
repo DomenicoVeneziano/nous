@@ -1,18 +1,15 @@
 # backend/services/notifications/summary.py
-"""Bounded change summary for a finished scan job, and the canonical event dict.
+"""Change counts for a finished scan job, the canonical event dict, and the
+rows of the full report.
 
-Every notification reads a fixed, small number of rows regardless of how many
-assets a project holds: five aggregate/sample queries whose combined result set
-is capped at 48 rows — 1 (totals) + MAX_FIELD_ROWS (top fields) + 1 (new asset
-count) + two samples of at most 20 each, the widest NOTIFY_SAMPLE_SIZE the
-bounds allow. Nothing here loads a table, and nothing here scales with asset
-volume.
+The summary reads two aggregate rows whatever the size of the project: the
+change totals and the new-asset count. Nothing here loads a table.
 
 The full report (iter_report_rows) is the one read not fixed in rows: it pages
 through a scan's rows by rowid, and render.write_report bounds it in bytes.
 
-The queries are SQLAlchemy Core text() with bound parameters only — no value,
-including the sample size, is ever interpolated into the SQL string.
+The queries are SQLAlchemy Core text() with bound parameters only — no value is
+ever interpolated into the SQL string.
 """
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -27,14 +24,6 @@ from services.settings_store import NOTIFY_BOUNDS
 SUCCESS_STATUSES = ("done",)
 FAILURE_STATUSES = ("failed", "timed_out", "cancelled")
 
-# How many per-field counts a summary keeps; see the module docstring for the
-# row ceiling this contributes to.
-MAX_FIELD_ROWS = 6
-
-# Longest single value carried in a change sample. Bound into the sample query
-# as :vchars and applied by SQLite, never here — see _SQL_CHANGE_SAMPLE.
-VALUE_CHARS = 80
-
 # Longest error message echoed into an event.
 MAX_ERROR_CHARS = 500
 
@@ -47,43 +36,17 @@ REPORT_PAGE_ROWS = 500
 REPORT_VALUE_CHARS = 1000
 REPORT_ASSET_CHARS = 300
 REPORT_FIELD_CHARS = 64
+# ponytail: sections beyond this many fields are dropped without a word; count
+# and report the omitted fields if a scan type ever tracks more than a handful.
+REPORT_MAX_FIELDS = 32
 
 _SQL_TOTALS = text(
     "SELECT COUNT(*) AS total_changes, COUNT(DISTINCT asset_id) AS changed_assets "
     "FROM asset_changes WHERE project_id = :pid AND scan_id = :sid"
 )
 
-_SQL_BY_FIELD = text(
-    "SELECT field, COUNT(*) AS n FROM asset_changes "
-    "WHERE project_id = :pid AND scan_id = :sid GROUP BY field ORDER BY n DESC"
-)
-
 _SQL_NEW_ASSETS = text(
     "SELECT COUNT(*) FROM assets WHERE project_id = :pid AND first_seen_scan_id = :sid"
-)
-
-# Two deliberate properties of the sample queries, neither of which is a bug:
-#
-# 1. No ORDER BY. ix_asset_changes_project_scan covers (project_id, scan_id) but
-#    not changed_at, so ordering by time would force SQLite to materialise and
-#    sort every change row belonging to the scan before it could apply the LIMIT
-#    — precisely the unbounded load the guardrails forbid. Unordered, SQLite
-#    walks the index and stops after :n hits. What is wanted here is "a few
-#    examples", not "the latest few"; the truncation flag says the rest exist.
-#
-# 2. substr(..., 1, :vchars) runs in SQL rather than in Python, with VALUE_CHARS
-#    bound in so the constant and the truncation cannot drift. The technologies
-#    and dns_records deltas are JSON arrays that can run to kilobytes per row;
-#    truncating after the fetch would still pull the whole payload into the
-#    backend's memory before discarding it.
-_SQL_CHANGE_SAMPLE = text(
-    "SELECT a.asset, c.field, substr(c.old_value, 1, :vchars), substr(c.new_value, 1, :vchars) "
-    "FROM asset_changes c JOIN assets a ON a.id = c.asset_id "
-    "WHERE c.project_id = :pid AND c.scan_id = :sid LIMIT :n"
-)
-
-_SQL_NEW_ASSET_SAMPLE = text(
-    "SELECT asset FROM assets WHERE project_id = :pid AND first_seen_scan_id = :sid LIMIT :n"
 )
 
 _SQL_PROJECT_TITLE = text("SELECT title FROM projects WHERE id = :pid")
@@ -94,13 +57,26 @@ _SQL_REPORT_NEW = text(
     "ORDER BY rowid LIMIT :page"
 )
 
-# LEFT JOIN, unlike the sample: a change whose asset was deleted since is still
-# a change, and _SQL_TOTALS, which the report's item count comes from, counts it.
-_SQL_REPORT_CHANGES = text(
-    "SELECT c.rowid, substr(a.asset, 1, :achars), substr(c.field, 1, :fchars), "
+# One section per field, busiest first by the number of assets it touched.
+_SQL_REPORT_FIELDS = text(
+    "SELECT field, COUNT(DISTINCT asset_id) AS assets FROM asset_changes "
+    "WHERE project_id = :pid AND scan_id = :sid "
+    "GROUP BY field ORDER BY assets DESC, field LIMIT :nfields"
+)
+
+# ponytail: each field's pass walks every change row of the scan on
+# ix_asset_changes_project_scan and filters by field, so a report costs
+# fields x scan rows; replace that index with (project_id, scan_id, field) if
+# scans grow large enough for it to show.
+#
+# LEFT JOIN: a change whose asset was deleted since is still a change, and
+# _SQL_TOTALS, which the report's item count comes from, counts it. "IS" rather
+# than "=" so a NULL field still matches its own rows.
+_SQL_REPORT_FIELD_CHANGES = text(
+    "SELECT c.rowid, substr(a.asset, 1, :achars), "
     "substr(c.old_value, 1, :vchars), substr(c.new_value, 1, :vchars) "
     "FROM asset_changes c LEFT JOIN assets a ON a.id = c.asset_id "
-    "WHERE c.project_id = :pid AND c.scan_id = :sid AND c.rowid > :after "
+    "WHERE c.project_id = :pid AND c.scan_id = :sid AND c.field IS :field AND c.rowid > :after "
     "ORDER BY c.rowid LIMIT :page"
 )
 
@@ -109,10 +85,10 @@ def clamped(key: str) -> int:
     """A bounded NOTIFY_* integer forced back inside its declared bounds.
 
     Re-clamped at use time, not just at save time, so a row edited straight in
-    the database can never widen how many rows a notification reads, how long a
-    send may hang, or how many times it retries. sender.py imports this for its
-    timeout and retry bounds rather than keeping a second copy; summary.py is
-    the lower module of the two, so the import direction cannot cycle.
+    the database can never widen how long a send may hang or how many times it
+    retries. sender.py imports this for its timeout and retry bounds rather than
+    keeping a second copy; summary.py is the lower module of the two, so the
+    import direction cannot cycle.
     """
     low, high = NOTIFY_BOUNDS[key]
     try:
@@ -155,55 +131,20 @@ def is_failure(status: str | None) -> bool:
 
 
 def collect_summary(project_id: str, scan_id: str) -> dict:
-    """Read the bounded change summary for one scan job.
+    """Read the change counts for one scan job.
 
     Opens its own short-lived session and closes it in a finally, so a caller
     running outside a request (the notifier, the scheduler) never holds a
     connection across an await.
     """
-    n = clamped("NOTIFY_SAMPLE_SIZE")
     db = SessionLocal()
     try:
         params = {"pid": project_id, "sid": scan_id}
-
         row = db.execute(_SQL_TOTALS, params).first()
-        total_changes = int(row[0] or 0) if row else 0
-        changed_assets = int(row[1] or 0) if row else 0
-
-        # ORDER BY n DESC above means the bounded fetch keeps the busiest
-        # fields; the tail is noise in a summary and is dropped rather than
-        # streamed into memory.
-        field_rows = db.execute(_SQL_BY_FIELD, params).fetchmany(MAX_FIELD_ROWS)
-        changes_by_field = {str(r[0]): int(r[1] or 0) for r in field_rows}
-
-        new_assets = int(db.execute(_SQL_NEW_ASSETS, params).scalar() or 0)
-
-        change_sample: list[dict] = []
-        new_asset_sample: list[str] = []
-        if n > 0:
-            # :n is a bound integer parameter, never string-formatted into SQL.
-            sample_params = {"pid": project_id, "sid": scan_id, "n": n}
-            change_params = dict(sample_params, vchars=VALUE_CHARS)
-            for r in db.execute(_SQL_CHANGE_SAMPLE, change_params).fetchmany(n):
-                change_sample.append({
-                    "asset": _text(r[0]) or "",
-                    "field": _text(r[1]) or "",
-                    "old": _text(r[2]),
-                    "new": _text(r[3]),
-                })
-            for r in db.execute(_SQL_NEW_ASSET_SAMPLE, sample_params).fetchmany(n):
-                new_asset_sample.append(_text(r[0]) or "")
-
         return {
-            "new_assets": new_assets,
-            "changed_assets": changed_assets,
-            "total_changes": total_changes,
-            "changes_by_field": changes_by_field,
-            "new_asset_sample": new_asset_sample,
-            "change_sample": change_sample,
-            # Either sample can be the truncated one: a recon run that finds
-            # 200 new assets and changes no field still lists only n of them.
-            "sample_truncated": total_changes > n or new_assets > n,
+            "new_assets": int(db.execute(_SQL_NEW_ASSETS, params).scalar() or 0),
+            "changed_assets": int(row[1] or 0) if row else 0,
+            "total_changes": int(row[0] or 0) if row else 0,
         }
     finally:
         db.close()
@@ -216,38 +157,58 @@ def _report_value(value) -> str | None:
     return out if len(out) <= REPORT_VALUE_CHARS else out[:REPORT_VALUE_CHARS] + "…"
 
 
-def iter_report_rows(db, project_id: str, scan_id: str, stop) -> Iterator[tuple]:
-    """Yield every new asset, then every change, of one scan, a page at a time.
+def _pages(db, sql, params: dict, shape, stop) -> Iterator[tuple]:
+    """Yield shaped rows of one keyset query, a page at a time.
 
     Each page is its own read transaction, ended by the rollback: the database
     runs in WAL mode, and one snapshot held open across a long report would keep
     the WAL from checkpointing. `stop`, a threading.Event, is checked before
     every page so a cancelled send stops reading.
     """
+    after = -(2 ** 63)
+    while not stop.is_set():
+        rows = db.execute(sql, dict(params, after=after)).fetchall()
+        db.rollback()
+        yield from (shape(r) for r in rows)
+        if len(rows) < REPORT_PAGE_ROWS:
+            return
+        after = rows[-1][0]
+
+
+def iter_report_rows(db, project_id: str, scan_id: str, stop) -> Iterator[tuple]:
+    """Yield every new asset of one scan, then its changes field by field.
+
+    Rows are ("new", asset), then for each field a ("field", field, assets)
+    marker followed by that field's ("change", asset, field, old, new) rows.
+    """
     base = {"pid": project_id, "sid": scan_id, "page": REPORT_PAGE_ROWS, "achars": REPORT_ASSET_CHARS}
-    passes = (
-        (_SQL_REPORT_NEW, base, lambda r: ("new", r[1] or "")),
-        (
-            _SQL_REPORT_CHANGES,
-            dict(base, fchars=REPORT_FIELD_CHARS, vchars=REPORT_VALUE_CHARS + 1),
-            lambda r: (
+    yield from _pages(db, _SQL_REPORT_NEW, base, lambda r: ("new", r[1] or ""), stop)
+    if stop.is_set():
+        return
+
+    fields = db.execute(
+        _SQL_REPORT_FIELDS, {"pid": project_id, "sid": scan_id, "nfields": REPORT_MAX_FIELDS}
+    ).fetchall()
+    db.rollback()
+    params = dict(base, vchars=REPORT_VALUE_CHARS + 1)
+    for field, assets in fields:
+        if stop.is_set():
+            return
+        name = ("" if field is None else str(field))[:REPORT_FIELD_CHARS]
+        yield ("field", name, int(assets or 0))
+        yield from _pages(
+            db,
+            _SQL_REPORT_FIELD_CHANGES,
+            dict(params, field=field),
+            lambda r, name=name: (
                 "change",
                 "(deleted asset)" if r[1] is None else r[1],
-                r[2] or "",
+                name,
+                _report_value(r[2]),
                 _report_value(r[3]),
-                _report_value(r[4]),
             ),
-        ),
-    )
-    for sql, params, shape in passes:
-        after = -(2 ** 63)
-        while not stop.is_set():
-            rows = db.execute(sql, dict(params, after=after)).fetchall()
-            db.rollback()
-            yield from (shape(r) for r in rows)
-            if len(rows) < REPORT_PAGE_ROWS:
-                break
-            after = rows[-1][0]
+            stop,
+        )
 
 
 def project_title(project_id: str) -> str:
@@ -261,15 +222,7 @@ def project_title(project_id: str) -> str:
 
 def empty_summary() -> dict:
     """The summary shape with every count at zero (used by the test send)."""
-    return {
-        "new_assets": 0,
-        "changed_assets": 0,
-        "total_changes": 0,
-        "changes_by_field": {},
-        "new_asset_sample": [],
-        "change_sample": [],
-        "sample_truncated": False,
-    }
+    return {"new_assets": 0, "changed_assets": 0, "total_changes": 0}
 
 
 def build_event(job, title: str | None = None) -> dict:

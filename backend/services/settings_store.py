@@ -41,7 +41,6 @@ NOTIFY_FIELDS: dict[str, type] = {
     "NOTIFY_TELEGRAM_ENABLED": bool,
     "NOTIFY_TELEGRAM_BOT_TOKEN": str,
     "NOTIFY_TELEGRAM_CHAT_ID": str,
-    "NOTIFY_SAMPLE_SIZE": int,
     "NOTIFY_TIMEOUT_SECONDS": int,
     "NOTIFY_RETRIES": int,
 }
@@ -67,7 +66,6 @@ NOTIFY_SECRET_API_FIELDS = tuple(
 # Inclusive (min, max) bounds re-applied on every save AND every load, so a row
 # edited directly in the DB can never widen a queue, timeout or retry budget.
 NOTIFY_BOUNDS: dict[str, tuple[int, int]] = {
-    "NOTIFY_SAMPLE_SIZE": (0, 20),
     "NOTIFY_TIMEOUT_SECONDS": (1, 30),
     "NOTIFY_RETRIES": (0, 5),
 }
@@ -252,7 +250,6 @@ def get_notification_settings() -> dict:
         "telegram_enabled": cfg.NOTIFY_TELEGRAM_ENABLED,
         "telegram_bot_token_set": bool(cfg.NOTIFY_TELEGRAM_BOT_TOKEN),
         "telegram_chat_id": cfg.NOTIFY_TELEGRAM_CHAT_ID,
-        "sample_size": cfg.NOTIFY_SAMPLE_SIZE,
         "timeout_seconds": cfg.NOTIFY_TIMEOUT_SECONDS,
         "retries": cfg.NOTIFY_RETRIES,
     }

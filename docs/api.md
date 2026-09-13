@@ -725,16 +725,44 @@ matching `<field>_set` boolean indicating whether a value is stored.
   "telegram_enabled": false,
   "telegram_bot_token_set": false,
   "telegram_chat_id": "",
-  "sample_size": 5,
   "timeout_seconds": 10,
   "retries": 2
 }
 ```
-Every field is a boolean except `telegram_chat_id` (string) and `sample_size` /
+Every field is a boolean except `telegram_chat_id` (string) and
 `timeout_seconds` / `retries` (integers).
 
-A notification fires once per finished scan job and carries a summary of what
-that scan changed. Delivery is at-most-once: the job is marked handled before
+A notification fires once per finished scan job. Slack, Discord and Telegram
+receive a short summary (status, duration, the error on a failure, and the new
+and changed asset counts) followed by the full report: every new asset and
+every change, grouped by field. Discord and Telegram get the report as a `.txt`
+attachment of up to 8 MiB. Slack incoming webhooks cannot carry attachments, so
+Slack gets up to nine follow-up messages, the last of which counts what did not
+fit. Change values are cut at 1,000 characters.
+
+The generic webhook receives one JSON body. `job` carries `id`, `scan_type`,
+`status`, `project_id`, `project_title`, `started_at`, `finished_at`,
+`duration_s` and `error_msg`:
+```json
+{
+  "event": "scan_job_finished",
+  "job": { "id": "…", "status": "done" },
+  "summary": {
+    "new_assets": 1,
+    "changed_assets": 1,
+    "total_changes": 1,
+    "new_assets_all": ["a.example.com"],
+    "changes_all": [{ "asset": "b.example.com", "field": "status_code", "old": "404", "new": "200" }],
+    "lists_truncated": false,
+    "lists_omitted": 0
+  },
+  "generated_at": "2026-09-13T08:05:09+00:00"
+}
+```
+`new_assets_all` and `changes_all` stop at 2 MiB of JSON; `lists_truncated` and
+`lists_omitted` say how many items were left out.
+
+Delivery is at-most-once: the job is marked handled before
 the send is attempted, so a failed delivery is logged and never retried on a
 later tick.
 
@@ -744,7 +772,7 @@ later tick.
 `ADMIN` · Update notification configuration (all fields optional; any subset may
 be sent). Persisted to the DB and applied to subsequently finished scan jobs.
 
-**Body** `{ "enabled", "on_success", "on_failure", "slack_enabled", "slack_webhook_url", "discord_enabled", "discord_webhook_url", "webhook_enabled", "webhook_url", "webhook_token", "telegram_enabled", "telegram_bot_token", "telegram_chat_id", "sample_size", "timeout_seconds", "retries", "clear_secrets" }`
+**Body** `{ "enabled", "on_success", "on_failure", "slack_enabled", "slack_webhook_url", "discord_enabled", "discord_webhook_url", "webhook_enabled", "webhook_url", "webhook_token", "telegram_enabled", "telegram_bot_token", "telegram_chat_id", "timeout_seconds", "retries", "clear_secrets" }`
 **Response** `200` notification config (same shape as GET)
 **Errors:** `422` invalid field type, or a malformed webhook URL,
 `telegram_bot_token` or `telegram_chat_id` · `400` a channel is switched on
@@ -776,7 +804,6 @@ rather than saved as an enabled channel with no chat id.
 or `https` scheme. `telegram_bot_token` must match `<digits>:<secret>` and
 `telegram_chat_id` must be a numeric id or an `@username`. Numeric fields are
 clamped to their supported ranges:
-`sample_size` `0`–`20` (sample of changed assets listed in a message),
 `timeout_seconds` `1`–`30` (per-delivery HTTP timeout), `retries` `0`–`5`
 (attempts within a single delivery).
 

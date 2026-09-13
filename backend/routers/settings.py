@@ -117,7 +117,6 @@ class NotificationConfigUpdate(BaseModel):
     telegram_chat_id: Any = None
     # Bounds mirror settings_store.NOTIFY_BOUNDS, which re-applies them on every
     # save and every load.
-    sample_size: int | None = Field(default=None, ge=0, le=20)
     timeout_seconds: int | None = Field(default=None, ge=1, le=30)
     retries: int | None = Field(default=None, ge=0, le=5)
     clear_secrets: list[str] | None = None

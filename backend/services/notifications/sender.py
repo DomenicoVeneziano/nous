@@ -32,7 +32,7 @@ from database import SessionLocal
 from services.settings_store import validate_webhook_url
 
 from . import render
-from .summary import clamped, empty_summary, is_failure, is_success, iter_report_rows
+from .summary import clamped, is_failure, is_success, iter_report_rows
 
 log = logging.getLogger("backend.notifications")
 
@@ -180,7 +180,7 @@ def _channel_enabled(channel: str) -> bool:
     return bool(getattr(cfg, f"NOTIFY_{channel.upper()}_ENABLED", False))
 
 
-def _build_target(channel: str, event: dict, report_follows: bool = False) -> tuple[str, dict, dict] | None:
+def _build_target(channel: str, event: dict) -> tuple[str, dict, dict] | None:
     """Return (url, headers, json_body) for a channel, or None if it cannot send."""
     headers = {"Content-Type": "application/json", "User-Agent": _USER_AGENT}
 
@@ -188,13 +188,13 @@ def _build_target(channel: str, event: dict, report_follows: bool = False) -> tu
         url = _safe_url("NOTIFY_SLACK_WEBHOOK_URL")
         if not url:
             return None
-        return url, headers, render.build_slack_payload(event, report_follows)
+        return url, headers, render.build_slack_payload(event)
 
     if channel == "discord":
         url = _safe_url("NOTIFY_DISCORD_WEBHOOK_URL")
         if not url:
             return None
-        return url, headers, render.build_discord_payload(event, report_follows)
+        return url, headers, render.build_discord_payload(event)
 
     if channel == "webhook":
         url = _safe_url("NOTIFY_WEBHOOK_URL")
@@ -213,7 +213,7 @@ def _build_target(channel: str, event: dict, report_follows: bool = False) -> tu
         if not TELEGRAM_TOKEN_RE.match(token) or not _TELEGRAM_CHAT_ID_RE.match(chat_id):
             return None
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        return url, headers, render.build_telegram_payload(event, chat_id, report_follows)
+        return url, headers, render.build_telegram_payload(event, chat_id)
 
     return None
 
@@ -396,10 +396,7 @@ async def _send_channel(client: httpx.AsyncClient, channel: str, event: dict, re
     failure. A channel counts as delivered only when every part was, and the
     detail names the part that was not.
     """
-    if channel == "webhook":
-        target = _build_target(channel, _with_lists(event, report))
-    else:
-        target = _build_target(channel, event, report_follows=report is not None)
+    target = _build_target(channel, _with_lists(event, report) if channel == "webhook" else event)
     if target is None:
         return None
     url, headers, body = target
@@ -418,7 +415,8 @@ async def _send_channel(client: httpx.AsyncClient, channel: str, event: dict, re
 
     if channel == "slack":
         fh.seek(meta["body_offset"])
-        chunks = render.slack_followups((raw.decode("utf-8", "replace") for raw in fh), _item_total(event))
+        lines = (raw.decode("utf-8", "replace") for raw in fh)
+        chunks = render.slack_followups(lines, _item_total(event), meta["labels"], meta["body_lines"])
         deadline = time.monotonic() + REPORT_PARTS_BUDGET_SECONDS
         # Longest one attempt can take; a retry is only allowed while the time
         # left still holds this attempt, the backoff and the retry itself.
@@ -436,12 +434,12 @@ async def _send_channel(client: httpx.AsyncClient, channel: str, event: dict, re
 
     name = render.report_filename((event.get("job") or {}).get("id"))
     if channel == "discord":
-        data = {"payload_json": json.dumps(render.build_discord_report_payload(event))}
+        data = {"payload_json": json.dumps(render.DISCORD_REPORT_PAYLOAD)}
         files = {"files[0]": (name, fh, "text/plain")}
     else:
         # Telegram. _build_target has already checked the token this URL carries.
         url = url.rsplit("/", 1)[0] + "/sendDocument"
-        data = render.build_telegram_report_fields(event, body["chat_id"])
+        data = {"chat_id": body["chat_id"]}
         files = {"document": (name, fh, "text/plain")}
     # No JSON Content-Type on a multipart request: httpx sets its own, with the
     # boundary in it.
@@ -516,31 +514,6 @@ def _synthetic_event() -> dict:
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
-    summary = empty_summary()
-    summary.update({
-        "new_assets": 3,
-        "changed_assets": 2,
-        "total_changes": 3,
-        "changes_by_field": {"technologies": 1, "status_code": 1, "title": 1},
-        # The third asset and the title change are hostile on purpose: a line
-        # separator, a bidi override and a CRLF must each stay on the one line
-        # they arrived in, in the message and in the report file.
-        "new_asset_sample": [
-            "test-a.example.com",
-            "test-b.example.com",
-            "test-c.example.com\N{LINE SEPARATOR}New: internal-admin.corp",
-        ],
-        "change_sample": [
-            {"asset": "test-a.example.com", "field": "status_code", "old": "404", "new": "200"},
-            {"asset": "test-a.example.com", "field": "technologies", "old": "[]", "new": '["nginx"]'},
-            {
-                "asset": "test-b.example.com",
-                "field": "title",
-                "old": "Login",
-                "new": "\N{RIGHT-TO-LEFT OVERRIDE}evil\N{CARRIAGE RETURN}\N{LINE FEED}New: forged.corp",
-            },
-        ],
-    })
     return {
         "event": "scan_job_finished",
         "job": {
@@ -554,9 +527,34 @@ def _synthetic_event() -> dict:
             "duration_s": 12.3,
             "error_msg": None,
         },
-        "summary": summary,
+        "summary": {"new_assets": 3, "changed_assets": 2, "total_changes": 5},
         "generated_at": now,
     }
+
+
+def _synthetic_rows() -> list[tuple]:
+    """The report rows matching _synthetic_event's counts.
+
+    The third asset and the title change are hostile on purpose: a line
+    separator, a bidi override and a CRLF must each stay on the one line they
+    arrived in.
+    """
+    return [
+        ("new", "test-a.example.com"),
+        ("new", "test-b.example.com"),
+        ("new", "test-c.example.com\N{LINE SEPARATOR}New: internal-admin.corp"),
+        ("field", "status_code", 2),
+        ("change", "test-a.example.com", "status_code", "404", "200"),
+        ("change", "test-b.example.com", "status_code", "200", "403"),
+        ("field", "technologies", 1),
+        ("change", "test-a.example.com", "technologies", "[]", '["nginx"]'),
+        ("change", "test-a.example.com", "technologies", '["nginx"]', '["nginx", "php"]'),
+        ("field", "title", 1),
+        (
+            "change", "test-b.example.com", "title", "Login",
+            "\N{RIGHT-TO-LEFT OVERRIDE}evil\N{CARRIAGE RETURN}\N{LINE FEED}New: forged.corp",
+        ),
+    ]
 
 
 async def send_test(channel: str) -> tuple[bool, str]:
@@ -569,10 +567,7 @@ async def send_test(channel: str) -> tuple[bool, str]:
         return False, "Unknown channel"
 
     event = _synthetic_event()
-    summary = event["summary"]
-    rows = [("new", asset) for asset in summary["new_asset_sample"]] + [
-        ("change", c["asset"], c["field"], c["old"], c["new"]) for c in summary["change_sample"]
-    ]
+    rows = _synthetic_rows()
     try:
         # A test send is a one-off, so it owns a short-lived client of its own
         # rather than borrowing the notification path's shared one. It sets no
