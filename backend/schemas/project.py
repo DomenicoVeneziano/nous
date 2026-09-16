@@ -1,7 +1,7 @@
 # backend/schemas/project.py
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AfterValidator, BaseModel, Field, model_validator
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 
 # A scope entry can be a CIDR, and each expands into one asset per address, so
@@ -31,6 +31,15 @@ def _canonical_phases(phases: list[str] | None) -> list[str] | None:
         return None
     seen = set(phases)
     return [p for p in SCAN_PHASES if p in seen]
+
+
+def dedupe_scope(entries: list[str]) -> list[str]:
+    """Trim entries and drop repeats, keeping first-occurrence order. Case is preserved."""
+    return list(dict.fromkeys(e.strip() for e in entries))
+
+
+# Field before AfterValidator: the cap must see the raw list, not the deduped one.
+ScopeList = Annotated[list[str], Field(max_length=MAX_SCOPE_ENTRIES), AfterValidator(dedupe_scope)]
 
 
 def _validate_schedule(model, enforce_complete: bool):
@@ -64,7 +73,7 @@ def _validate_schedule(model, enforce_complete: bool):
 class ProjectCreate(BaseModel):
     title: str
     description: str | None = None
-    root_domains: list[str] = Field(max_length=MAX_SCOPE_ENTRIES)
+    root_domains: ScopeList
     schedule_enabled: bool = False
     schedule_interval_value: int | None = Field(default=None, ge=1, le=MAX_INTERVAL_VALUE)
     schedule_interval_unit: Literal["hours", "days", "weeks", "months"] | None = None
@@ -80,7 +89,7 @@ class ProjectCreate(BaseModel):
 class ProjectUpdate(BaseModel):
     title: str | None = None
     description: str | None = None
-    root_domains: list[str] | None = Field(default=None, max_length=MAX_SCOPE_ENTRIES)
+    root_domains: ScopeList | None = None
     status: str | None = None
     schedule_enabled: bool | None = None
     schedule_interval_value: int | None = Field(default=None, ge=1, le=MAX_INTERVAL_VALUE)

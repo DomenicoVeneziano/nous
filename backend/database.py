@@ -415,6 +415,32 @@ def init_db():
             except Exception:
                 pass  # Column not present yet on a database mid-upgrade
 
+    # Collapse repeated scope entries saved before the schema deduplicated them.
+    # Keyset-paged so memory stays bounded; only changed rows are rewritten.
+    from schemas.project import dedupe_scope
+    with engine.connect() as conn:
+        try:
+            last = ""
+            while True:
+                rows = conn.execute(
+                    text("SELECT id, root_domains FROM projects WHERE id > :last ORDER BY id LIMIT 500"),
+                    {"last": last},
+                ).fetchall()
+                if not rows:
+                    break
+                for pid, raw in rows:
+                    items = json.loads(raw) or []  # 'null' is storable via an explicit null update
+                    cleaned = dedupe_scope(items)
+                    if cleaned != items:
+                        conn.execute(
+                            text("UPDATE projects SET root_domains = :rd WHERE id = :id"),
+                            {"rd": json.dumps(cleaned), "id": pid},
+                        )
+                conn.commit()
+                last = rows[-1][0]
+        except Exception:
+            pass  # Table not present yet on a fresh or mid-upgrade database
+
     # Normalize timestamps the engine wrote as offset-aware ISO strings
     # ("2026-07-27T09:15:00.123456+00:00") to the naive, space-separated form
     # SQLAlchemy's SQLite DateTime reads and writes. Both processes write these
