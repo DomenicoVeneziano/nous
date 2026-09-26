@@ -102,8 +102,12 @@ def expand_cidr(value: str) -> list[str]:
     return [str(h) for h in net.hosts()] or [str(net.network_address)]
 
 
-def _asset_ids_by_name(db: Session, project_id: str, names: list[str]) -> dict[str, str]:
+def _asset_ids_by_name(
+    db: Session, project_id: str, names: list[str], asset_type: str | None = None
+) -> dict[str, str]:
     """{asset name: id} for the names of `names` that already exist.
+
+    `asset_type`, when set, restricts the match to assets of that type.
 
     One statement per chunk of names, never one per name — the lookup runs on
     ranges of up to MAX_CIDR_HOSTS addresses.
@@ -114,9 +118,13 @@ def _asset_ids_by_name(db: Session, project_id: str, names: list[str]) -> dict[s
         placeholders = ", ".join(f":n{i}" for i in range(len(chunk)))
         params = {f"n{i}": name for i, name in enumerate(chunk)}
         params["pid"] = project_id
+        type_clause = ""
+        if asset_type is not None:
+            type_clause = " AND asset_type = :atype"
+            params["atype"] = asset_type
         rows = db.execute(text(
             f"SELECT asset, id FROM assets"
-            f" WHERE project_id = :pid AND asset IN ({placeholders})"
+            f" WHERE project_id = :pid AND asset IN ({placeholders}){type_clause}"
         ), params).fetchall()
         for row in rows:
             found[row[0]] = row[1]

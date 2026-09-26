@@ -4,13 +4,14 @@ import { Trash2 } from 'lucide-react';
 
 interface Props {
   selectedCount: number;
+  onRunRecon: () => void;
   onRunTech: () => void;
   onRunCrawl: () => void;
   onClear: () => void;
   onDeleteSelected?: () => Promise<void>;
 }
 
-export default function BulkActionsMenu({ selectedCount, onRunTech, onRunCrawl, onClear, onDeleteSelected }: Props) {
+export default function BulkActionsMenu({ selectedCount, onRunRecon, onRunTech, onRunCrawl, onClear, onDeleteSelected }: Props) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
@@ -48,6 +49,10 @@ export default function BulkActionsMenu({ selectedCount, onRunTech, onRunCrawl, 
       }}>
         {selectedCount} selected
       </span>
+      <button onClick={onRunRecon} style={btnStyle}
+        onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; e.currentTarget.style.borderColor = 'var(--border-emphasis)'; }}
+        onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; e.currentTarget.style.borderColor = 'var(--border-default)'; }}
+      >Recon</button>
       <button onClick={onRunTech} style={btnStyle}
         onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--text-primary)'; e.currentTarget.style.borderColor = 'var(--border-emphasis)'; }}
         onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--text-secondary)'; e.currentTarget.style.borderColor = 'var(--border-default)'; }}

@@ -1,5 +1,5 @@
 # backend/schemas/scan.py
-from pydantic import BaseModel, field_serializer
+from pydantic import BaseModel, Field, field_serializer
 from datetime import datetime
 from typing import Literal
 
@@ -8,7 +8,9 @@ class ScanCreate(BaseModel):
     project_id: str
     scan_type: Literal["recon", "tech", "crawl"]
     asset_ids: list[str] | None = None
-    scope_domains: list[str] | None = None  # recon only; null/omit = all root domains
+    # At most 500 non-root (archive-only) hosts per run, enforced in the router;
+    # 2000 bounds the raw body and covers the 1000-root project scope cap.
+    scope_domains: list[str] | None = Field(default=None, max_length=2000)  # recon only; null = all root domains; entries not in root_domains must be hostname assets and get archive-only recon
 
 
 class ScanPositionUpdate(BaseModel):

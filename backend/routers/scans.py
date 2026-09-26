@@ -1,4 +1,5 @@
 # backend/routers/scans.py
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
@@ -7,10 +8,17 @@ from schemas.scan import ScanCreate, ScanPositionUpdate, ScanOut
 from models.scan import ScanJob
 from services.project_service import get_project
 from services import scan_service
+from services.asset_service import _asset_ids_by_name
 from ws.scan_stream import clear_buffer_and_broadcast
 from datetime import datetime, timezone
 
 router = APIRouter(prefix="/scans", tags=["scans"])
+
+_DOMAIN_RE = re.compile(r"^[a-zA-Z0-9._\-]+$")
+_MAX_INVALID_LISTED = 20
+# Each non-root host is a sequential archive run of up to an hour on the
+# single-threaded engine, so one recon run may not queue an unbounded batch.
+MAX_ARCHIVE_HOSTS = 500
 
 
 @router.post("/", response_model=ScanOut, status_code=201)
@@ -19,11 +27,23 @@ def enqueue_scan(data: ScanCreate, db: Session = Depends(get_db), _: dict = Depe
     if not project:
         raise HTTPException(404, "Project not found")
 
-    if data.scope_domains:
-        valid = set(project.root_domains or [])
-        invalid = [d for d in data.scope_domains if d not in valid]
+    scope_domains = data.scope_domains
+    if scope_domains:
+        scope_domains = list(dict.fromkeys(scope_domains))
+        roots = set(project.root_domains or [])
+        non_root = [d for d in scope_domains if d not in roots]
+        if len(non_root) > MAX_ARCHIVE_HOSTS:
+            raise HTTPException(422, f"At most {MAX_ARCHIVE_HOSTS} non-root hosts per recon run; {len(non_root)} given")
+        # Non-root entries must be existing subdomain assets of this project;
+        # the lookup is chunked, so the assets table is never loaded whole.
+        candidates = [d for d in non_root if _DOMAIN_RE.match(d)]
+        known = _asset_ids_by_name(db, project.id, candidates, asset_type="subdomain")
+        invalid = [d for d in non_root if d not in known]
         if invalid:
-            raise HTTPException(422, f"Domains not in project scope: {invalid}")
+            listed = invalid[:_MAX_INVALID_LISTED]
+            extra = len(invalid) - len(listed)
+            suffix = f" (+{extra} more)" if extra else ""
+            raise HTTPException(422, f"Domains not in project scope: {listed}{suffix}")
 
     # Queueing lives in scan_service so this endpoint and the recurring
     # scheduler cannot drift apart on settings snapshots or queue ordering.
@@ -32,7 +52,7 @@ def enqueue_scan(data: ScanCreate, db: Session = Depends(get_db), _: dict = Depe
         project_id=data.project_id,
         scan_type=data.scan_type,
         asset_ids=data.asset_ids,
-        scope_domains=data.scope_domains,
+        scope_domains=scope_domains,
     )
 
 

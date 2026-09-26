@@ -22,13 +22,14 @@ wildcard_batch=20
 # ------------------------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: $0 -d <domain> -o <output_file> [-s <known_subs>] [-w <wordlist>] [-r <resolvers>] [-n] [-x]
+Usage: $0 -d <domain> -o <output_file> [-s <known_subs>] [-w <wordlist>] [-r <resolvers>] [-a] [-n] [-x]
 
   -d  Target domain (required)
   -o  Output file for final results (required)
   -s  File of known subdomains to exclude from output (optional)
   -w  Wordlist for DNS bruteforce (default: $wordlist)
   -r  Resolvers file (default: $resolvers)
+  -a  Archive-only: fetch archived URLs for this exact host, no enumeration
   -n  Skip DNS bruteforce and permutation steps
   -x  Expand the bruteforce wordlist with tokens from discovered subdomains
   -h  Show this help
@@ -49,13 +50,14 @@ check_dependencies() {
 # ------------------------------------------------------------------------------
 # Parse arguments
 # ------------------------------------------------------------------------------
-while getopts "d:o:s:w:r:nxh" opt; do
+while getopts "d:o:s:w:r:anxh" opt; do
     case $opt in
         d) domain="$OPTARG" ;;
         o) output_file="$OPTARG" ;;
         s) subs_file="$OPTARG" ;;
         w) wordlist="$OPTARG" ;;
         r) resolvers="$OPTARG" ;;
+        a) archive_only=1; skip_bruteforce=1 ;;
         n) skip_bruteforce=1 ;;
         x) expand_wordlist=1 ;;
         h) usage ;;
@@ -164,21 +166,26 @@ atomic_write() {
 # strips userinfo and ports inline so mid-step flushes (before the Step 1 dedup)
 # stay clean. Every destination is replaced atomically.
 flush_output() {
-    # Strip any user:pass@ userinfo prefix before the port, otherwise
-    # "user:pass@host" collapses to "user" instead of "host".
-    cat "$active_subs" "$bruteforced_subs" "$permuted_subs" 2>/dev/null \
-        | sed -e 's/^[^@]*@//' -e 's/:.*$//' \
-        | sort -u > "$combined_subs" || true
-    if [[ -n "${subs_file:-}" && -s "$subs_file" ]]; then
-        grep -vFxf "$subs_file" "$combined_subs" 2>/dev/null \
-            | atomic_write "$output_file" || true
-    else
-        atomic_write "$output_file" < "$combined_subs" 2>/dev/null || true
+    # Archive-only runs enumerate no subdomains, so the output file is left alone.
+    if [[ -z "${archive_only:-}" ]]; then
+        # Strip any user:pass@ userinfo prefix before the port, otherwise
+        # "user:pass@host" collapses to "user" instead of "host".
+        cat "$active_subs" "$bruteforced_subs" "$permuted_subs" 2>/dev/null \
+            | sed -e 's/^[^@]*@//' -e 's/:.*$//' \
+            | sort -u > "$combined_subs" || true
+        if [[ -n "${subs_file:-}" && -s "$subs_file" ]]; then
+            grep -vFxf "$subs_file" "$combined_subs" 2>/dev/null \
+                | atomic_write "$output_file" || true
+        else
+            atomic_write "$output_file" < "$combined_subs" 2>/dev/null || true
+        fi
     fi
     # Persist archived URLs gathered so far too (gau/waymore stream into
     # raw_archived_urls); the engine's crawl-merge step reads archived_urls.txt.
     sort -u "$raw_archived_urls" 2>/dev/null \
         | atomic_write "$archived_urls_file" || true
+    # Nothing to attribute in archive-only mode.
+    [[ -n "${archive_only:-}" ]] && return 0
     # Per-source attribution. Deliberately NOT filtered against subs_file: an
     # already-known host that bruteforce independently rediscovers has genuinely
     # been found by two sources, and the engine accumulates both tags.
@@ -197,30 +204,42 @@ echo "[+] ================================================================"
 echo "[+]  Step 1: Active Subdomain Enumeration"
 echo "[+] ================================================================"
 
-# subfinder — passive enumeration via multiple sources
-echo "[+] Running subfinder on $domain ..."
-subfinder -d "$domain" -all -o "$active_subs" 2>/dev/null || true
-flush_output  # checkpoint: subfinder results persisted
+# Archive-only mode fetches URLs for the exact host: no subdomain enumeration,
+# no subdomain expansion in gau/waymore, and extracted hostnames are discarded.
+if [[ -n "${archive_only:-}" ]]; then
+    gau_opts=()
+    waymore_opts=(-n)
+    host_sink=/dev/null
+else
+    gau_opts=(--subs)
+    waymore_opts=()
+    host_sink="$active_subs"
 
-# crt.sh — certificate transparency logs
-echo "[+] Querying crt.sh for $domain ..."
-crt -s -json "$domain" 2>/dev/null \
-    | jq -r '.[].subdomain' \
-    | sed -e 's/^\*\.//' >> "$active_subs" || true
-flush_output  # checkpoint: + crt.sh results
+    # subfinder — passive enumeration via multiple sources
+    echo "[+] Running subfinder on $domain ..."
+    subfinder -d "$domain" -all -o "$active_subs" 2>/dev/null || true
+    flush_output  # checkpoint: subfinder results persisted
+
+    # crt.sh — certificate transparency logs
+    echo "[+] Querying crt.sh for $domain ..."
+    crt -s -json "$domain" 2>/dev/null \
+        | jq -r '.[].subdomain' \
+        | sed -e 's/^\*\.//' >> "$active_subs" || true
+    flush_output  # checkpoint: + crt.sh results
+fi
 
 # gau — fetch known URLs from AlienVault, Wayback, etc., extract hostnames
 echo "[+] Running gau on $domain ..."
-echo "$domain" | gau --subs 2>/dev/null \
+echo "$domain" | gau ${gau_opts[@]+"${gau_opts[@]}"} 2>/dev/null \
     | tee -a "$raw_archived_urls" \
-    | awk -F/ '{print $3}' | sort -u >> "$active_subs" || true
+    | awk -F/ '{print $3}' | sort -u >> "$host_sink" || true
 flush_output  # checkpoint: + gau results & archived URLs
 
 # waymore — fetch URLs, extract hostnames
 echo "[+] Running waymore on $domain ..."
-waymore -i "$domain" -mode U 2>/dev/null \
+waymore -i "$domain" -mode U ${waymore_opts[@]+"${waymore_opts[@]}"} 2>/dev/null \
     | tee -a "$raw_archived_urls" \
-    | awk -F/ '{print $3}' | sort -u >> "$active_subs" || true
+    | awk -F/ '{print $3}' | sort -u >> "$host_sink" || true
 flush_output  # checkpoint: + waymore results & archived URLs
 
 # Strip userinfo prefixes (user:pass@host → host) and trailing port numbers
@@ -230,6 +249,11 @@ sort -u "$active_subs" -o "$active_subs"
 
 # Write deduplicated archived URLs for the Python job to process
 sort -u "$raw_archived_urls" | atomic_write "$archived_urls_file"
+
+if [[ -n "${archive_only:-}" ]]; then
+    echo "[+] Archive-only run for $domain complete."
+    exit 0
+fi
 
 echo "[+] Active scan complete. Found $(wc -l < "$active_subs") unique subdomains."
 

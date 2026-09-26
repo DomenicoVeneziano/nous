@@ -1,5 +1,5 @@
 // frontend/src/pages/ProjectView.tsx
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { useProjectStore } from '../store/projectStore';
 import { fetchAllAssets, fetchAsset, createAsset, deleteAsset } from '../api/assets';
@@ -12,7 +12,7 @@ import AssetDetail from '../components/project/AssetDetail';
 import TechPieChart from '../components/project/TechPieChart';
 import BulkActionsMenu from '../components/projects/BulkActionsMenu';
 import ProjectOverlay from '../components/projects/ProjectOverlay';
-import ReconScopeModal from '../components/project/ReconScopeModal';
+import ReconScopeModal, { MAX_RECON_SCOPE } from '../components/project/ReconScopeModal';
 import FindingsSearchView from '../components/project/FindingsSearchView';
 import ScreenshotsView from '../components/project/ScreenshotsView';
 import TagManager from '../components/project/TagManager';
@@ -71,6 +71,7 @@ export default function ProjectView() {
   const [detailAsset, setDetailAsset] = useState<Asset | null>(null);
   const [showEdit, setShowEdit] = useState(false);
   const [showReconModal, setShowReconModal] = useState(false);
+  const [reconError, setReconError] = useState<string | null>(null);
   const [showAddAsset, setShowAddAsset] = useState(false);
   const [showTagManager, setShowTagManager] = useState(false);
   const [newAssetValue, setNewAssetValue] = useState('');
@@ -200,6 +201,37 @@ export default function ProjectView() {
     });
     setSelectedIds(new Set());
   };
+
+  const scopeHosts = useMemo(
+    () => assets.filter((a) => a.asset_type === 'subdomain' && a.tags.some((t) => t.name === 'Seed')).map((a) => a.asset),
+    [assets],
+  );
+
+  const runReconOnSelected = async () => {
+    if (!id) return;
+    const names = assets.filter((a) => selectedIds.has(a.id) && a.asset_type === 'subdomain').map((a) => a.asset);
+    if (names.length === 0) {
+      setReconError('Recon needs hostnames; the selection holds only IP addresses.');
+      return;
+    }
+    const roots = new Set(current?.root_domains ?? []);
+    const hostCount = names.filter((n) => !roots.has(n)).length;
+    if (hostCount > MAX_RECON_SCOPE) {
+      setReconError(`At most ${MAX_RECON_SCOPE} hosts per recon run; ${hostCount} selected.`);
+      return;
+    }
+    try {
+      await enqueueScan({ project_id: id, scan_type: 'recon', scope_domains: names });
+    } catch (err) {
+      // The selection stays so the operator can adjust it and retry.
+      setReconError(`Recon was not queued: ${(err as Error).message}`);
+      return;
+    }
+    setSelectedIds(new Set());
+  };
+
+  // A notice about an earlier attempt no longer applies once the selection changes.
+  useEffect(() => { setReconError(null); }, [selectedIds]);
 
   const handleReconConfirm = async (selectedDomains: string[]) => {
     if (!id) return;
@@ -414,8 +446,20 @@ export default function ProjectView() {
           </div>
         )}
 
+        {reconError && selectedIds.size > 0 && (
+          <div style={{
+            background: 'var(--status-error-bg, rgba(255,0,0,0.08))',
+            border: '1px solid var(--status-error-border, rgba(255,0,0,0.28))',
+            borderRadius: 6, padding: '7px 10px', marginBottom: 10,
+            fontSize: 12, color: 'var(--status-error)',
+          }}>
+            {reconError}
+          </div>
+        )}
+
         <BulkActionsMenu
           selectedCount={selectedIds.size}
+          onRunRecon={runReconOnSelected}
           onRunTech={() => runScan('tech')}
           onRunCrawl={() => runScan('crawl')}
           onClear={() => setSelectedIds(new Set())}
@@ -493,6 +537,7 @@ export default function ProjectView() {
       {showReconModal && current && (
         <ReconScopeModal
           domains={current.root_domains}
+          hosts={scopeHosts}
           onConfirm={handleReconConfirm}
           onClose={() => setShowReconModal(false)}
         />
