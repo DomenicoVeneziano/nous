@@ -12,7 +12,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import websockets
 
 from sqlalchemy.exc import OperationalError
-from queue_manager import get_session, fetch_next_job, get_job_status, migrations_complete
+from queue_manager import get_session, fetch_next_job, get_job_status, migrations_complete, fail_orphaned_jobs
 from jobs.recon_job import run_recon_job
 from jobs.tech_job import run_tech_job
 from jobs.crawler_job import run_crawler_job
@@ -124,6 +124,15 @@ async def main_loop():
     wait_for_db()
     broadcaster = WSBroadcaster(_engine_ws_url())
     await broadcaster.connect()
+
+    session = get_session()
+    try:
+        orphaned = fail_orphaned_jobs(session)
+    finally:
+        session.close()
+    for job_id in orphaned:
+        log.warning(f"Marked orphaned job {job_id} failed")
+        await broadcaster.broadcast("job_failed", {"job_id": job_id, "error": "Interrupted by engine restart"})
 
     shutdown_event = asyncio.Event()
     retention_task = asyncio.create_task(retention_loop(shutdown_event))

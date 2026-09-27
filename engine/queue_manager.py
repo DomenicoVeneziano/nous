@@ -171,6 +171,21 @@ def transition_status(session: Session, job_id: str, from_status: str, to_status
     return result.rowcount > 0
 
 
+def fail_orphaned_jobs(session: Session) -> list[str]:
+    """Mark jobs left `running` by a previous engine process as failed.
+
+    Safe only because there is one engine process and it runs jobs one at a
+    time: at startup nothing can legitimately be running yet.
+    """
+    rows = session.execute(text(
+        "UPDATE scan_jobs SET status = 'failed', finished_at = :now, error_msg = :msg "
+        "WHERE status = 'running' RETURNING id"
+    ), {"now": utc_now_str(),
+        "msg": "Interrupted: engine restarted while the job was running"}).fetchall()
+    session.commit()
+    return [r[0] for r in rows]
+
+
 def _select_assets(session: Session, columns: str, ids, project_id) -> list:
     """Asset rows for either an explicit id list or a whole project.
 
