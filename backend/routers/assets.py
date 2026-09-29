@@ -260,6 +260,8 @@ def create_asset(project_id: str, data: AssetCreate, db: Session = Depends(get_d
     those pre-existing rows alongside the created ones. Both get the Manual tag,
     matching how project_service._create_assets_from_hostnames tags rows the
     scope names but did not create.
+
+    A URL with a path adds its origin (or reuses it) and archives the path on it.
     """
     proj = project_service.get_project(db, project_id)
     if not proj:
@@ -269,7 +271,23 @@ def create_asset(project_id: str, data: AssetCreate, db: Session = Depends(get_d
         raise HTTPException(422, "Asset value is required")
 
     cidr = asset_service.parse_cidr(name)
-    if cidr is None:
+    origin, path = asset_service.split_url(name)
+    rejected = [f for f in _CIDR_REJECTED_FIELDS if getattr(data, f, None) is not None]
+    if cidr is None and path is not None:
+        if rejected:
+            raise HTTPException(
+                422,
+                f"'{name}' names a path, which is archived on {origin}; these "
+                f"fields cannot be applied to it: {', '.join(rejected)}",
+            )
+        try:
+            asset_ids = asset_service.create_assets_bulk(db, project_id, [name], SOURCE_MANUAL)
+        except asset_service.ArchiveMergeConflict:
+            raise HTTPException(409, f"'{path}' was not archived on {origin} due to a concurrent update, retry")
+        assets = asset_service.load_assets_by_ids(db, asset_ids)
+    elif cidr is None:
+        name = origin
+        data = data.model_copy(update={"asset": origin})
         if asset_service.get_asset_by_name(db, project_id, name):
             raise HTTPException(409, f"Asset '{name}' already exists in this project")
         try:
@@ -277,7 +295,6 @@ def create_asset(project_id: str, data: AssetCreate, db: Session = Depends(get_d
         except IntegrityError:
             raise HTTPException(409, f"Asset '{name}' already exists in this project")
     else:
-        rejected = [f for f in _CIDR_REJECTED_FIELDS if getattr(data, f, None) is not None]
         # "ip" is redundant but consistent with what the expansion produces;
         # "subdomain" contradicts it.
         if data.asset_type == "subdomain":
