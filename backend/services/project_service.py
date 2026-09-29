@@ -34,6 +34,7 @@ def _split_domains_and_assets(entries: list[str]) -> tuple[list[str], list[str],
     wildcards = []
     cidrs = []
     assets = []
+    bad = []
     for entry in entries:
         entry = entry.strip()
         if not entry:
@@ -42,8 +43,12 @@ def _split_domains_and_assets(entries: list[str]) -> tuple[list[str], list[str],
             wildcards.append(entry)
         elif asset_service.parse_cidr(entry) is not None:
             cidrs.append(entry)
+        elif not asset_service.split_url(entry)[0]:
+            bad.append(entry)
         else:
             assets.append(entry)
+    if bad:
+        raise HTTPException(422, f"Not a URL with a valid hostname or IP: {', '.join(bad[:10])}")
     return wildcards, cidrs, assets
 
 

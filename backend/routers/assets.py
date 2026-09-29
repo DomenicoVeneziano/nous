@@ -261,7 +261,7 @@ def create_asset(project_id: str, data: AssetCreate, db: Session = Depends(get_d
     matching how project_service._create_assets_from_hostnames tags rows the
     scope names but did not create.
 
-    A URL with a path adds its origin (or reuses it) and archives the path on it.
+    A URL is reduced to its hostname; any path it carries is archived on that asset.
     """
     proj = project_service.get_project(db, project_id)
     if not proj:
@@ -271,23 +271,25 @@ def create_asset(project_id: str, data: AssetCreate, db: Session = Depends(get_d
         raise HTTPException(422, "Asset value is required")
 
     cidr = asset_service.parse_cidr(name)
-    origin, path = asset_service.split_url(name)
+    host, path = asset_service.split_url(name)
+    if not host:
+        raise HTTPException(422, f"'{name}' is not a URL with a valid hostname or IP")
     rejected = [f for f in _CIDR_REJECTED_FIELDS if getattr(data, f, None) is not None]
     if cidr is None and path is not None:
         if rejected:
             raise HTTPException(
                 422,
-                f"'{name}' names a path, which is archived on {origin}; these "
+                f"'{name}' names a path, which is archived on {host}; these "
                 f"fields cannot be applied to it: {', '.join(rejected)}",
             )
         try:
             asset_ids = asset_service.create_assets_bulk(db, project_id, [name], SOURCE_MANUAL)
         except asset_service.ArchiveMergeConflict:
-            raise HTTPException(409, f"'{path}' was not archived on {origin} due to a concurrent update, retry")
+            raise HTTPException(409, f"'{path}' was not archived on {host} due to a concurrent update, retry")
         assets = asset_service.load_assets_by_ids(db, asset_ids)
     elif cidr is None:
-        name = origin
-        data = data.model_copy(update={"asset": origin})
+        name = host
+        data = data.model_copy(update={"asset": host})
         if asset_service.get_asset_by_name(db, project_id, name):
             raise HTTPException(409, f"Asset '{name}' already exists in this project")
         try:
@@ -324,6 +326,8 @@ def create_asset(project_id: str, data: AssetCreate, db: Session = Depends(get_d
 
 @router.put("/{asset_id}", response_model=AssetOut)
 def update_asset(project_id: str, asset_id: str, data: AssetUpdate, db: Session = Depends(get_db), _: dict = Depends(require_admin)):
+    if data.asset and "://" in data.asset:
+        raise HTTPException(422, "Hostnames cannot be URLs; add the URL as a new asset to archive its path")
     asset = asset_service.update_asset(db, asset_id, data)
     if not asset or asset.project_id != project_id:
         raise HTTPException(404, "Asset not found")

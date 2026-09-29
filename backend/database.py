@@ -48,6 +48,9 @@ _FTS_SENTINEL = "FTS_ROWID_REBUILD"
 # already notified. Also lives in app_settings.
 _NOTIFY_BACKFILL_SENTINEL = "NOTIFY_BACKFILL_DONE"
 
+# Marks a database whose scheme://host assets have been reduced to bare hosts.
+_URL_ASSET_SENTINEL = "URL_ASSETS_TO_HOSTS"
+
 # How SQLAlchemy renders a DateTime for SQLite: naive, no offset. Raw SQL writes
 # to those columns have to match it or the two forms sort against each other.
 # Public: the routers and services that write or parse those columns import it
@@ -474,6 +477,95 @@ def init_db():
                 conn.commit()
             except Exception:
                 pass  # Column missing on an older schema — nothing to normalize
+
+    # One-shot reduction of assets stored as scheme://host[/path] to the bare
+    # host, with the path archived on it. A row whose host already exists as an
+    # asset is folded into that row: its findings, changes, tags and endpoints
+    # move over and the duplicate is deleted. Keyset-paged and committed per
+    # chunk, so an interrupted run resumes; the sentinel lands only at the end.
+    # Each row runs in its own savepoint: a row that fails (a concurrent engine
+    # insert of the same host) keeps its name, like an invalid host, and the
+    # pass carries on. FTS follows through the existing triggers.
+    from services.asset_service import split_url, detect_asset_type
+    from schemas.asset import normalize_crawled_urls
+
+    def _urls(raw):
+        try:
+            return normalize_crawled_urls(json.loads(raw) if raw else None)
+        except (TypeError, ValueError):
+            return normalize_crawled_urls(None)
+
+    with engine.connect() as conn:
+        try:
+            done = conn.execute(
+                text("SELECT 1 FROM app_settings WHERE key = :k"),
+                {"k": _URL_ASSET_SENTINEL},
+            ).fetchone()
+            last = 0
+            while done is None:
+                rows = conn.execute(text(
+                    "SELECT rowid, id, project_id, asset, crawled_urls FROM assets "
+                    "WHERE rowid > :last AND asset LIKE '%://%' ORDER BY rowid LIMIT 500"
+                ), {"last": last}).fetchall()
+                if not rows:
+                    conn.execute(
+                        text("INSERT OR REPLACE INTO app_settings (key, value) VALUES (:k, '1')"),
+                        {"k": _URL_ASSET_SENTINEL},
+                    )
+                    conn.commit()
+                    break
+                touched: set[str] = set()
+                for _, aid, pid, name, raw in rows:
+                    host, path = split_url(name)
+                    if not host:
+                        continue
+                    urls = _urls(raw)
+                    if path:
+                        urls["archived"].append(path)
+                    try:
+                        with conn.begin_nested():
+                            keep = conn.execute(
+                                text("SELECT id, crawled_urls FROM assets WHERE project_id = :p AND asset = :h"),
+                                {"p": pid, "h": host},
+                            ).fetchone()
+                            if keep:
+                                kept = _urls(keep[1])
+                                for k in ("crawling", "archived"):
+                                    urls[k] += kept[k]
+                            urls = {k: sorted(set(v), key=str.lower) for k, v in urls.items()}
+                            if keep is None:
+                                conn.execute(
+                                    text("UPDATE assets SET asset = :h, asset_type = :t, crawled_urls = :u WHERE id = :id"),
+                                    {"h": host, "t": detect_asset_type(host), "u": json.dumps(urls), "id": aid},
+                                )
+                                continue
+                            ids = {"keep": keep[0], "dup": aid}
+                            conn.execute(text("UPDATE findings SET asset_id = :keep WHERE asset_id = :dup"), ids)
+                            conn.execute(text("UPDATE asset_changes SET asset_id = :keep WHERE asset_id = :dup"), ids)
+                            conn.execute(text(
+                                "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id) "
+                                "SELECT :keep, tag_id FROM asset_tags WHERE asset_id = :dup"
+                            ), ids)
+                            conn.execute(text("DELETE FROM assets WHERE id = :dup"), ids)
+                            conn.execute(
+                                text("UPDATE assets SET crawled_urls = :u WHERE id = :keep"),
+                                {"u": json.dumps(urls), "keep": keep[0]},
+                            )
+                            touched.add(pid)
+                    except Exception:
+                        pass  # Row rolled back to its savepoint; it keeps its name
+                for pid in touched:
+                    conn.execute(text(
+                        "UPDATE projects SET "
+                        "asset_count = (SELECT COUNT(*) FROM assets WHERE project_id = :p), "
+                        "tech_count = (SELECT COUNT(*) FROM assets WHERE project_id = :p "
+                        "AND technologies != '[]' AND technologies IS NOT NULL) "
+                        "WHERE id = :p"
+                    ), {"p": pid})
+                conn.commit()
+                last = rows[-1][0]
+        except Exception:
+            pass  # Table not present yet on a fresh or mid-upgrade database
 
     # One-shot upgrade to the rowid-keyed index, gated on a sentinel rather than
     # on "is the index empty?": the tags_text repair rebuilds the index through

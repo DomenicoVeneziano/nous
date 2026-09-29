@@ -12,6 +12,7 @@ from schemas.asset import AssetCreate, AssetUpdate, normalize_crawled_urls
 from services import tag_service
 import ipaddress
 import json
+import re
 import urllib.parse
 import uuid
 
@@ -33,6 +34,10 @@ EMPTY_CRAWLED_URLS = '{"crawling": [], "archived": []}'
 # SQLite caps bound parameters per statement; chunk long name/id lists well
 # under it, matching tag_service._ID_CHUNK.
 _NAME_CHUNK = 500
+
+
+# The domain charset the engine accepts; a URL's host must match it (or be an IP).
+_HOST_RE = re.compile(r"^[a-zA-Z0-9._\-]+$")
 
 
 class CidrError(ValueError):
@@ -109,43 +114,47 @@ def expand_cidr(value: str) -> list[str]:
 
 
 def split_url(value: str) -> tuple[str, str | None]:
-    """Split a URL into its origin and the path it names, or (value, None).
+    """Split a URL into its host and the path it names, or (value, None).
 
-    Only a value carrying scheme://host is a URL here; hostnames, IPs, CIDRs and
-    wildcards come back untouched. The path keeps its query and drops the
-    fragment, the host is lowercased, and a bare "/" counts as no path, so `https://x.com/` and
-    `https://x.com` are the same origin.
+    Only a value carrying "://" is a URL here; hostnames, IPs, CIDRs and
+    wildcards come back untouched. The host is lowercased and stripped of
+    scheme, userinfo, port, IPv6 brackets and a trailing dot — the engine
+    probes only 443/80 on a bare host, so the port is dropped on purpose. The
+    path keeps its query and drops the fragment, and a bare "/" counts as no
+    path, so `https://x.com/` and `https://x.com` are the same host. A URL without a valid hostname or IP
+    comes back as ("", None).
     """
     value = value.strip()
     if "://" not in value:
         return value, None
     try:
         p = urllib.parse.urlsplit(value)
+        host = (p.hostname or "").rstrip(".")
     except ValueError:
-        return value, None
-    if not p.scheme or not p.netloc:
-        return value, None
+        return "", None
+    if not _HOST_RE.match(host) and detect_asset_type(host) != "ip":
+        return "", None
     path = p.path or "/"
     if p.query:
         path += "?" + p.query
-    return f"{p.scheme}://{p.netloc.lower()}", None if path == "/" else path
+    return host, None if path == "/" else path
 
 
 def merge_archived_paths(
-    db: Session, project_id: str, origin_paths: dict[str, set[str]]
+    db: Session, project_id: str, host_paths: dict[str, set[str]]
 ) -> None:
-    """Merge paths into the "archived" section of each origin's crawled_urls.
+    """Merge paths into the "archived" section of each host's crawled_urls.
 
     Deduped and sorted the way engine/queue_manager.merge_crawled_urls_bulk
     does it. Each write is a compare-and-swap on the value just read: the Add
     Asset dialog POSTs its lines in parallel, and a plain read-modify-write
-    would let two paths on one origin overwrite each other. Each round lands at
-    least one writer per origin, so paths still pending after the last round
+    would let two paths on one host overwrite each other. Each round lands at
+    least one writer per host, so paths still pending after the last round
     raise ArchiveMergeConflict rather than being dropped.
     """
-    pending = dict(origin_paths)
-    # ponytail: 32 CAS rounds covers 32 concurrent writers per origin; beyond
-    # that the caller gets a conflict to retry. Add a per-origin lock if needed.
+    pending = dict(host_paths)
+    # ponytail: 32 CAS rounds covers 32 concurrent writers per host; beyond
+    # that the caller gets a conflict to retry. Add a per-host lock if needed.
     for _ in range(32):
         if not pending:
             return
@@ -256,16 +265,16 @@ def create_assets_bulk(
     Each name is classified by detect_asset_type, so an IP is stored as "ip"
     whether it came from a CIDR, from a project's scope, or on its own.
 
-    A URL with a path names its origin: the origin is the asset, and the path is
-    merged into that asset's archived endpoints (see split_url).
+    A URL names its host: the host is the asset, and any path is merged into
+    that asset's archived endpoints (see split_url).
     """
     unique: list[str] = []
     seen: set[str] = set()
-    origin_paths: dict[str, set[str]] = {}
+    host_paths: dict[str, set[str]] = {}
     for raw in names:
         name, path = split_url(raw or "")
         if path is not None:
-            origin_paths.setdefault(name, set()).add(path)
+            host_paths.setdefault(name, set()).add(path)
         if name and name not in seen:
             seen.add(name)
             unique.append(name)
@@ -293,7 +302,7 @@ def create_assets_bulk(
     # a race inserted nothing, and the row that won carries a different id.
     ids_by_name = _asset_ids_by_name(db, project_id, unique)
     asset_ids = [ids_by_name[name] for name in unique if name in ids_by_name]
-    merge_archived_paths(db, project_id, origin_paths)
+    merge_archived_paths(db, project_id, host_paths)
     if not asset_ids:
         return []
     tag = tag_service.ensure_system_tag(db, project_id, source_tag)
@@ -397,14 +406,20 @@ def delete_asset(db: Session, asset_id: str) -> bool:
 
 
 if __name__ == "__main__":
-    o = "https://entreprise.mma.fr"
-    assert split_url(o) == (o, None)
-    assert split_url(o + "/") == (o, None)
-    assert split_url(o + "/contact/demande") == (o, "/contact/demande")
-    assert split_url(" https://x.com:8443/a?b=1#frag ") == ("https://x.com:8443", "/a?b=1")
-    assert split_url("https://x.com?q=1") == ("https://x.com", "/?q=1")
-    assert split_url("https://x.com#top") == ("https://x.com", None)
-    assert split_url("https://Entreprise.MMA.fr/b") == (o, "/b")
+    h = "entreprise.mma.fr"
+    assert split_url("https://" + h) == (h, None)
+    assert split_url("https://" + h + "/") == (h, None)
+    assert split_url("https://" + h + "/contact/demande") == (h, "/contact/demande")
+    assert split_url(" https://x.com:8443/a?b=1#frag ") == ("x.com", "/a?b=1")
+    assert split_url("https://x.com?q=1") == ("x.com", "/?q=1")
+    assert split_url("https://x.com#top") == ("x.com", None)
+    assert split_url("https://Entreprise.MMA.fr/b") == (h, "/b")
+    assert split_url("https://x.com./a") == ("x.com", "/a")
+    assert split_url("http://u:p@10.0.0.1/x") == ("10.0.0.1", "/x")
+    assert split_url("https://[2001:db8::1]:8443/") == ("2001:db8::1", None)
+    assert detect_asset_type(split_url("https://[::1]")[0]) == "ip"
+    for bad in ("https://", "x://", "https://a b.com/", "https://*.x.com", "https://[::1"):
+        assert split_url(bad) == ("", None), bad
     for v in ("x.com", "10.0.0.1", "10.0.0.0/24", "*.x.com", "x.com/path", "::1"):
         assert split_url(v) == (v, None), v
     print("split_url ok")
